@@ -1,0 +1,165 @@
+# design.md Section Template
+
+`{workdir}/design.md` records the **decisions** made around the requirements ledger: how the module
+is structured, what any split of it must jointly keep at its internal boundaries, and the timing
+scenarios the interfaces are held to. `rtl-design`, `simulation-plan` and `simulation-triage`
+declare `design.md` as an input — rtl-design reads §1.2 to choose the module split, and is held to
+§1.3.2's obligations whatever it chooses.
+
+> **Cite, never restate.** What the engineer requires is in `requirements.json`, one row each, in
+> their words, and every stage reads that file. Mention a requirement here by its row id with at
+> most a short gloss; a paragraph that says again what a row says is a second home for one fact,
+> and the two diverge invisibly. The requirements reviewer reads this document against the ledger
+> for exactly that.
+
+> **Single home**: every per-field fact lives in exactly one place — its sidecar. Each §1.x below
+> points at its sidecar and carries only the narrative no field can hold: why the boundary is
+> what it is, how the datapath divides, what is out of scope. Never restate a field value in
+> prose or in a second table.
+
+## Document Position
+
+| Section range | Responsibility |
+|---|---|
+| 1.1–1.5 Overview sections | Function, interfaces, timing, frequencies, architecture partitioning: the decisions, citing requirement rows by id. |
+| 2 Document control | Version, revision notes. |
+
+## Rendering Conventions
+
+| Content type | Recommended format | Notes |
+|----------|----------|------|
+| Architecture diagrams (§1.2 / submodule `<child>.md` bodies) | mermaid code block | GitHub / VSCode preview / mkdocs all render natively; for multiple side-by-side candidates use one code block each. |
+| Timing diagrams (§1.4 interface timing) | Hand-drawn ASCII (preferred) or wavedrom | wavedrom does **not** render on GitHub — if wavedrom is used, attach an ASCII equivalent or export a PNG when reviewing the PR; otherwise stick with ASCII. |
+
+A waveform is optional and never authoritative: the requirement rows and the scenario row below
+govern, and a picture drawn to agree with them is a second home for one fact. Draw one only where
+it shows something neither can — a phase relationship across several signals — and say which
+scenario id it belongs to.
+
+## Overview Section Template (1.1–1.5)
+
+```markdown
+# <module_name> Design Document (design.md)
+
+## 1. Module Overview
+
+### 1.1 Overview
+(Module description: role in the system, core problem solved, scope boundaries, citing the
+requirement rows that set them.)
+
+### 1.2 Module Structure
+
+The structure this module wants, and the argument for it: the dataflow, which internal edges are
+clean elastic handshakes and which couplings forbid a cut, which block carries the dominant area
+term. **This is an argument, not a roster.** rtl-design reads it and decides the module split, so
+say why a boundary belongs where you put it rather than only where.
+
+```mermaid
+flowchart LR
+  A[Sub-A] --> B[Sub-B] --> C[Sub-C]
+```
+
+### 1.3 Module Interface and Interconnects
+
+#### 1.3.1 Top-Level IO
+
+The port list lives in `top-io.json`. Here: what the boundary is for, which groups exist and
+why.
+
+#### 1.3.2 Joint Obligations
+
+Whatever this module divides into, some obligations bind more than one part of it: a shared
+operating-phase or event timeline, a sequencing, a co-assertion or mutual-exclusion among control
+strobes, who holds a value stable and for how long. **State each of them once, here.** The stage
+that writes the RTL chooses the module split and reads this section to know what any split must
+keep; an obligation left inside one part's description is one the others never see.
+
+> - A behaviour one signal's own entry fully captures (a plain valid/ready handshake, a
+>   single-clock latency) is not a joint obligation and belongs in `top-io.json`.
+> - Form adapts to the module: a phase-sequenced datapath states an ordered operating-phase
+>   timeline; a handshake/arbitration module states the co-assertion / mutual-exclusion rule in
+>   prose.
+> - **State the obligation, never the cycle.** "The operands are captured in the cycle the strobe
+>   is sampled" is an obligation any split can keep; "the strobe is asserted in cycle 0" is a
+>   schedule, and whether the producer registers its outputs decides it. A cycle count the
+>   engineer stated is a requirement row, and the row is its home. Naming cycles here turns one
+>   implementation choice into an obligation on the rest, and whoever chose otherwise is then in
+>   breach of a contract nothing required.
+> - This pins the *statement* of the obligations. Their *correctness* is design judgment
+>   (advisory soundness + downstream RTL/sim), not pinned here.
+
+##### 1.3.2.1 Worked forms
+
+Form A — a **phase-sequenced datapath** states an ordered operating-phase timeline; control
+encodings project onto it (each symbol names its canonical phase(s)). The order is the contract;
+how long each phase takes is not:
+
+| # | Phase | Entered when | Notes (projection / co-assertion / boundary, as applicable) |
+|---|-------|--------------|-------------------------------------------------------------|
+| 1 | LOAD    | the last input beat is accepted | ctrl_phase=LOAD |
+| 2 | PRELOAD | LOAD's operand set is complete | ctrl_fabric=PRELOAD |
+| … | …       | …                               | … |
+
+Form B — a **handshake / arbitration** module states the obligation in prose (no phase table).
+E.g. a TX/RX start mux:
+
+> `start_tx_fifo` and `start_rx_fifo` are mutually exclusive (never both high). The master-bus
+> outputs route to the TX variables when `start_tx_fifo` is high, to the RX variables when
+> `start_rx_fifo` is high, else to `0`. Consumers of the muxed bus rely on this exclusion to decode
+> the source.
+
+### 1.4 Interface Timing Scenarios
+
+Subdivide by **interface group**. The scenario table below is this section's product; a waveform
+is optional (rendering per §Rendering Conventions).
+
+#### Example: a configuration-port write transaction (hand-drawn ASCII)
+
+~~~text
+        idle      setup/hold region        transaction done      idle
+clk      __|‾|_|‾|_|‾|_|‾|_|‾|_|‾|_|‾|_|‾|_|‾|_
+cfg_en   _________|‾‾‾‾‾‾‾‾‾‾‾‾‾|_______________
+addr     _________<── ADDR ──>_______________
+wdata    _________<── WDATA ─>_______________
+rdy      _________|‾‾‾‾‾‾‾‾‾‾‾‾‾|_______________   (slave ready)
+~~~
+
+**What it shows** (the obligations themselves are rows; SC-001 below is what a sequence is built from)
+- **idle**: `cfg_en` low; whether ADDR/WDATA matter is defined by the protocol.
+- **setup/hold region**: before/after the valid sampling edge, ADDR and WDATA satisfy *T_setup* / *T_hold* relative to `clk`.
+- **transaction done**: when `cfg_en` and `rdy` are both high, the slave accepts this write.
+- **return to idle**: after the slave drops `rdy`, the bus enters idle, ready for the next transaction.
+
+#### Timing Scenarios Table
+
+One entry per interface timing scenario, next to the waveform it belongs to. Give each a
+stable `SC-NNN` id — simulation-plan authors one sequence per id and refers back by it — then
+say what is driven, what is observable, and the timing obligation. Prose; the shape is yours.
+
+| ID | Interface / mode | Stimulus | Expected | Timing constraint |
+|---|---|---|---|---|
+| SC-001 | APB / write | Legal-address write transaction | `pready` high within 1–2 cycles, `pslverr`=0 | ≤2 cycles after `penable` |
+
+### 1.5 Clocks and Frequencies
+
+Clock definitions live in `clocks.json` (the sole numeric + relationship source;
+`constraints/<TOP>.{sdc,sgdc}` are generated from it). Here: domain count, CDC posture, reset
+scheme, release-ordering constraints.
+```
+
+
+## Where the rules live
+
+A sidecar's own shape is its `references/*.schema.json`, field by field — read the schema, not a
+summary of it; it is enforced wherever a verb reads that file. A relation *between* files is what
+no schema can express, and that is `check-crossrefs`. Neither is restated here.
+
+## Document Control
+
+```markdown
+## 2. Document Control
+
+| Version | Date | Notes |
+|------|------|------|
+| 0.1 | YYYY-MM-DD | Initial draft |
+```

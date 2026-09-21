@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FPGA创新设计赛道</title>
+    <link rel="stylesheet" href="css/style.css">
+    <link rel="stylesheet" href="css/element-ui.css">
+    <link rel="stylesheet" href="css/element-fpga.css">
+    <link rel="stylesheet" href="css/header-app.css">
+    <link rel="stylesheet" href="css/swiper-bundle.min.css">
+    <style>
+        /* shell 布局：头部 + iframe 内容区 + 底部 */
+        body { display: flex; flex-direction: column; min-height: 100vh; }
+        .shell-content { flex: 1; position: relative; }
+        .shell-iframe { width: 100%; border: none; display: block; }
+        #footer-container { margin-top: auto; }
+        /* 非激活 iframe：visibility 隐藏而非 display:none，
+           保留渲染树与图片解码缓存，切回时无需重排重绘，杜绝半帧卡顿 */
+        .shell-iframe.frame-hidden {
+            visibility: hidden;
+            position: absolute;
+            top: 0;
+            left: 0;
+            height: 0 !important;
+            overflow: hidden;
+        }
+    </style>
+    <script src="js/swiper-bundle.min.js"></script>
+    <script src="js/vue.js"></script>
+    <script src="js/index.js"></script>
+    <script type="text/javascript" src="js/jquery-1.10.2.min.js"></script>
+    <script src="js/script.js"></script>
+    <script type="text/javascript" src="js/js.cookie.min.js"></script>
+    <script src="js/jsencrypt.min.js"></script>
+    <script src="js/crypto-js.min.js"></script>
+    <script src="js/crypto.js"></script>
+    <script type="text/javascript" src="js/httpUtils.js"></script>
+    <script src="js/i18n.js"></script>
+    <script src="js/common.js"></script>
+    <script type="text/javascript" src="js/wxLogin.js"></script>
+</head>
+
+<body>
+    <div id="page-loading-mask"><svg width="36" height="36" viewBox="0 0 50 50"><circle cx="25" cy="25" r="20" fill="none" stroke="#63065F" stroke-width="4" stroke-linecap="round" stroke-dasharray="90 60" /></svg></div>
+    <!-- 公共头部：由 common.js 加载 header.html（含导航栏） -->
+    <div id="header-container"></div>
+
+    <!-- 内页 banner：壳页面统一管理，避免 iframe 切换时闪屏 -->
+    <section class="hero-ny" id="shell-hero-ny" style="display:none;">
+        <div class="swiper-slide">
+            <div class="banner-text" id="shell-hero-text"></div>
+            <img src="images/banner-ny.png" class="small-banner" />
+        </div>
+    </section>
+
+    <!-- 内容区：双 iframe 架构，首页持久化不重建 -->
+    <div class="shell-content">
+        <div id="iframe-loading-overlay" style="position:absolute;inset:0;z-index:10;background:#fff;display:flex;align-items:center;justify-content:center;transition:opacity .15s ease-out;">
+            <svg width="28" height="28" viewBox="0 0 50 50" style="animation:mask-spin .9s linear infinite;filter:drop-shadow(0 0 6px rgba(99,6,95,.3));">
+                <circle cx="25" cy="25" r="20" fill="none" stroke="#63065F" stroke-width="4" stroke-linecap="round" stroke-dasharray="90 60" />
+            </svg>
+        </div>
+        <!-- 首页持久 iframe：一次加载后永不重建，切换页面仅 show/hide -->
+        <iframe id="home-frame" name="home-frame" class="shell-iframe frame-hidden" src="home-content.html"></iframe>
+        <!-- 其他内容页 iframe -->
+        <iframe id="content-frame" name="content-frame" class="shell-iframe frame-hidden" src="about:blank"></iframe>
+    </div>
+
+    <!-- 公共底部：由 common.js 加载 footer.html -->
+    <div id="footer-container"></div>
+
+    <script>
+        // 标记 shell 模式，供 iframe 内页面及 header 判断
+        window.__isShellPage = true;
+
+        // 微信PC登录回调：URL 中携带 token 参数时保存并清理
+        (function () {
+            var urlParams = new URLSearchParams(window.location.search);
+            var token = urlParams.get('token');
+            if (token) {
+                setLoginToken(token);
+                urlParams.delete('token');
+                var newUrl = window.location.pathname + (urlParams.toString() ? '?' + urlParams.toString() : '');
+                window.history.replaceState({}, '', newUrl);
+                window.location.reload();
+            }
+        })();
+
+        // ========================================
+        // 壳页面核心逻辑：双 iframe 架构 + 导航同步
+        // 首页 (home-frame) 持久化不重建，其他页面 (content-frame) 按需加载
+        // ========================================
+        (function () {
+            var homeFrame = document.getElementById('home-frame');
+            var pageFrame = document.getElementById('content-frame');
+            var overlay = document.getElementById('iframe-loading-overlay');
+
+            // 壳页面 → 内容页映射（首页由 home-frame 持久承载，不在此映射中加载）
+            var PAGE_MAP = {
+                'index':    'home-content.html',
+                'home':     'home-content.html',
+                'jssm':     'jssm-content.html',
+                'notice':   'notice-content.html',
+                'faq':      'faq-content.html',
+                'train':    'train-content.html',
+                'awards':   'awards-content.html',
+                'download': 'download-content.html',
+                'contact':  'contact-content.html'
+            };
+
+            // 壳页面 key → header activeNav 映射
+            var NAV_MAP = {
+                'index': 'home', 'home': 'home',
+                'jssm': 'jssm', 'notice': 'notice', 'faq': 'faq',
+                'train': 'train', 'awards': 'awards',
+                'download': 'download', 'contact': 'contact'
+            };
+
+            // 壳页面 key → hero-ny banner 文字 i18n key（首页无 banner）
+            var BANNER_MAP = {
+                'jssm': 'jssmTitle', 'notice': 'notice', 'faq': 'faqTitle',
+                'train': 'training', 'awards': 'awards',
+                'download': 'downloadTitle', 'contact': 'contactTitle'
+            };
+
+            var currentPage = ''; // 当前显示的页面 key
+            var homeFrameReady = false; // 首页 iframe 是否已加载完成
+            var pageFrameReady = false; // 内容页 iframe 是否已加载完成
+            var activeFrame = null; // 当前激活的 frame 元素（用于高度消息过滤）
+
+            // 判断是否为首页
+            function isHomePage(pageKey) {
+                return pageKey === 'index' || pageKey === 'home';
+            }
+
+            // 从 URL 读取当前 page 参数
+            function getPageFromUrl() {
+                var params = new URLSearchParams(window.location.search);
+                return params.get('page') || 'index';
+            }
+
+            // 获取内容页文件名
+            function getContentFile(pageKey) {
+                return PAGE_MAP[pageKey] || PAGE_MAP['index'];
+            }
+
+            // 获取导航高亮 key
+            function getNavKey(pageKey) {
+                return NAV_MAP[pageKey] || 'home';
+            }
+
+            // iframe 加载覆盖层控制
+            function showOverlay() {
+                if (overlay) {
+                    overlay.style.opacity = '1';
+                    overlay.style.pointerEvents = 'auto';
+                    overlay.style.display = 'flex';
+                }
+            }
+            function hideOverlay() {
+                if (overlay) {
+                    overlay.style.opacity = '0';
+                    overlay.style.pointerEvents = 'none';
+                    setTimeout(function () { overlay.style.display = 'none'; }, 160);
+                }
+            }
+
+            // 更新 header 导航高亮
+            function updateHeaderNav(pageKey) {
+                var navKey = getNavKey(pageKey);
+                var headerContainer = document.getElementById('header-container');
+                if (headerContainer) {
+                    headerContainer.setAttribute('data-active-nav', navKey);
+                }
+                var headerApp = document.getElementById('header-app');
+                if (headerApp && headerApp.__vue__) {
+                    headerApp.__vue__.activeNav = navKey;
+                }
+            }
+
+            // 更新 hero-ny banner 显隐与文字
+            function updateHeroBanner(pageKey) {
+                var heroEl = document.getElementById('shell-hero-ny');
+                var textEl = document.getElementById('shell-hero-text');
+                if (!heroEl || !textEl) return;
+                var i18nKey = BANNER_MAP[pageKey];
+                if (i18nKey) {
+                    heroEl.style.display = '';
+                    textEl.textContent = (window.i18n ? window.i18n.t(i18nKey) : i18nKey);
+                } else {
+                    heroEl.style.display = 'none';
+                }
+            }
+
+            // 显示首页 frame，隐藏内容页 frame
+            function showHomeFrame() {
+                activeFrame = homeFrame;
+                homeFrame.classList.remove('frame-hidden');
+                pageFrame.classList.add('frame-hidden');
+            }
+
+            // 显示内容页 frame，隐藏首页 frame
+            function showPageFrame() {
+                activeFrame = pageFrame;
+                pageFrame.classList.remove('frame-hidden');
+                homeFrame.classList.add('frame-hidden');
+            }
+
+            // 切换页面
+            function switchPage(pageKey, pushState) {
+                if (pageKey === currentPage) {
+                    // 首页漂移检测（如 iframe 内跳转到了 gallery.html）
+                    if (isHomePage(pageKey)) {
+                        try {
+                            var hp = homeFrame.contentWindow.location.pathname;
+                            if (hp.indexOf('home-content.html') === -1) {
+                                // 首页 iframe 已漂移，强制重新加载
+                                homeFrame.src = 'home-content.html';
+                                homeFrameReady = false;
+                            }
+                        } catch (e) {}
+                    } else {
+                        // 内容页漂移检测（如 iframe 内跳转到了 notice-details.html）：
+                        // 点击当前板块面包屑/导航时若内容页已漂移，强制重新加载目标内容页
+                        try {
+                            var cp = pageFrame.contentWindow.location.pathname;
+                            if (cp.indexOf(getContentFile(pageKey)) === -1) {
+                                pageFrameReady = false;
+                                showOverlay();
+                                pageFrame.src = getContentFile(pageKey);
+                            }
+                        } catch (e) {}
+                    }
+                    return;
+                }
+                currentPage = pageKey;
+
+                if (isHomePage(pageKey)) {
+                    // ===== 切换到首页：直接显示持久 iframe，零加载 =====
+                    showHomeFrame();
+                    hideOverlay();
+                } else {
+                    // ===== 切换到其他页面：content-frame 按需加载 =====
+                    showPageFrame();
+                    var contentFile = getContentFile(pageKey);
+                    // 检测是否已在目标页面（避免重复加载）
+                    var needLoad = true;
+                    try {
+                        var curPath = pageFrame.contentWindow.location.pathname;
+                        if (curPath.indexOf(contentFile) !== -1) needLoad = false;
+                    } catch (e) {}
+                    if (needLoad) {
+                        pageFrameReady = false;
+                        showOverlay();
+                        pageFrame.src = contentFile;
+                    } else {
+                        hideOverlay();
+                    }
+                }
+
+                // 更新 URL（不刷新页面）
+                if (pushState !== false) {
+                    var newUrl = isHomePage(pageKey)
+                        ? window.location.pathname
+                        : window.location.pathname + '?page=' + pageKey;
+                    window.history.pushState({ page: pageKey }, '', newUrl);
+                }
+
+                updateHeaderNav(pageKey);
+                updateHeroBanner(pageKey);
+            }
+
+            // 暴露全局方法，供 header 和 common.js 调用
+            window.__shellSwitchPage = switchPage;
+
+            // ===== 初始化 =====
+            var initialPage = getPageFromUrl();
+            currentPage = initialPage;
+            homeFrame.style.height = '800px';
+            pageFrame.style.height = '800px';
+
+            if (isHomePage(initialPage)) {
+                // 初始就在首页：显示 home-frame（已在 HTML 中设置了 src）
+                showHomeFrame();
+            } else {
+                // 初始在其他页面：home-frame 后台静预加载，content-frame 加载目标页
+                showPageFrame();
+                showOverlay();
+                pageFrame.src = getContentFile(initialPage);
+            }
+            updateHeaderNav(initialPage);
+            updateHeroBanner(initialPage);
+
+            // home-frame 加载完成
+            homeFrame.addEventListener('load', function () {
+                homeFrameReady = true;
+                // 如果当前正在显示首页，隐藏 overlay
+                if (isHomePage(currentPage)) hideOverlay();
+            });
+
+            // content-frame 加载完成
+            pageFrame.addEventListener('load', function () {
+                pageFrameReady = true;
+                if (!isHomePage(currentPage)) hideOverlay();
+            });
+
+            // 接收消息：高度自适应 / 页面导航切换 / 语言切换
+            window.addEventListener('message', function (e) {
+                if (!e.data) return;
+                if (e.data.type === 'iframe-height') {
+                    var h = Math.max(e.data.height || 0, 500);
+                    // 通过 e.source 识别来源 frame，只更新当前激活 frame 的高度
+                    if (e.source === homeFrame.contentWindow) {
+                        homeFrame.style.height = h + 'px';
+                    } else if (e.source === pageFrame.contentWindow) {
+                        pageFrame.style.height = h + 'px';
+                    }
+                } else if (e.data.type === 'shell-navigate') {
+                    var page = e.data.page || 'index';
+                    var key = page.replace('.html', '').replace('-content', '');
+                    if (key === 'home') key = 'index';
+                    switchPage(key, true);
+                } else if (e.data.type === 'dashboard-message') {
+                    // iframe 内消息转发至最外层显示，避免被壳页面头部遮挡
+                    if (window.ELEMENT && window.ELEMENT.Message) {
+                        window.ELEMENT.Message({
+                            showClose: true,
+                            message: e.data.message,
+                            type: e.data.msgType || 'info',
+                            duration: e.data.duration || 3000
+                        });
+                    }
+                } else if (e.data.type === 'fpga-lang-change') {
+                    updateHeroBanner(currentPage);
+                }
+            });
+
+            // 语言切换（含从 header 直接切换的场景）时刷新 hero-ny 标题。
+            // header 与 shell 同处一个 window，switchLang 派发的是 fpga-lang-changed
+            // CustomEvent 而非 postMessage，故上面的 message 监听不会触发，这里补齐。
+            window.addEventListener('fpga-lang-changed', function () {
+                updateHeroBanner(currentPage);
+            });
+
+            // 浏览器前进/后退
+            window.addEventListener('popstate', function (e) {
+                var page = (e.state && e.state.page) || getPageFromUrl();
+                currentPage = ''; // 重置以允许切换
+                switchPage(page, false);
+            });
+
+            // 拦截 footer 导航链接，走无刷新切换
+            document.addEventListener('click', function (e) {
+                var link = e.target.closest ? e.target.closest('a[href]') : null;
+                if (!link) return;
+                if (!link.closest('#footer-container')) return;
+                var href = link.getAttribute('href');
+                if (!href) return;
+                var fileName = href.split('/').pop().split('?')[0];
+                var key = fileName.replace('.html', '');
+                if (PAGE_MAP[key]) {
+                    e.preventDefault();
+                    switchPage(key, true);
+                }
+            }, true);
+        })();
+    </script>
+</body>
+
+</html>

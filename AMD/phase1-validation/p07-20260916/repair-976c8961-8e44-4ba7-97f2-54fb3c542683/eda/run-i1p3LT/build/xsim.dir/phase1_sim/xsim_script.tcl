@@ -1,0 +1,1 @@
+xsim {phase1_sim} -autoloadwcfg -tclbatch {D:/AMD/phase1-validation/p07-20260916/repair-976c8961-8e44-4ba7-97f2-54fb3c542683/eda/run-i1p3LT/build/simulate.tcl}

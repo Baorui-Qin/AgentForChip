@@ -1,0 +1,1 @@
+xsim {phase1_sim} -autoloadwcfg -tclbatch {D:/AMD/phase1-validation/p09-output-budget-20260917-v2/experiments/repair-13698a00-03c8-419e-ac58-b9525bc98254/eda/run-AEsmA5/build/simulate.tcl} -sv_seed 1

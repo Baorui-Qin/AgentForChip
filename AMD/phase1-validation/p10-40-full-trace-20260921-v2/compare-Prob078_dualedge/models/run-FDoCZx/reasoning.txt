@@ -1,0 +1,378 @@
+The simulation fails with 223 mismatches. So my XOR approach is wrong for this test suite. Let's think about how the testbench likely works.
+
+The standard HDLBits solution for Dual-edge triggered FF (Problem 78) is:
+
+```verilog
+module top_module (
+    input clk,
+    input d,
+    output q
+);
+    reg p, n;
+    always @(posedge clk) p <= d ^ n;
+    always @(negedge clk) n <= d ^ p;
+    assign q = p ^ n;
+endmodule
+```
+
+This is THE canonical HDLBits solution, and it works. But here the testbench reports 223 mismatches out of 224 checks. That means basically everything mismatches — like the output is always wrong.
+
+Hmm, wait — 224 checks, 1 record. Maybe the check is comparing against a reference model where q is expected to hold d sampled at both edges. The XOR trick works if the registers are sampled correctly. However, there might be an initialization issue: at time 0, p and n are X. Then p^q... Actually with unknown initial values, p=X, n=X, q = X^X = X. Then the testbench might compare and get X mismatches at the start. But the first few checks... Actually the XOR trick requires the initial condition p=n=0 for consistency; the classic solution works because at start p and n are unknown, but after both edges pass, they become consistent? Let's check.
+
+Actually, the XOR trick: after the first posedge, p <= d ^ n (n=X initially) → p = X. Then negedge: n <= d ^ p = X. So they stay X forever! That's a problem. Hmm, but in HDLBits simulation, registers typically initialize to 0? No, in Verilog they initialize to X. But HDLBits solution... Actually many people note that this solution works in simulation because... hmm let me reconsider. Actually with X values, the XOR stays X indefinitely. Unless the testbench starts with a reset or with clk at 0 and the values... X^X = X, X^0 = X, X^1 = X. So indeed it locks into X.
+
+But actually in real HDLBits simulation this solution passes. Hmm. Let me think about a known correct behavior. The known HDLBits solution that passes:
+
+```verilog
+module top_module (
+    input clk,
+    input d,
+    output q
+);
+    reg p, n;
+    always @(posedge clk) p <= d ^ n;
+    always @(negedge clk) n <= d ^ p;
+    assign q = p ^ n;
+endmodule
+```
+
+Hmm, wait. Actually one issue: the RHS references. `p <= d ^ n` at posedge. But the "d ^ n" uses the OLD n. At the first posedge, n is X → p becomes X. Hmm.
+
+Actually, there's a variant that's more reliable:
+
+```verilog
+always @(posedge clk) p <= d;
+always @(negedge clk) n <= d;
+assign q = clk ? p : n;
+```
+
+This is glitchy but functionally may work in the testbench if there's no delay. Actually the combinational multiplexer on clk: at posedge clk, clk=1 selects p which is being updated to d... race. Hmm, output may glitch but settle. In a simple testbench sampling q after a delay or at clock edges, this might work.
+
+But the task says "without an output-select race" — hmm, that comment was mine in the source. Let me reconsider.
+
+The typical HDLBits testbench: it drives clk, d, and samples q. Let me think about what the checking is. "checks": 224, mismatches 223. So only 1 check passes — that's a global thing (like 1 record = the test). Actually "records":1 might be one test record with 224 checks inside. 223 mismatches means nearly every cycle mismatched. That strongly suggests X propagation throughout.
+
+Hmm, but actually X vs expected value would count as mismatch. So the XOR solution locking into X would give near-100% mismatch. So maybe I need a different approach.
+
+How to build a dual-edge FF that works in simulation with proper initialization? Options:
+
+1. Use the XOR trick but ensure initialization. We can't use initial blocks in synthesis... but for this task simulation matters. Actually maybe we could add `initial p = 0; n = 0;` but that's not synthesizable-friendly and the test may require synthesis. The task mentions "5 ns synthesis clock" and synthesis stage. Hmm.
+
+Wait, actually, does the XOR trick really lock into X? Let's simulate mentally with a testbench that starts clk=0.
+
+Actually many of these auto-generated testbenches (this looks like an HDLBits-derived dataset) test with a driver. Let me consider that the reference is a dual-edge FF: q updates on both posedge and negedge with the d value at that time.
+
+The XOR trick is known to be correct for the *stable* behavior. The X issue: In HDLBits, the initial value of regs at time 0 is X. But the first thing that happens... Let's trace with clk starting at 0, d = 0 or 1.
+
+t0: p=X, n=X, q = X^X = X.
+posedge: p = d ^ n = d ^ X = X (if d is 0 or 1). So p stays X.
+So indeed it never recovers. So the standard solution wouldn't pass simulation on HDLBits either... But it does pass. Why?
+
+Hmm, maybe because in HDLBits, and in many simulators, `reg` without initialization is X, but the XOR with X... Let me reconsider: In Verilog, X ^ 1 = X, X ^ 0 = X. Yes.
+
+Hmm so how does HDLBits solution pass? Let me search memory... Actually I recall the HDLBits solution page for "Dual-edge triggered flip-flop" shows:
+
+```verilog
+module top_module (
+    input clk,
+    input d,
+    output q
+);
+    reg p, n;
+    always @(posedge clk) p <= d ^ n;
+    always @(negedge clk) n <= d ^ p;
+    assign q = p ^ n;
+endmodule
+```
+
+And people report it works. The reason: In HDLBits, the clock starts at 0, and the testbench applies stimulus. Hmm. Actually wait — maybe the key: at the posedge, p <= d ^ n where n is X → p = X. Then at negedge, n <= d ^ p where p is now X → X. Hmm.
+
+Unless d ^ X where... no.
+
+OK, maybe HDLBits's simulator initializes regs to 0. Some simulators with 2-state (like the HDLBits custom simulator based on Icarus... or "Verilog simulator" that uses 4-state). Hmm. Actually I think HDLBits uses iverilog-like simulation and the solution does work there. So maybe something else: maybe the testbench applies an initial value. Actually many HDLBits testbenches toggle clk from time 0 with clk starting as 1.
+
+Hmm, regardless, if this custom test suite reports 223/224 mismatches for this canonical solution, then the expected behavior differs. Perhaps the expected model is: q = d at both edges, and this testbench could be sampling at a specific time.
+
+Hold on. Let me reconsider: maybe the issue is different — maybe the test suite drives d and clk, and compares q to a golden model that is a *combinational* something. 223/224 mismatch = basically always wrong, which for the XOR solution would happen if it's stuck at X (X never equals 0 or 1, so always mismatch except maybe at t0 if expected also X... no, expected would be 0 or 1).
+
+So the fix: avoid X lock-in. How?
+
+Idea: use the multiplexer approach with clk:
+
+```verilog
+logic p, n;
+always @(posedge clk) p <= d;
+always @(negedge clk) n <= d;
+assign q = clk ? p : n;
+```
+
+Trace: at t0 with clk=0, q = n = X. Hmm, still X until first negedge. If clk starts at 1... Let's think: clk starts at 0. p=X, n=X, q=n=X. posedge: p=d. q = clk?p:n → clk=1 → q=p=d. Good! Then negedge: n=d. q=clk?p:n → clk=0 → q=n=d. Good. So after the first posedge, it works. Only X before any edge, which is fine if the testbench only checks after edges. That explains 224 checks with maybe first check = X but expected also X or the check starts later.
+
+Hmm, but the mux has a race at the clock edge: at posedge, clk changes to 1 and p is updated to d simultaneously; q = p (new value d) — fine, q gets d either way since before posedge q=n=d_prev... wait no.
+
+Let's carefully trace the mux approach at a positive edge. Before posedge: clk=0, q=n (captured at previous negedge = d value at that time). At posedge, clk→1 so q=p; p is updated to current d. There's a race: does q momentarily show old p? Old p was set at previous posedge = d then. But q transitions from n(=old d) to p. Both are "d at the last edge" values. Hmm, at the posedge, expected q = d(current). p updates to d(current) at posedge. So q = p = d(current). Good, matches expectation after the edge settles. But during the race q might show old p (d at previous posedge) then new p. If the testbench samples after a delay (not exactly at edge), fine.
+
+Actually with nonblocking assignments p <= d and the mux assigning q = clk?p:n, at the posedge: clk updates, p updates in NBA region. The mux q is continuous assign, so it'll settle. Simulation delta-order could cause q to briefly be old p. If the tester samples q at the clock edge with #0 or at exact time, could be an issue.
+
+Alternatively, glitch-free approach: the XOR approach is glitch-free and race-free, which is why it's the canonical answer. So the X-lock-in is the concern.
+
+Hmm, wait. Let me reconsider whether the XOR approach locks into X. Actually, I realize: maybe the testbench's very first thing is a reset-like drive where d is set and the clock toggles, but with the "XOR" approach the initial X's never clear. Let me verify: q = p ^ n. If p=X and n=X, q = X. p <= d ^ n = X. Yeah, locked.
+
+So how does HDLBits pass? Let me reconsider — I think HDLBits auto-grader might treat X as matching anything? No, it compares to expected. Hmm.
+
+Actually! I recall now: The issue is that in HDLBits, the simulator (which is based on... I think it's "Icarus Verilog" compiled to WASM) — and the reference solution... Hmm.
+
+Actually here's a thought: In many of these HDLBits problems, the testbench does NOT compare q cycle-by-cycle with a golden reference. Instead, HDLBits testbenches drive inputs and the grader compares the final waveform... no, it does compare per-cycle.
+
+Hmm, let me think about HDLBits dualedge testbench. I believe it's:
+
+```verilog
+module top_module_testbench();
+   reg clk=0, d;
+   wire q;
+   top_module uut(clk, d, q);
+   ...
+```
+
+Hmm, I don't remember. There's a known trick: HDLBits uses "\\" clock generation `always #5 clk = ~clk;` with clk initialized to 0 in the reg declaration → clk starts at 0. Still X lock.
+
+Unless... the grader initializes all regs to 0 by default? Icarus doesn't.
+
+Hmm, actually maybe the real HDLBits solution passes because of a subtlety: `n <= d ^ p` — at the first negedge, p has been set to X at the posedge. Hmm.
+
+OK, let me step back. Rather than guess, maybe I can use a design that is robust to X and gives correct results. But X-lock-in: any design where the initial state is X and the output depends on it will be wrong until it settles. The mux approach settles after the first posedge (since p <= d, hmm but p starts X, then at posedge p=d). Yes, the mux approach recovers after the first edge. That's a big advantage.
+
+But wait — does it? At the first posedge, p <= d = known. So p becomes known. q = clk?p:n = p = d. Good, known after first posedge. So mux approach recovers.
+
+But is the mux approach what the expected model is? The expected model is "dual-edge triggered FF": q = d at every clock edge. Mux approach gives exactly that (after settling). So it should match, modulo edge-race sampling.
+
+However, there's a caveat: the checker might sample q exactly at the clock edge time with a zero-delay or might use `#1` after edge. Typically these testbenches generate stimulus and sample at some clock phase. Let's just think: the most robust solution that matches a dual-edge FF and is glitch-free...
+
+Alternative approach without X lock: use the XOR approach but with initialization to 0 via `initial` blocks? Synthesis might complain but many tools accept `initial` for FPGA. Hmm, but the task says synthesis is run and presumably must pass. `initial` blocks in synthesis for Xilinx: Vivado supports `initial` for register initialization on FPGA. But Yosys? The tool here probably uses Yosys or Vivado. Risky.
+
+Alternative robust approach: use two registers with opposite edges and a mux, but make it non-racy by... hmm.
+
+Actually, let me reconsider the XOR approach more carefully. Maybe I should reconsider: is it truly stuck at X? q = p^n = X. Then at the next posedge, p <= d^n = X. Yeah stuck. Unless the simulator's handling... Yeah stuck.
+
+Hmm, so why would the canonical HDLBits answer be that? Let me reconsider: maybe the canonical answer is:
+
+```verilog
+always @(posedge clk) p <= d;
+always @(negedge clk) n <= d;
+assign q = clk ? p : n;
+```
+
+Hmm, I actually think the HDLBits canonical solution uses the xor trick and it "works in simulation". Let me search memory harder: HDLBits "Dual-edge triggered flip-flop" — the solution section shows... I'm fairly sure it's the xor one. And there's a comment "This is a correct solution". And the reason it works in HDLBits simulation: because HDLBits simulates with the clock starting... 
+
+OK here's another thought: maybe HDLBits's testbench assigns initial values. Actually no. Hmm, but the "1 mismatch out of 224" here suggests exactly that: 1 check "passed" — maybe an initial check where both are X. And 223 failed. So the design is stuck at X. So the xor approach is X-stuck in this environment.
+
+Therefore use the mux approach. But will the mux approach pass? Let's reason about the testbench sampling. If the tester samples q at times aligned with clock edges (e.g., samples right at or just after edges), and our mux has a delta race, it might mismatch occasionally. Hmm.
+
+Safer: avoid race by making q depend on registered values only, with proper sampling. E.g.:
+
+Approach: q should reflect d sampled at both edges. Equivalent formulation: Let r = d delayed... hmm.
+
+Alternative glitch-free & X-robust approach:
+
+Use two registers p (posedge) and n (negedge), both capturing d, and select based on a *registered* version of clk? No, clk must select.
+
+Actually the cleanest: 
+```
+always @(posedge clk) p <= d;
+always @(negedge clk) n <= d;
+assign q = clk ? p : n;
+```
+The race: at posedge, clk=1 selects p. Since p is being assigned d via NBA, q will be old p during the clk update then new p. The tester probably samples after some delay. Since the expected value is d at the edge, and p becomes d, q converges to d quickly (delta cycles), so if the tester samples with any #delay > 0, it's fine.
+
+But if the tester samples combinational q at the exact edge time using `@(posedge clk); #0 q_sample`... hmm, could catch old p. Risky.
+
+Alternatively, think about what "checks=224" means. 224 = maybe 2 checks per cycle? Like each cycle checks q and something else? Or 224 cycles. With 5ns period... hmm.
+
+Let me think about a fully race-free and X-robust construction. 
+
+Hmm: what about using the xor trick but ensuring the initial values are defined? We can't set initial values without `initial`.
+
+But wait: could we design so it's self-consistent regardless of initial X? E.g., p <= d, n <= d, q = clk ? p : n — recovers. Or a different formulation:
+
+q = clk ? (d ^ n ... ) hmm.
+
+Let's think of the XOR trick's purpose: q = p ^ n where p is set on posedge to d^n and n on negedge to d^p. Invariant: p ^ n = q = d at last edge, and p and n alternate such that... Actually the trick: after posedge, p = d^n_old, so q = p^n_old = d. Good (n unchanged at posedge). After negedge, n = d^p_old so q = p_old ^ n = d. So q updates at each edge to the new d. Clever and glitch-free. It requires initial consistency: p^n should equal initial d or be X → but X^X=X. If p and n initialized to 0 and 1? Then q = 1. Hmm, but which initial is right?
+
+Actually if p and n both initialized to 0, then q=0 and it works: posedge p = d^0 = d, q = d^0 = d ✓. negedge n = d^p = d^d... wait n = d ^ p where p = d (current). n = d^d = 0. Then q = p^n = d^0 = d ✓. Next posedge: p = d_new ^ n(0) = d_new. q = d_new ✓. So with p=n=0 init it works perfectly and is glitch-free! Nice. But requires init.
+
+Can we get init without `initial`? Hmm. On FPGA, register power-up state is 0 by default unless specified. Simulation-wise, no.
+
+So: use the mux approach (self-recovering) — this is likely what passes. But is it glitch-free enough? Let's consider: the checker might be an HDLBits-style testbench. Let me recall the actual HDLBits testbench for dualedge... 
+
+I found in memory: HDLBits problem "Dualedge" testbench:
+```verilog
+module top_module ();
+	reg clk, d;
+	wire q;
+	...
+	initial begin
+		clk = 0;
+		...
+	end
+	always #5 clk = ~clk;
+```
+Something like that. And they sample at various times.
+
+Given the uncertainty, the mux approach is the standard "safe" HDLBits alternative? Hmm, actually many HDLBits users report the mux solution fails and xor works, or vice versa. Ugh.
+
+Hmm, let me reconsider. There is another possibility: this test suite's golden reference might be a dual-edge FF implemented in an idealized way, and the tester samples q with a delay after each edge, comparing to d at that edge. Then:
+- xor approach: fails due to X lock (matches observation: 223/224 fail).
+- mux approach: passes.
+
+Also given the observed result (nearly 100% fail), the xor approach is definitely wrong in this environment. So switch.
+
+But we should be careful about the race. Let me consider an alternative that is both glitch-free and X-recovering, and doesn't rely on the clk mux race:
+
+Alternative: use the xor trick but with a "reset" via making the equations self-initializing:
+
+Hmm, what if we compute q directly from registered d values and clk but ensure no race by having q come from a register updated on both... no, can't.
+
+What about: 
+```
+logic p, n;
+always @(posedge clk) p <= d;
+always @(negedge clk) n <= d;
+assign q = clk ? p : n;
+```
+At posedge: clk goes 1. q = p. p is being updated to d. In Verilog, the continuous assignment q = clk ? p : n is evaluated whenever clk or p or n changes. At the posedge time, both clk (procedural/whatever drives it) and p change. Order of evaluation in the same delta: the always block schedules p update in NBA region; the assign q re-evaluates when clk changes (active region) giving q = old_p, then when p updates in NBA region, q re-evaluates giving new_p. So there's a delta glitch but settles within the same time step. A tester that samples q at the edge time with #0 or in a different order could see either value. But if the tester samples q after the clock edge (e.g., `@(posedge clk) ; #1; expected = d;`) then fine.
+
+Hmm, but the expected model: at posedge, expected q = d (current). Our q after settling = p = d (current, since p <= d at posedge). So matches.
+
+At negedge: clk → 0, q = n, n <= d so q = d (settled). Expected: q = d at negedge. ✓.
+
+However, consider the sampling at exactly the clock edge in a testbench that does: `@(posedge clk); if (q !== d) error;` with blocking `@(posedge clk)` — the check happens in the same time step as the edge, in the active region (or wherever the testbench process runs). Our q could be old_p at that moment. old_p = d value at previous posedge, which may differ from current d. → mismatch. Risky.
+
+Given the risk, maybe a design where q settles immediately with no race is better. 
+
+Idea: make the two state registers capture d such that the "select" is done by clk but using only pre-edge-stable values... Actually any clk-based mux requires clk.
+
+Alternative idea: Use the xor trick but fix the X issue by using a different invariant. What if instead:
+
+p <= d ^ n; and n <= d ^ p — the fix requires init.
+
+Hmm what if we use:
+```
+assign q = clk ? (d ^ n) : (d ^ p);
+```
+No that's weird.
+
+Let's think again — maybe there's an approach where the output is a registered value that updates on both edges using two registers and combinational xor, and the XOR is inherently glitch-free, and we can define initial values through... hmm, we could force initial values by using a "self-correcting" xor: 
+
+What if q = p ^ n where p and n are set such that p^n tracks d. Suppose at posedge: p <= ~(d ^ n)? Then q = p^n = ~d... no.
+
+The X-lock happens because XOR of X's is X. If instead we used a construction with an OR or a form that resolves X... e.g., q = p | n etc. Hmm.
+
+What about a completely different construction: 
+
+Use two registers, one clocked on posedge, one on negedge, each storing d; and output q = clk ? p : n. Requires mux on clk. Race exists.
+
+Alternatively: use a single register clocked on both edges via... not allowed.
+
+Hmm, what about generating an internal clock-ish signal? Since the design has only clk, d, q ports, we could create a "toggle" register: 
+
+t <= ~t at both edges — same dual-edge problem.
+
+Hmm. What about using a delay-line approach: q = d XOR something... 
+
+Actually, here's a thought: a dual-edge FF is equivalent to: q changes at every edge to d. Equivalently, consider signal x = d ^ q_prev... no.
+
+Let's think: define e = XOR of d sampled... 
+
+Actually, here's a neat construction: Let r be a register toggled on every edge, and let... hmm.
+
+I think the mux approach is the intended "functionally behaves like dual-edge FF" answer. And the task comment mentioned "output-select race" — my previous self-wrote comment. Hmm, that comment was in the current source (mine). It says "without ... an output-select race", meaning the previous author (me) chose xor to avoid the mux race. But it fails.
+
+Let's consider what the testbench likely does. Since this is an auto-generated dataset ("Prob078_dualedge"), the testbench is probably also auto-generated to check the functionality: drive d, toggle clk, check q at appropriate times. It reported 224 checks. If it sampled exactly at edge with race, the canonical HDLBits-passing solution... hmm.
+
+Given the observation that the XOR solution yields 223/224 mismatches, the XOR solution is definitively not acceptable here. Let me try the mux approach and see.
+
+Actually wait. Let me reconsider: maybe the issue with XOR is not X-lock but that the testbench expects q to update at the edge and the xor approach's q update timing (settles right after the edge) is fine... but stuck at X. 223 out of 224 mismatched. If it were a race issue, we'd see a fraction of mismatches, not ~100%. So it's X-lock (or a fundamental model mismatch). Hmm, but could it be a fundamental model mismatch, like the tester expects q to be a *delayed* version? Hmm.
+
+Actually hold on, maybe the tester's expected model is also a Verilog dual-edge FF described with `always @(posedge clk or negedge clk) q <= d;` — that's legal in simulation compilers (just not synthesizable). If the golden model is that, then expected q updates at both edges. The xor approach should match that after settling... except for X-lock in the DUT making q=X forever. Yes! So expected = 0/1, DUT = X → mismatch always. That fits 223/224.
+
+Great, so the fix is to get a non-X-stuck design. The mux approach recovers. Let's also double check the mux approach vs the golden `always @(posedge clk or negedge clk) q <= d`: at each edge, golden q becomes d. Our q settles to d at each edge. Mismatch only if the tester samples during the delta glitch window. With a golden model using NBA, the tester likely samples after a small delay or after the edge settles. Since the golden model also uses NBA and the checker must wait for the golden to settle, it probably samples after the edge (e.g., at a time when it reads both). Actually typically the checker in such testbenches: it drives clk and d, and at each interesting time compares DUT q to expected q computed by the golden model — both sampled at the same simulation time. If sampled in the same time step but after NBA region (e.g., in a `#0` or after `@(posedge clk)` in a separate process with a small delay), our mux settles. Both NBA updates in the DUT (p, n) and the golden q happen in the NBA region, then active region re-evaluation of assigns... Our q = clk?p:n is a continuous assign, evaluated after NBA updates in the same time step (in the "post-NBA" active region). So by the end of the time step, q is settled. A checker that samples in the same time step but scheduled after NBA (e.g., using a `#0` delay or a separate always block with a delay) would see settled q. Should be OK.
+
+Hmm, but risk: the checker could be like: `@(posedge clk); if (q !== d) mismatch++;` — this runs in the active region at the edge, potentially before NBA updates p. Then q = old p (or n). Let's see: right at posedge before NBA, clk has been set to 1 (by the clk driver — but the clk driver itself is also a procedural assignment... if the clk driver uses `always #5 clk = ~clk` blocking, clk updates in active region; the checker's @(posedge clk) triggers, resumed in active region, reads q = clk?p:n = 1?old_p:... = old_p). old_p = d at previous posedge. Expected (golden) = d at this posedge = maybe different. → mismatch. That would make the mux approach fail too, partially. But not 100%.
+
+Hmm, but how many mismatches would that produce? If the checker uses that pattern, every edge could mismatch → ~100%. Hmm. But then no solution would work except one whose output is a register updated at the edge... which is impossible without dual-edge.
+
+Unless... the checker samples with a delay like `#1` after the edge. Then it waits for NBA.
+
+I think the likely testbench: generates a clock with `always #5 clk = ~clk` (period 10? or #2.5), applies d changes, and samples q with `#1` after each edge or at certain times. Let's just try the mux approach.
+
+Alternatively, consider a hybrid that is both X-recovering and glitch-free/race-free... Is there one? 
+
+Hmm: what about using the xor trick but where the initial state is guaranteed consistent because we use a construction that XORs with something else? Like:
+
+p <= d ^ n; n <= d ^ p; with p,n possibly X → q = X.
+
+What if instead: p <= d XOR n; n <= ~(d XOR p)? Then at posedge with p=X,n=X: p=X... hmm no XOR still.
+
+Use OR instead: p <= d | n; n <= d & p? Let's test: purpose: q should be d, with two registers... Let's define q = something. Hmm.
+
+Let's think: we want output q = d after every edge, glitch-free. Consider registers a (posedge) and b (negedge) and q = f(a,b). At posedge, a updates to something; q must become d. At negedge, b updates; q must become d. And q must not glitch in between (a and b only change at their edges, but f is combinational so it changes when a or b changes, i.e., at edges — that's fine, q only changes at edges; any transient during the edge is a delta glitch).
+
+For XOR trick, q = a^b. At posedge: a <= d^b_old ⇒ q_new = d. At negedge: b <= d^a_old ⇒ q_new = d. Correct. X lock: a=b=X ⇒ q=X forever.
+
+Is there another function f that's self-healing? Suppose q = a | b with a <= something. Hmm, we need q = d exactly (both 0 and 1). 
+
+Consider a "toggle-based" approach: Actually, let's think of it as: the output q is a register-like element that we can't build; we approximate with mux. The mux approach: q = clk ? a : b. At posedge, clk=1 → q = a; a <= d ⇒ q = d after settle. At negedge, clk=0 → q = b; b <= d ⇒ q=d. Before the first edge q = b = X → 1 mismatch maybe.
+
+Alternatively, implement the dual-edge FF as: q = clk XOR (something)? Hmm, e.g., a toggle FF: q toggles at each edge: q <= ~q at both edges — same problem.
+
+I think the mux approach is the standard, correct, and expected. Let's also consider an even better mux variant that reduces the race: none really.
+
+Hmm, but actually wait. Let's reconsider: maybe there's an issue with the mux approach's race creating a *permanent* wrong value for one cycle? No, it settles within the time step.
+
+Let me think about whether the checker might be a cycle-based comparison where it samples DUT q and expected q at the same simulation time, both after NBA. With golden `always @(posedge clk or negedge clk) q_ref <= d;` — the golden's q_ref settles in NBA. The DUT's q is a continuous assign that settles after NBA. If the checker samples using `#0` or `#1` it's fine. If the checker is a separate always block `always @(clk) ...` hmm.
+
+Actually, maybe the checker is structured as: a "monitor" that at each clk edge (both edges) does `#1; compare q to d;`? Or it drives d and then reads q.
+
+I'll go with the mux approach. Actually, hmm, let me think about whether there's a cleverer approach that is glitch-free AND X-recovering, matching the golden exactly even under zero-delay sampling.
+
+Idea: Since q must equal d at edges, and the golden model is a dual-edge register, maybe we can build the DUT as:
+
+```
+logic p, n;
+always @(posedge clk) p <= d;
+always @(negedge clk) n <= d;
+assign q = (clk) ? p : n;
+```
+
+Zero-delay sampling at the edge: at the posedge, before NBA, clk is already 1 (if the clk driver updates clk in the active region before the checker resumes — but ordering among active-region processes is nondeterministic in Verilog if the checker is triggered by @(posedge clk)). Actually the checker `@(posedge clk)` resumes when clk changes to 1. Then the checker reads q. At that moment, p is still old_p (NBA not yet applied). q = 1 ? old_p : n = old_p. Golden q_ref: also hasn't updated yet (NBA pending) → q_ref = d at previous edge? Hmm, golden q_ref updates at the same posedge via NBA. So at this instant q_ref is also old. So the checker reading both at this instant would compare old_p vs old_q_ref. Consistent? old_p = d at previous posedge. old_q_ref = d at previous edge (which was negedge!). Hmm, they'd differ if d changed.
+
+This is getting too deep. The empirical result will tell: let's try the mux and see. If it fails, I'll adapt.
+
+Actually, let me think about which is more likely for an auto-generated testbench from this dataset family (looks like HDLBits-derived with auto TB). The checker probably: applies clock, random d, and compares with a reference model computed in the testbench, sampling after settling. Given the observed "224 checks", maybe 224 time steps checked. Fine.
+
+Let me write:
+
+```systemverilog
+module TopModule (
+    input  logic clk,
+    input  logic d,
+    output logic q
+);
+    logic p, n;
+
+    always @(posedge clk) p <= d;
+    always @(negedge clk) n <= d;
+
+    assign q = clk ? p : n;
+endmodule
+```
+
+Hmm, but I'm worried. Let me think about the X-lock more: is there a way to make an X-recovering XOR? 
+
+What if we use the xor trick but with n captured as ~d on negedge... Let's try to find a formulation with invariant q = d.
+
+Let f(p,n) = q. Constraints: at posedge, p_new = g(d, n, p); require f(p_new, n) = d for all n (that satisfies invariant f(p,n)=d_prev). At negedge, n_new = h(d,p,n); require f(p,n_new) = d.
+
+With f = XOR: g = d^n works since p_new^n = d. h = d^p works.
+
+Other f options: f(p,n) = XNOR(p,n) = ~(p^n). At posedge: need ~(p_new ^ n) = d ⇒ p_new ^ n = ~d ⇒ p_new = ~d ^ n. OK so g = ~d^n. At negedge: n_new = ~d ^ p. Then initial p=n=X... 0 also works: p=n=0 → q=1 initially, then posedge p = ~d, q = ~(~d ^ 0)=... wait let me recompute: q = ~(p^n). posedge p_new =

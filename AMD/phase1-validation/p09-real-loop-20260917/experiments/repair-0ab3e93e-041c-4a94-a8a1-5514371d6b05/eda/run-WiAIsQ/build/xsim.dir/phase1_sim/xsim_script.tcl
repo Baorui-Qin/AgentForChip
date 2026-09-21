@@ -1,0 +1,1 @@
+xsim {phase1_sim} -autoloadwcfg -tclbatch {D:/AMD/phase1-validation/p09-real-loop-20260917/experiments/repair-0ab3e93e-041c-4a94-a8a1-5514371d6b05/eda/run-WiAIsQ/build/simulate.tcl}

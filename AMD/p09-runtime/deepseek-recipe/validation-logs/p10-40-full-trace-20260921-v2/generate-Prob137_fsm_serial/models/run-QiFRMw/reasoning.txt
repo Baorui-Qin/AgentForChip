@@ -1,0 +1,259 @@
+We need answer final with one complete DUT between [BEGIN] and [DONE]. Need implement TopModule FSM serial receiver.
+
+We need reason carefully. Specification: input clk, reset, in, output done. Active-high synchronous reset. Serial protocol: idle line 1. Start bit 0, 8 data bits LSB first, stop bit 1. FSM identifies start bit, waits 8 data bits, verifies stop bit. If stop bit does not appear when expected, FSM must wait until it finds a stop bit before attempting to receive next byte. done output presumably asserted when byte correctly received? Need infer. This is classic HDLBits problem "Fsm serial" or "Fsm serialdata"? Actually known HDLBits problem "Fsm serial" maybe. Let's recall.
+
+Problem statement: "In many (older) serial communications protocols, each data byte is sent along with a start bit and a stop bit, to help the receiver delimit bytes from the stream of bits. One common scheme is to use one start bit (0), 8 data bits, and 1 stop bit (1). The line is also at logic 1 when nothing is being transmitted (idle). Implement a finite state machine that will identify when bytes have been correctly received when given a stream of bits. It needs to identify the start bit, wait for all 8 data bits, then verify that the stop bit was correct. If the stop bit does not appear when expected, the FSM must wait until it finds a stop bit before attempting to receive the next byte. Include a active-high synchronous reset. Note that the serial protocol sends the least significant bit first."
+
+This exactly HDLBits problem "Fsm serial" (maybe "Serial receiver"). The expected FSM likely outputs done as 1 when stop bit correct? Let's search memory: HDLBits problem "Fsm serial" has module top with clk, reset, in, done. The solution uses states: idle, start, data 0..7, stop, wait. Done is assigned in stop state when in==1? Wait.
+
+Let's recall HDLBits "Fsm serial" problem. There is a known Verilog solution:
+```
+module top_module(
+    input clk,
+    input reset,
+    input in,
+    output done
+);
+
+    parameter idle=0, start=1, data0=2, data1=3, ..., data7=10, stop=11, wait=12;
+    reg [3:0] state, next_state;
+
+    always @(*) begin
+        case(state)
+            idle: next_state = in ? idle : start;
+            start: next_state = data0;
+            data0: next_state = data1;
+            ...
+            data7: next_state = stop;
+            stop: next_state = in ? idle : wait;
+            wait: next_state = in ? idle : wait;
+        endcase
+    end
+
+    always @(posedge clk) begin
+        if(reset) state <= idle;
+        else state <= next_state;
+    end
+
+    assign done = (state == stop) && in; // maybe?
+endmodule
+```
+Wait done should be asserted when byte correctly received, i.e., at the stop bit? If state==stop and in==1, then stop bit is correct. But done might be combinational output that is high during the stop bit cycle. Or registered after verifying? Let's examine problem wording: "Implement a finite state machine that will identify when bytes have been correctly received when given a stream of bits. It needs to identify the start bit, wait for all 8 data bits, then verify that the stop bit was correct. If the stop bit does not appear when expected, the FSM must wait until it finds a stop bit before attempting to receive the next byte." Output done. Usually in HDLBits, done is asserted when stop bit is detected, i.e., in stop state with in=1. The FSM goes to idle next cycle. The done output is high for one cycle when stop bit is received. Let's confirm from known solutions.
+
+I remember HDLBits problem "Fsm serial" has the following state transition diagram:
+- idle: if in=0 -> start, else idle.
+- start: -> data0 (unconditionally? Actually start bit is sampled as 0; we are already in start state for one cycle after detecting in=0. Then next is data0. The start bit is the 0 that caused transition. So we have seen start bit.)
+- data0..data7: shift through 8 data bits, one per cycle.
+- stop: if in=1 -> idle, else wait. done = (state==stop && in==1).
+- wait: if in=1 -> idle, else wait. (Wait until stop bit found; then go idle, not start a new byte immediately? "wait until it finds a stop bit before attempting to receive the next byte." So after finding stop bit, go to idle, then next cycle can detect start bit. So in wait: if in=1 -> idle else wait.)
+This matches.
+
+But need be careful: In stop state, if in=1, done should be 1. If in=0, done=0, go to wait. In wait state, if in=1, go to idle. If in=0, stay wait. That means we treat the first 1 after an invalid stop as the stop bit, even if it's not exactly one bit time after? The spec says "wait until it finds a stop bit before attempting to receive the next byte." So yes, any 1 is considered stop bit and we go idle.
+
+Potential issue: What about start bit detection? The line is idle 1. When in=0, we consider start bit. We are in idle state at cycle when in=0? The FSM is synchronous: state updates on posedge. So if in=0 during cycle when state=idle, next_state=start. Then at next posedge state becomes start. During the next cycle, in is the first data bit? Wait, the start bit is the 0 that we detected. If we transition to start at next clock edge, we have "consumed" one cycle? Let's trace: At cycle T, state=idle, in=0. At posedge T+1, state becomes start. During cycle T+1, in is the bit following the start bit? Actually the serial stream: idle high, then start bit 0 for one bit period, then data bits. If the FSM samples at every clock edge, and the bit period is one clock cycle, then at the clock edge where we see in=0, that is the start bit. The next clock edge will see the first data bit. So if we set next_state=start when in=0 in idle, then at the next clock edge we enter start state, but we are already at the first data bit. That would mean we skip the start bit? Let's think carefully.
+
+In typical HDLBits problem, the FSM transitions from idle to start when in=0. Then from start to data0 unconditionally on next clock. So the start state lasts one clock cycle, during which the start bit is present? Wait, if idle sees in=0, that means the start bit has just arrived? Actually the input `in` is the level of the line during the current clock cycle. If we are in idle and in=0 during cycle T, that means the start bit is present during cycle T. At posedge T+1, we transition to start state. During cycle T+1, the line will present the first data bit (since start bit lasts one cycle). So if we transition to start, we have missed the start bit? But the FSM doesn't need to do anything with start bit except recognize it. The next state after start should be data0, which means we start sampling data bits. If we enter start at T+1, and then at T+2 we enter data0, then during T+2 we sample the first data bit? Wait, if start bit is during T, then first data bit is during T+1. If we enter start at T+1, then at T+2 we enter data0. During T+2, we sample the second data bit? That would be off by one.
+
+Let's re-evaluate. In many FSM designs for serial receiver, the state transitions are:
+- idle: if in==0, next=start
+- start: next=data0 (unconditional)
+- data0: next=data1
+...
+- data7: next=stop
+- stop: if in==1, next=idle; else next=wait
+This means:
+Cycle T: idle, in=0 (start bit). At posedge T+1, state becomes start.
+Cycle T+1: in=first data bit. state=start. At posedge T+2, state becomes data0.
+Cycle T+2: in=second data bit. state=data0. At posedge T+3, state becomes data1.
+...
+Cycle T+9: in=stop bit. state=data7? Let's count.
+
+Data bits: d0 at T+1, d1 at T+2, d2 at T+3, d3 at T+4, d4 at T+5, d5 at T+6, d6 at T+7, d7 at T+8, stop at T+9.
+Our states:
+T: idle
+T+1: start (sampling d0)
+T+2: data0 (sampling d1)
+T+3: data1 (sampling d2)
+T+4: data2 (sampling d3)
+T+5: data3 (sampling d4)
+T+6: data4 (sampling d5)
+T+7: data5 (sampling d6)
+T+8: data6 (sampling d7)
+T+9: data7 (sampling stop)
+T+10: stop (sampling next bit, which is idle or next start)
+
+So the FSM would check stop bit at T+10, but actual stop bit is at T+9. So it's off by one. This suggests that the transition from idle to start should not consume a cycle? Or the start state should be skipped? Let's check actual HDLBits problem. I recall the state diagram for "Fsm serial" has states: idle, start, data0...data7, stop, wait. The transition from idle to start is when in=0. Then from start to data0 unconditionally. Then from data0 to data1, etc. And done is asserted in stop state when in=1. Let's simulate with this: Suppose bit sequence: idle (1), start (0), 8 data bits, stop (1). Let's assume clock cycles align with bits. At cycle 0: idle, in=1. Cycle 1: start bit arrives, in=0. State at cycle 1: idle (since previous was idle). At posedge 1->2, state becomes start. Cycle 2: first data bit d0, state=start. At posedge 2->3, state becomes data0. Cycle 3: d1, state=data0. Cycle 4: d2, state=data1. ... Cycle 10: d7? Let's list:
+Cycle 1: idle, in=0 (start)
+Cycle 2: start, in=d0
+Cycle 3: data0, in=d1
+Cycle 4: data1, in=d2
+Cycle 5: data2, in=d3
+Cycle 6: data3, in=d4
+Cycle 7: data4, in=d5
+Cycle 8: data5, in=d6
+Cycle 9: data6, in=d7
+Cycle 10: data7, in=stop (1)
+Cycle 11: stop, in=next bit (idle 1 or start 0)
+So at cycle 10, state=data7, and we are sampling the stop bit. But we only check stop when state=stop, which is cycle 11. So we would check the bit after stop. That's wrong.
+
+Wait, maybe the FSM samples the start bit and then immediately goes to data0 without a separate start state? But the problem mentions "identify the start bit, wait for all 8 data bits, then verify that the stop bit". The start state might be used to wait one cycle? Let's look at known solution from HDLBits. I remember a solution:
+```
+module top_module(
+    input clk,
+    input reset,
+    input in,
+    output done
+);
+    parameter IDLE=0, START=1, D0=2, D1=3, D2=4, D3=5, D4=6, D5=7, D6=8, D7=9, STOP=10, WAIT=11;
+    reg [3:0] state, next;
+    always @(*) begin
+        case(state)
+            IDLE: next = in ? IDLE : START;
+            START: next = D0;
+            D0: next = D1;
+            D1: next = D2;
+            D2: next = D3;
+            D3: next = D4;
+            D4: next = D5;
+            D5: next = D6;
+            D6: next = D7;
+            D7: next = STOP;
+            STOP: next = in ? IDLE : WAIT;
+            WAIT: next = in ? IDLE : WAIT;
+        endcase
+    end
+    always @(posedge clk) begin
+        if(reset) state <= IDLE;
+        else state <= next;
+    end
+    assign done = (state == STOP) && in;
+endmodule
+```
+This is exactly what I wrote. But let's check timing again. If start bit is at cycle 1 (in=0), state=IDLE at cycle 1. At posedge 2, state=START. Cycle 2: in=d0, state=START. At posedge 3, state=D0. Cycle 3: in=d1, state=D0. ... Cycle 10: in=stop, state=D7? Let's recount:
+Cycle 1: IDLE, in=0 (start)
+Cycle 2: START, in=d0
+Cycle 3: D0, in=d1
+Cycle 4: D1, in=d2
+Cycle 5: D2, in=d3
+Cycle 6: D3, in=d4
+Cycle 7: D4, in=d5
+Cycle 8: D5, in=d6
+Cycle 9: D6, in=d7
+Cycle 10: D7, in=stop
+Cycle 11: STOP, in=next bit
+So indeed at cycle 10, state=D7, in=stop. At posedge 11, state=STOP. At cycle 11, in=next bit (idle). Then done is checked in STOP state with in=next bit. That would be wrong.
+
+Wait, maybe the bit sequence is such that the start bit is detected at the clock edge, and the first data bit is present on the very next cycle, but the FSM transitions to START at that same edge. Actually, if in=0 during cycle 1, the FSM sees it and at the same clock edge? Synchronous: the input is sampled at the clock edge. So at posedge 1 (start of cycle 1), the FSM samples in. But cycle 1 is the start bit? Let's define cycles by clock edges. At posedge, the FSM updates state based on the input value just before the edge. The input during the cycle before the edge is the value. So if the start bit is present during cycle 0 (between posedge 0 and posedge 1), then at posedge 1, the FSM sees in=0 and updates state to START. Then during cycle 1, the line has d0. At posedge 2, state updates to D0. So the FSM is in START during d0. Then in D0 during d1. So the FSM is always one bit behind? Actually, the FSM should sample the start bit, then sample d0, d1,... d7, then stop. If it enters START at posedge 1, then during cycle 1 it sees d0. But the START state doesn't do anything with the data, it just waits one cycle. Then during cycle 2, state=D0, sees d1. So it misses d0. It would sample d1 as the first data bit. That's wrong unless the FSM is supposed to sample the data bits in the data0..data7 states. Let's trace: If it samples d0 in data0 state, then data0 state must occur during d0. So the transition from START to D0 should happen at the same edge that START is entered? That is, if in=0 during cycle 0, at posedge 1, state becomes START. But if we want D0 during cycle 1 (d0), then at posedge 1 we should go directly to D0, not START. So the START state seems to consume a cycle.
+
+Maybe the start bit is not a separate clock cycle? In some protocols, the start bit is detected when the line goes low, and then the receiver samples the first data bit after half a bit period? But here it's synchronous with one bit per clock. The problem likely assumes the FSM samples at the clock rate, and the start bit is one clock cycle. The classic HDLBits solution I recall does have the start state, and it works because the done is asserted at the stop state, and the stop state is entered one cycle after the stop bit? Let's check the actual HDLBits problem "Fsm serial". I think I remember the state diagram: The FSM has states: IDLE, START, DATA0..DATA7, STOP, WAIT. The done output is registered? Or combinational? Let's search memory: In HDLBits, there is a problem "Fsm serial" where the solution is exactly as above. And it passes. How does it pass? Let's consider the testbench. The testbench likely drives `in` with the serial stream. The FSM samples `in` on each clock edge. The testbench probably aligns the bits such that the start bit is present for one clock cycle, then data bits, etc. If the FSM enters START on the clock edge after seeing start bit, it will be in START during the first data bit. Then it enters D0 on the next edge, during the second data bit. So it samples 8 data bits in states D0..D7? Let's count: D0 samples second data bit, D1 samples third, ..., D7 samples ninth bit? There are only 8 data bits. So D7 would sample the stop bit. Then STOP state would sample the next bit. That means the FSM is off by one. So maybe the FSM actually transitions from IDLE to D0 directly when in=0? But then what is START for? Let's look at the state diagram of HDLBits "Fsm serial". I can recall a solution from memory:
+```
+module top_module(
+    input clk,
+    input reset,
+    input in,
+    output done
+);
+    reg [3:0] state, next_state;
+    parameter IDLE=0, START=1, D0=2, D1=3, D2=4, D3=5, D4=6, D5=7, D6=8, D7=9, STOP=10, WAIT=11;
+    always @(*) begin
+        case (state)
+            IDLE: next_state = in ? IDLE : START;
+            START: next_state = D0;
+            D0: next_state = D1;
+            D1: next_state = D2;
+            D2: next_state = D3;
+            D3: next_state = D4;
+            D4: next_state = D5;
+            D5: next_state = D6;
+            D6: next_state = D7;
+            D7: next_state = STOP;
+            STOP: next_state = in ? IDLE : WAIT;
+            WAIT: next_state = in ? IDLE : WAIT;
+        endcase
+    end
+    always @(posedge clk) begin
+        if (reset) state <= IDLE;
+        else state <= next_state;
+    end
+    assign done = (state == STOP) && in;
+endmodule
+```
+Wait, maybe the bit order is LSB first, but the FSM doesn't care about data, only counts 8 bits. So it just needs to count 8 cycles after start. The start bit is detected when in=0 in IDLE. At that clock edge, state becomes START. Then the next 8 clock cycles are data bits. But if state becomes START, then the next cycle is START, then D0, D1, ..., D7. That's 1 (START) + 8 (D0..D7) = 9 cycles after the start bit. But there are only 8 data bits. So it would sample one extra bit. Unless the start bit is not a full clock cycle? Or the FSM samples the start bit and then immediately starts counting data bits on the next cycle? If the start bit is present at cycle T, and we transition to START at T+1, then at T+1 the first data bit is present. If we go to D0 at T+2, then D0 samples the second data bit. So we miss the first data bit. That would be incorrect. But maybe the done output is not used to validate data, just to indicate a stop bit. The problem says "identify when bytes have been correctly received". It doesn't require outputting the data. So if the FSM just counts 8 bits and checks stop, being off by one might still detect a stop bit incorrectly? But the testbench likely sends a stream and expects done to pulse at the correct time. The HDLBits testbench for this problem probably checks the timing of done. I need to get this exactly right.
+
+Let's think about the actual HDLBits problem "Fsm serial". I have seen it. The problem statement is exactly as given. The solution that is widely accepted is the one with START state. Let's simulate with a concrete stream and see when done pulses, and compare with expected. The expected behavior: The FSM should assert done when the stop bit is correctly received. The stop bit is the 10th bit after the start bit? Actually: idle (1), start (0), 8 data bits, stop (1). Total 10 bits. If we have a bit stream: 1 (idle), 0 (start), d0, d1, d2, d3, d4, d5, d6, d7, 1 (stop). The FSM should see start at bit index 1 (0-based), then data at 2..9, stop at 10. If clock cycles align with bits, then at cycle 1, in=0. Cycle 2, in=d0. ... Cycle 9, in=d7. Cycle 10, in=1 (stop). The FSM should assert done at cycle 10, because that's when stop bit is sampled. Now with the START state solution:
+Cycle 1: state=IDLE, in=0 -> next=START. At posedge 2, state=START.
+Cycle 2: state=START, in=d0. next=D0. At posedge 3, state=D0.
+Cycle 3: state=D0, in=d1. next=D1. At posedge 4, state=D1.
+Cycle 4: state=D1, in=d2.
+Cycle 5: state=D2, in=d3.
+Cycle 6: state=D3, in=d4.
+Cycle 7: state=D4, in=d5.
+Cycle 8: state=D5, in=d6.
+Cycle 9: state=D6, in=d7.
+Cycle 10: state=D7, in=stop (1). next=STOP. At posedge 11, state=STOP.
+Cycle 11: state=STOP, in=next bit (idle 1). done = (state==STOP && in) = 1. So done asserts at cycle 11, one cycle after stop bit. That is off by one. The expected done should be at cycle 10. So this solution would fail if the testbench checks done at the exact cycle.
+
+But wait, maybe the testbench doesn't check exact cycle? In HDLBits, the testbench usually compares the output to a reference implementation. The reference might be implemented differently. Let's look up the actual HDLBits problem "Fsm serial". I recall there is a problem "Fsm serial" and the solution on HDLBits is exactly as I wrote, with the START state. And it passes. How? Let's re-examine the timing. Perhaps the FSM samples the start bit at the same edge it transitions? No, synchronous logic samples at the edge. The input is the value before the edge. The state is updated at the edge. The output is combinational based on current state and current input. So if at cycle 1, state=IDLE, in=0, then at posedge 2, state becomes START. During cycle 2, state=START. The input during cycle 2 is d0. So the FSM is in START during d0. Then at posedge 3, state=D0. During cycle 3, input=d1. So D0 samples d1. That means the FSM samples d1, d2, d3, d4, d5, d6, d7, and stop? Let's list the states and the input they see:
+- START sees d0
+- D0 sees d1
+- D1 sees d2
+- D2 sees d3
+- D3 sees d4
+- D4 sees d5
+- D5 sees d6
+- D6 sees d7
+- D7 sees stop (1)
+- STOP sees next bit (idle 1 or start 0)
+So the FSM actually samples 7 data bits (d1..d7) and then in D7 it sees the stop bit. But it doesn't check the stop bit until STOP state. So it checks the bit after the stop. That seems wrong. However, note that the problem says "wait for all 8 data bits, then verify that the stop bit was correct." The FSM doesn't need to use the data bits, just count them. If it counts 8 cycles after start, it should check the 9th bit as stop. In the above, from start bit (cycle 1), the 9th bit is at cycle 10 (stop). The FSM checks stop at cycle 11, which is the 10th bit. So it's counting 9 cycles? Let's count cycles from start: Cycle 1 is start. Cycle 2 is d0. Cycle 3 d1. Cycle 4 d2. Cycle 5 d3. Cycle 6 d4. Cycle 7 d5. Cycle 8 d6. Cycle 9 d7. Cycle 10 stop. The FSM enters D0 at cycle 3, D1 at 4, ..., D7 at 10? Let's trace state sequence:
+Cycle 1: IDLE
+Cycle 2: START
+Cycle 3: D0
+Cycle 4: D1
+Cycle 5: D2
+Cycle 6: D3
+Cycle 7: D4
+Cycle 8: D5
+Cycle 9: D6
+Cycle 10: D7
+Cycle 11: STOP
+So D7 is at cycle 10, which is the stop bit. Then STOP is at cycle 11. So the FSM is in D7 when the stop bit is present. It then goes to STOP at cycle 11, when the next bit (idle) is present. So done would be asserted at cycle 11 if in=1 (idle). That would falsely indicate a stop bit when actually the stop bit was at cycle 10. So this design would accept a stop bit that is one bit late? But the testbench might send the next byte immediately? If the next byte starts, the bit after stop is start bit 0. Then at cycle 11, in=0, so done=0, and it goes to WAIT. That would fail to detect the correct stop bit at cycle 10. So this design seems wrong.
+
+Let's reconsider the state assignments. Maybe the transition from IDLE to START happens when in=0, but then START goes directly to D0 on the next cycle, and the data bits are sampled in states D0..D7. But if the start bit is at cycle 1, then at cycle 2 we are in START and see d0. Then at cycle 3 we are in D0 and see d1. So D0 samples d1. That means D0 is the second data bit. So D7 would sample the 9th bit, which is the stop bit. Then STOP state would sample the 10th bit. So it's off by one. To fix this, the FSM should transition from IDLE directly to D0 when it sees the start bit. But then what is START for? Maybe START is the state that samples the start bit? If the FSM is in IDLE, and in=0, it could transition to START. Then in START, it should transition to D0 unconditionally. But if it transitions to D0 at the next clock edge, then D0 is entered at the same time the first data bit is present? Let's align: If start bit is at cycle 1, then at posedge 2, state becomes START. During cycle 2, first data bit d0 is present. If we want D0 to sample d0, we should be in D0 during cycle 2. So we should transition from IDLE to D0 at posedge 2, not START. So the START state is unnecessary if the start bit is just one cycle. But the problem mentions "identify the start bit", which might just mean the transition from IDLE to D0 when in=0. However, the classic HDLBits solution does have a START state. Let's check the actual HDLBits problem "Fsm serial" again. I think I recall the state diagram: It has states: IDLE, START, DATA0, DATA1, ..., DATA7, STOP, WAIT. The transition from IDLE to START is on in=0. The transition from START to DATA0 is unconditional. The transition from DATA0 to DATA1, etc. The transition from DATA7 to STOP is unconditional. The transition from STOP to IDLE is on in=1, else WAIT. The done output is (state == STOP && in). This is exactly what I wrote. And I remember it being a valid solution on HDLBits. So how does it work? Let's re-examine the timing of the testbench. Maybe the testbench drives the input such that the start bit is present for one clock cycle, but the FSM samples it and then the first data bit is present on the next clock cycle. But the FSM enters START at the next clock edge, so START is active during the first data bit. Then at the following edge, it enters DATA0, which is active during the second data bit. So DATA0 samples the second data bit. Then DATA1 samples the third, ..., DATA7 samples the ninth bit (stop bit). Then STOP samples the tenth bit. So the FSM is checking the bit after the stop bit as the stop bit. That would mean it expects the stop bit to be at the position of the 9th bit? But the protocol is start, 8 data, stop. That's 10 bits. Start is bit 0, data bits 1-8, stop bit 9. If the FSM enters START at cycle 2 (which is data bit 1), then DATA0 at cycle 3 (data bit 2), ..., DATA7 at cycle 10 (data bit 9? Wait, data bits are 1-8, stop is 9. Let's index from 0: bit 0 = start, bits 1-8 = data, bit 9 = stop. If cycle 1 is start (bit 0), cycle 2 is bit 1 (d0), cycle 3 is bit 2 (d1), ..., cycle 9 is bit 8 (d7), cycle 10 is bit 9 (stop). The FSM state sequence:
+Cycle 1: IDLE
+Cycle 2: START
+Cycle 3: DATA0
+Cycle 4: DATA1
+Cycle 5: DATA2
+Cycle 6: DATA3
+Cycle 7: DATA4
+Cycle 8: DATA5
+Cycle 9: DATA6
+Cycle 10: DATA7
+Cycle 11: STOP
+So DATA7 is at cycle 10, which is the stop bit! Then STOP is at cycle 11, which is bit 10 (the next bit after stop, likely idle 1 or start of next byte 0). So the FSM is in DATA7 when the stop bit is present. But it doesn't check the stop bit in DATA7; it just goes to STOP unconditionally. So it ignores the stop bit value. Then in STOP, it checks the next bit. If the next bit is 1 (idle), it thinks stop is correct. So it would incorrectly accept a byte if the stop bit was 0 but the next bit is 1. That's a bug. However, the problem says: "If the stop bit does not appear when expected, the FSM must wait until it finds a stop bit before attempting to receive the next byte." This implies that the FSM should check the stop bit at the expected position. If it checks the next bit, it's not checking the stop bit. So the START state must be consuming an extra cycle. How to fix? The FSM should not have a START state, or the START state should be combined with the first data bit? Let's look at the HDLBits problem "Fsm serialdata" or something. There is another problem "Fsm serial" that has a different state diagram. Let me search my memory. I think there is a problem called "Fsm serial" where the state diagram is given in the problem statement. The diagram might have states: IDLE, START, DATA (with a counter), STOP, WAIT. Or it might have 8 data states. I recall a solution with a counter:
+```
+reg [3:0] count;
+always @(posedge clk) begin
+    if (reset) begin
+        state <= IDLE;
+        count <= 0;
+    end else begin
+        case (state)
+            IDLE: if (in == 0) begin state <= START; count <= 0; end
+            START: begin state <= DATA; count <= 0; end
+            DATA: begin
+                if (count == 7) state <= STOP;
+                else count <= count + 1;
+            end
+            STOP: if (in == 1) state <= IDLE; else state <= WAIT;
+            WAIT: if (in == 1) state <= IDLE;
+        endcase
+    end
+end
+assign done = (state == STOP && in);
+```
+This would have the same timing: START consumes a cycle. So it would sample 8 data bits in DATA state? Let's trace: Cycle 1: IDLE, in=0 -> state=START, count=0. Cycle 2: START, in=d0 -> state=DATA, count=0. Cycle 3: DATA, in=d1, count=0 -> count=1. Cycle 4: DATA, in=d2, count=1 -> count=2. ... Cycle 9: DATA, in=d7, count=6 -> count=7. Cycle 10: DATA, in=stop, count=7 -> state=STOP. Cycle 11: STOP, in=next bit. So again, DATA state samples d1..d7 and stop? Wait, count goes 0 to 7. When count=0, it samples d1 at cycle 3. When count=1, samples d2. ... count=6 samples d7 at cycle 9. count=7 samples stop at cycle 10. So it counts 8 cycles in DATA, but the first one (count=0) samples d1, not d0. So it misses d0. So the start bit is not sampled as data, but the first data bit is skipped. That would mean the FSM receives 8 bits, but they are d1..d7 and stop? That's only 8 bits total, but the stop is included as a data bit. Then STOP checks the next bit. That's clearly wrong.
+
+Unless the start bit is not a full bit period. In some UART, the start bit is detected, and then the receiver waits 1.5 bit periods to sample the first data bit. But here it's a synchronous FSM with one bit per clock. The problem likely assumes that the start bit is detected when the line goes low, and then the next clock cycle is the first data bit. The FSM should transition from IDLE to DATA0 on the same clock edge that it sees the start bit? But synchronous FSM can't transition and sample in the same cycle. The state updated at the edge reflects the input sampled just before the edge. So if the start bit is present during cycle T, at the edge T+1 the state becomes something. During cycle T+1, the first data bit is present. So to sample the first data bit in a data state, that data state must be active during cycle T+1. That means at edge T+1, the state should become DATA0. So the transition from IDLE should be directly to DATA0 when in=0. There is no need for a START state. But the problem says "identify the start bit". Maybe the IDLE state itself identifies the start bit and transitions to DATA0. The START state might be used if the start bit is not aligned with the clock? No, it's synchronized.
+
+Let's check the actual HDLBits problem "Fsm serial" on the web. I can't access internet, but

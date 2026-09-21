@@ -1,0 +1,35 @@
+
+module TopModule (
+  input  logic clk,
+  input  logic areset,
+  input  logic bump_left,
+  input  logic bump_right,
+  output logic walk_left,
+  output logic walk_right
+);
+
+  typedef enum logic {LEFT, RIGHT} state_t;
+  state_t state, next;
+
+  always_comb begin
+    if (bump_left && bump_right)
+      next = (state == LEFT) ? RIGHT : LEFT;
+    else if (bump_left)
+      next = RIGHT;
+    else if (bump_right)
+      next = LEFT;
+    else
+      next = state;
+  end
+
+  always_ff @(posedge clk or posedge areset) begin
+    if (areset)
+      state <= LEFT;
+    else
+      state <= next;
+  end
+
+  assign walk_left  = (state == LEFT);
+  assign walk_right = (state == RIGHT);
+
+endmodule

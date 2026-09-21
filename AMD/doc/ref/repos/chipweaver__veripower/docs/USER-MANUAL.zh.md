@@ -1,0 +1,505 @@
+# VeriPower 用户手册
+
+面向前端设计/验证工程师。从装环境到签核，按实际操作顺序走一遍。人工介入点在流程中标出，末尾附两张速查表。
+
+---
+
+## §0 一句话介绍
+
+VeriPower 把一份已经敲定的模块需求，一路推到前端签核。Spec、验证计划、RTL、lint/CDC、综合、时序、仿真、功耗，八个阶段由 Orchestrator 自动派发和返工，你在四类节点上出手来把控质量。
+
+---
+
+## §1 完整流程
+
+以下用 `{module}` 表示模块名。整棵工作树就放在同名目录下，命令里给的也是它。不在它的上一层目录里时，给出到该目录的路径。
+
+### 1.1 开跑前
+
+**装本插件**
+
+Claude Code:
+
+```bash
+claude plugin marketplace add chipweaver/veripower
+claude plugin install veripower@chipweaver
+```
+
+或 clone 源码后从命令行启动：`claude --plugin-dir /path/to/veripower`。
+
+opencode —— 把插件加进 `~/.config/opencode/opencode.json` 或项目级 `opencode.json`:
+
+```json
+{ "plugin": ["veripower@git+https://github.com/chipweaver/veripower.git"] }
+```
+
+然后带两个环境变量启动：
+
+```bash
+OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true \
+OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX=131072 opencode
+```
+
+第一个开关放开后台子 agent，阶段派发跑在上面。第二个不能省：opencode（1.18.x）会把每次
+补全截到 32,000 token，无视模型自身声明上限，较长的 RTL 编写输出可能因此被截断。
+
+DeepSeek Harness —— 装进你要跑的 profile：
+
+```bash
+dsh plugin --profile web add "veripower@git+https://github.com/chipweaver/veripower.git"
+dsh web
+```
+
+它以 profile 层的形式装入，并自己找到 `skills/`，无需任何配置。用 `web`，不要用一次性的
+`headless` —— 派发出去的阶段会活过派发它的那个回合，而 `headless` 回合一结束就退出。
+
+Codex — 安装原生插件（已在 Linux、CLI 0.153.4 验证）：
+
+```bash
+codex plugin marketplace add chipweaver/veripower
+codex plugin add veripower@chipweaver --json
+```
+
+使用安装输出中的 `installedPath`，运行 `python3 <installedPath>/codex/setup.py`，
+然后以 `codex --profile veripower` 启动。在 `/hooks` 中审核并信任 VeriPower 的两个
+hook，再开启新会话。专用配置将判断命令的审批交给用户；后台阶段使用原生子代理，
+父线程等待完成后继续调度。升级步骤与验证范围见 [Codex 适配说明](../codex/README.md)。
+
+**Python**
+
+支持 **3.10 / 3.11 / 3.12**。
+
+```bash
+python3 --version
+```
+
+装依赖包：
+
+```bash
+pip install "jsonschema>=4.18" referencing PyYAML
+```
+
+或源码目录内执行：
+
+```bash
+pip install -r requirements.txt
+```
+
+**EDA 工具与 license**
+
+要装的工具、要设的变量见 [`eda-env.md`](eda-env.md)。包括 `dc_shell` / `pt_shell` / `vcs` / `spyglass`、`fsdbreport` / `fsdb2vcd`、`make` / `urg`、license 变量、`LIB_DB` / `LIB_V` / `UVM_HOME`，还有 `/bin/sh` 要指向 `bash`。
+
+只跑 `specification` / `simulation-plan` / `rtl-design` 的话，这段可以跳过，不需要任何 EDA 工具。
+
+**`env-precheck` 环境检查**
+
+环境准备好之后，在一个独立会话里：
+
+> 运行 env-precheck 技能
+
+它逐行核对工具与变量，再实跑一遍各工具命令确认能 checkout，最后报出这台机器能跑的阶段清单。只报告，不改环境。缺变量时打印 `export` 行给你自己贴。
+
+### 1.2 输入件
+
+整条流水线只认一个目录：`{module}/intent/`。文档以 `brainstorm.md` 的名字放进去，文档依赖的东西一起放进去，里面怎么组织随你。怎么来有两条路。
+
+**一、你已经有规格文档**：直接存成 `{module}/intent/brainstorm.md`，什么形状都行，它引用的东西也放进这个目录：参考模型、寄存器表、标准原文。你的文档指为权威的文件，会由需要它的阶段在原地读取。有两件事要知道。放在 `intent/` 之外的文件不属于意图——没有阶段拿得到它，它变了也没有阶段察觉；你的文档若指着这样一个路径，需要它的阶段会在你的第一道门上说出来。符号链接按它指向哪里记账，不按那里有什么，所以共享规格在链接背后变了是看不见的——请直接拷进来。不用再跑 brainstorm：`specification` 会把文档里每一条要求转录进 `requirements.json`，一行一条，用你的原话，对文档怎么组织不做任何假设。
+
+**二、从零生成**：在**独立会话**里：
+
+> 为 {module} 运行 brainstorm 技能
+
+它一次问一个问题，每问都附上它自己的答案和理由，所以你是在挑，不是在写。范围、功能、顶层接口、时钟复位
+及其跨越、架构分区、时序场景、PPA 目标、下游阶段还缺什么，逐项要么定下、要么明确留白，才算问完。你已经
+带来的东西，它不会再问一遍。
+
+跑完它**只把路径交给你**，不回显正文。你读磁盘上那份文件，**确认内容没问题即可启动流水线**。
+
+不管走哪条路，文档里写了什么，流水线就按什么判，多一条也没有：你没写的界限不会被判，你写的每一条要么由某个阶段判，要么在账本门上由你判，要么作为流水线判不了的东西明示给你。文档里漏掉的时钟和顶层接口，会在账本门上以 specification 无法实现的行的形式冒出来。
+
+> **目前不支持**：把已有的 RTL、testbench 作为工程件导入。它们只能作为对话素材喂进 brainstorm，RTL 和 TB 仍由流水线重新生成。
+
+### 1.3 启动
+
+在**独立会话**里：
+
+> 为 {module} 运行 design-flow 技能
+
+Orchestrator 接管。它每一轮问一次调度器「下一步干什么」，调度器返回**恰好一个**动作，由它执行。从这里开始你只在介入点出手。
+
+### 1.4 逐阶段推进
+
+```
+[brainstorm]  (流水线之前，独立会话)
+     ↓
+intent/brainstorm.md
+     ↓
+[specification] → [simulation-plan] → [rtl-design]
+                                            │
+                          ┌─────────────────┴──────────────────┐
+                          ↓                                    ↓
+                     [lint-cdc]                          [simulation]
+                          ↓                                    │
+                     [synthesis]                               │
+                          ↓                                    │
+                  [timing-analysis]                            │
+                          └─────────────────┬──────────────────┘
+                                            ↓
+                                    [power-analysis]
+                                            ↓
+                                      签核（你，§1.6）
+```
+
+工作树按阶段分在 `Design/` 和 `Verification/` 下。每个阶段只说三件事：**干什么**、**产物**、**你的动作**。
+
+产物表第三列标出要不要你看。**必看**表示门上会把路径交到你手上。**选看**表示复核时才需要翻。没标的不用读，脚本把关或直接被下游工具消费。
+
+**流水线会在决策点提示你。** 包括 specification 的账本与边界门、失败需要你归因时，以及签核时逐份认可判据。
+
+剩下标着「读 xx / 扫一眼 xx」的是复核动作，流水线不为它们停。`semantic-review` 和 `refmodel` 会在你签核时被拦下来补上。lint-cdc 的 `waiver.tcl` 由你直接复核，没有单独的审批提示。
+
+---
+
+#### specification
+
+**干什么**：把 brainstorm 推导成冻结的设计文档与边界文件。分三步走。分解（划分子模块），各子模块子设计（并行 ×N），逐子模块语义评审（并行 ×N）。
+
+**产物**（`{module}/Design/specification/`）
+
+| 文件 | 是什么 | 要你看吗 |
+|---|---|---|
+| `design.md` | 模块总览 §1.1–1.5：它提议的架构、边界叙述、联合义务、时序场景 | **必看** |
+| `<child>.md × N` | 每个子模块的子设计 | **必看** |
+| `requirements.json` | 你的意图文档里每一条要求，一行一条，用你的原话，写明由哪个阶段判。门上逐字给你看四组：没人能派的（`unassignable`）、流水线之外判的、留给你判的、工具将要比数的数值界限 | **这四组必看** |
+| `manifest.json` | 顶层 RTL 模块名，仅此一项 | 选看 |
+| `spec-review/findings/requirements.md` / `findings/<child>.md` / `decisions.md` | 账本对你文档的核对、各子设计对账本的核对、以及你的裁决 | **必看** |
+| `check-hints.json` | 仿真将怎样观测它判的每一条要求 | 选看 |
+| `clocks.json` / `top-io.json` | 边界信息：时钟与到达预算、顶层端口 | `design.md` §1.3 是它们的人读版本 |
+| `constraints/<TOP>.sdc` / `.sgdc` | 由 clocks + top-io 生成的约束对 | 生成物，不是决策 |
+
+**你的动作：一道门，然后交付回顾**
+
+- **账本与边界门**（需求评审之后）：处理每一条 `unassignable`（定义怎么量、指派裁判、或宣布它不是要求），看流水线之外判的和留给你判的那几行，核对数值界限，确认划分或给合并意见让它重划。
+- **交付回顾**（子设计评审之后）：只给你路径，不问你任何结论。看 `design.md` 和各 `<child>.md` 是否实现了它们引用的账本行，说出你要改什么。认可这些评审是 `kernel.py pin`（下表 #6）—— 在那之前模块签不了核，所以一条没处置的阻塞发现挡的是模块，不是这一轮。
+
+> spec 阶段是后续设计与验证工作的来源。
+
+---
+
+#### simulation-plan
+
+**干什么**：从规格推出测试点矩阵、TB 骨架、激励序列和功耗场景。
+
+**产物**（`{module}/Verification/simulation-plan/`）
+
+| 文件 | 是什么 | 要你看吗 |
+|---|---|---|
+| `verification-plan.md` | §3 测试点矩阵 + §4 功耗场景，交付回顾时你看的就是这份 | **必看** |
+| `plan-review/findings.md` / `decisions.md` | 计划评审的发现，以及你的裁决 | **必看** |
+| `tb-scaffold.json` | TB 骨架：testpoint 与 agent 的定义 | 选看，plan §3 是它的人读版本 |
+| `power-scenarios.json` | 功耗场景，由 power-analysis 消费 | 选看，plan §4 是它的人读版本 |
+| `sequences.json` | 激励序列定义 | 不用看 |
+
+**你的动作：交付回顾。** 给你 `verification-plan.md` 和 `plan-review/findings.md` 的路径，不问你任何结论。说出你要改什么，它增量改后再交一次；你让它认下某条评审标为 blocking 的发现时，你的原话会记进 `plan-review/decisions.md`。认可这份评审是 `kernel.py pin`（下表 #6），而下游没有任何东西复查"测试点对规格" —— 所以一条没处置的缺口挡在签核上。
+
+> 测试点矩阵指导 TB 编写、回归和覆盖率收敛。
+
+---
+
+#### rtl-design
+
+**干什么**：按各子设计写 RTL，并把这份 RTL 隐含的时序例外和生成时钟声明到 `constraint-annotations.json`，下游 lint-cdc 和 synthesis 的约束都从这里来。
+
+**产物**（`{module}/Design/rtl-design/`）
+
+| 文件 | 是什么 | 要你看吗 |
+|---|---|---|
+| `semantic-review/*.md` | 对照设计意图审 RTL 的评审 | **必看**，签核前要你认可 |
+| `*.v` | RTL 本体 | 选看 |
+| `constraint-annotations.json` | 这份 RTL 隐含的时序例外与生成时钟，按真实模块名。lint-cdc 与 synthesis 的约束都从这里来 | 选看 |
+| `rtl-files.json` | 按子模块的 `files[]` + `incdirs[]`，下游每一份 filelist 都由它生成 | 不用看 |
+
+**你的动作：读 `semantic-review/*.md`。** 它是签核前要你认可的四份判据之一（§1.6）。流水线不会在这里停下来等你，但提前读掉可以少一轮返工。
+
+这一阶段跑完，流水线分叉成实现签核链和仿真链两条并行推进。
+
+---
+
+#### lint-cdc
+
+**干什么**：后台跑 SpyGlass lint 与 CDC 检查。
+
+**产物**（`{module}/Design/lint-cdc/`）
+
+| 文件 | 是什么 | 要你看吗 |
+|---|---|---|
+| `scripts/waiver.tcl` | 它判为「可接受」的 violation，每条带理由 | **必看** |
+| `lint-report.txt` / `cdc-report.txt` | SpyGlass 原始报告 | 选看 |
+| `lint-violations.json` / `cdc-violations.json` | 结构化的 violation 清单 | 选看 |
+| `scripts/local.sgdc` | 本阶段补的 SGDC 标注，seed 无从得知的端口/时钟关联 | 选看 |
+| `scripts/constraints.sgdc` | 实际用的 SGDC，由 spec 的 seed + RTL 标注 + `local.sgdc` 装配而成 | 每轮重装；本阶段补充标注写入 `scripts/local.sgdc` |
+
+**你的动作：扫一眼 `scripts/waiver.tcl`。** 它自己判为「可接受」的 violation 会写成 `waive` 并附理由。**复核报告计数时也要查看被 waive 的 violation。** 判定本身由 SpyGlass 规则集给出，不需要你表态。
+
+---
+
+#### synthesis
+
+**干什么**：后台用 `compile_ultra` 综合，逐条判定 `requirements.json` 里派给综合的行。
+
+**产物**（`{module}/Design/synthesis/`）
+
+| 文件 | 是什么 | 要你看吗 |
+|---|---|---|
+| `reports/qor.rpt` | QoR 报告，PPA 判定读的就是这份 | 选看 |
+| `constraints.local.sdc` | 转写自 `constraint-annotations.json` 的时序例外 | 选看 |
+| `out/<TOP>_syn.v` / `_syn.sdc` / `_syn.sdf` | 综合后 netlist、导出 SDC、延时标注 | 下游 timing / power 消费 |
+| `constraints.sdc` | 实际用的约束，由 spec 的 SDC + `constraints.local.sdc` 装配而成 | 装配产物 |
+
+**你的动作：无。** 要复核就看 `reports/qor.rpt` 和 `result.json` 里的 `requirements[]`。判定由 dc_shell 的 QoR 报告给出，基准是你在账本门批过的那几行。SDC 里的例外来自 rtl-design 声明的 `constraint-annotations.json`，无法满足时序的路径会路由到上游修复。
+
+---
+
+#### timing-analysis
+
+**干什么**：后台读综合出来的 netlist + SDC 跑静态时序。
+
+**产物**（`{module}/Design/timing-analysis/`）
+
+| 文件 | 是什么 | 要你看吗 |
+|---|---|---|
+| `timing-report.txt` | setup / hold slack 报告，判定读的就是这份 | 选看 |
+
+**你的动作：无。** 要复核就看 `timing-report.txt`。判定由 pt_shell 的报告给出。
+
+---
+
+#### simulation
+
+**干什么**：把验证计划落成 UVM TB，跑回归，收敛覆盖率。用例挂了而它自己判断不出该谁修时，会自动派 `simulation-triage` 去翻波形（`fsdbreport`）、失败用例清单和日志，逐条给出归因。返工由调度器按归因派回该修的那一阶段。
+
+**产物**（`{module}/Verification/simulation/`）
+
+| 文件 | 是什么 | 要你看吗 |
+|---|---|---|
+| `tb/uvm/refmodel/**` | 判对错的参考模型 | **必看**，签核前要你认可 |
+| `case-results-summary.md` | 逐用例结果汇总 | 选看 |
+| `structural-coverage.json` | 结构覆盖率：line / cond / branch / toggle / fsm | 选看 |
+| `regression-log.txt` + `logs/` | 回归日志，以及每个用例自己的 log | 选看，查某个用例为什么挂就翻 |
+| `tb/uvm/**`（其余） | UVM TB 本体 | 选看 |
+| `check-review.md` | 逐 testpoint 的检查充分性评审 | 用于本阶段的检查修复 |
+| `env.sh` / `filelist.f` / `rtl_filelist.f` / `tests/testlist.json` / `case-results.json` | 环境、编译文件表、用例清单、机器可读结果 | 不用看 |
+
+**你的动作：细看参考模型 `tb/uvm/refmodel/*`。** 它为回归检查提供预期行为，是签核前需要认可的四份判据之一（§1.6）。流水线不会在这里停下来等你，返工也不用你指派。
+
+---
+
+#### power-analysis
+
+**干什么**：两条链在这里汇合。后台用综合的 netlist + SDF 和仿真的 TB 环境跑门级仿真，出 SAIF，再用 PT-PX 算平均功耗，逐条判定 `requirements.json` 里派给功耗分析的行。
+
+**产物**（`{module}/Verification/power-analysis/`，`<id>` = 功耗场景）
+
+| 文件 | 是什么 | 要你看吗 |
+|---|---|---|
+| `reports_ptpx/<id>/power_flat.rpt` | 该场景的功耗总数，PPA 判定读的就是这份 | 选看 |
+| `reports_ptpx/<id>/switching_activity.rpt` | 多少翻转来自 SAIF，多少来自工具默认值 | 选看，核对实测场景的活动是否已标注 |
+| `reports_ptpx/<id>/power_hier.rpt` | 功耗花在哪，层次化明细 | 选看，要降功耗才翻 |
+| `saif/<id>.saif` | 每个场景一份 SAIF，激励等价的场景只仿一次、共享结果 | 不用看 |
+| `reports_ptpx/<id>/ptpx.log` | 该场景的 PT-PX 日志 | 出错时才看 |
+
+**你的动作：无。** 要复核就看 `reports_ptpx/<id>/power_flat.rpt`。判定由 pt_shell 的报告给出。这一阶段过了流水线就到头了，签核是另一件由你开口要的事（§1.6）。
+
+---
+
+**随时看进度**：问一句「{module} 现在到哪一步」。每个阶段是六种状态之一：
+
+| 状态 | 含义 |
+|---|---|
+| `missing` | 还没跑过 |
+| `in-flight` | 正在跑 |
+| `valid` | 跑过，结果当前可信 |
+| `stale` | 跑过，但上游变了，结果已失效，下一轮会重建 |
+| `failed` | 跑了，判定不过 |
+| `blocked` | 跑不下去（环境缺件、崩了） |
+
+### 1.5 特殊场景
+
+**我手改了 RTL，会不会被覆盖？谁是真源？**
+
+磁盘是真源。你改完那一刻，**产出这个文件的阶段、读了它的所有下游阶段，同时失效**。每个结果都记了自己读入和产出文件的指纹，对不上就不再有效。
+
+**你的手改不会被回滚。** 但正因为产出它的那个阶段也失效了，下一轮调度会重建它。Agent 是在你改过的文件上**就地改**，你的版本是它的起点，不是被丢弃。
+
+**Ctrl-C 了 / ssh 断了 / 机器重启了**
+
+重新说一句「继续 {module} 的设计流程」即可，没有单独的恢复流程。调度器查询事件日志和落盘文件自动接续，只要目录在，任何新会话都能接上进度。
+
+唯一要你出手的地方：被打断的那一轮会一直显示「还在跑」。你确认它死了就让它收口，下一轮重新路由。
+
+**它卡住了 / 反复改同一个地方**
+
+流程会停下来，把原因**原文**给你，必要时附上候选归因。恢复的唯一通道是**人来做一次归因**，指明该由哪个阶段去修、以及为什么。
+
+常见的一类是规格自己修不动了，通常意味着**需求本身要改**。用 brainstorm 的修订模式重跑，改完 `intent/brainstorm.md`，规格阶段的结果就自动失效了，重新跑流程即可。
+
+更多报错见[附录 B](#附录-b-报错速查)。
+
+### 1.6 签核
+
+**签核是对已完成验证结果的认可。** 跑完只说明每个阶段都出了结果、且结果当前有效。签核是你作为责任人在这批结果上最终从头到尾检查一次并落名，它只在你开口要的时候才开始：
+
+> 为 {module} 进行签核
+
+**这一步为什么存在。** 八个阶段里，四个阶段「过没过」是工具说的。SpyGlass 的规则集、dc_shell 的 QoR 报告、pt_shell 的时序和功耗报告，工具报告本身就作数。另外四个阶段，「过没过」是一份 LLM 写的东西说的，需要你最终评审：
+
+| 阶段 | 判它过没过的是什么 |
+|---|---|
+| specification | `spec-review/findings/*.md`，LLM 写的规格评审 |
+| simulation-plan | `plan-review/*.md`，LLM 写的计划评审 |
+| rtl-design | `semantic-review/*.md`，LLM 写的 RTL 评审 |
+| simulation | `tb/uvm/refmodel/*`，LLM 写的参考模型，判每个用例对错的那把尺子 |
+
+**签核前，这四份判据需要你逐份读过并认可。**
+
+**你要做的三件事**
+
+1. **说一句要进行签核**（就是上面那句）。
+2. **逐份认可那四份。** 差哪份它就停下来指名，比如「rtl-design 的评审还没认可」。你去读那份文件，然后确认，并给一句理由说明为什么你认它。理由连同你的身份记进审计日志。
+3. **看清你签的是什么，再批准签核。** 四份都认完、且所有阶段结果仍然有效，它会把签核依据逐个阶段摊开给你。判它过没过的是什么、这份判据现在算谁认的、你认可时那份内容是什么样、工具是哪个、这一阶段读了哪些文件。看完你批准，签核才落下，并记下是谁签的、为什么。
+
+第 2、3 步和「撤回一次认可」都是**问过你才做**的动作，每次都会弹确认。
+
+> **认可绑的是内容，不是文件名。** 它记下那份文件此刻的样子。文件一改，认可自动失效，要重新读、重新认。你签的是那份东西本身。
+
+**签核会自己跌回去。** 签核之后，你改了任何一个上游设计文件，或撤回了任何一次认可，模块立刻退回未签核，不需要谁去撤销。
+
+如果有文件**在流程外新增到某个阶段的输入里**，签核门要求先记录该输入。把它移走，或者让那一阶段重跑一次、正式把它记录下来。
+
+### 1.7 产物与退出路径
+
+**目录树**
+
+```
+{module}/
+├── intent/                        # 流水线的唯一输入：brainstorm.md 与它依赖的文件（你的，pipeline 只读）
+├── events.jsonl                   # 审计日志，唯一的持久状态文件
+├── Design/
+│   ├── specification/             # design.md / <child>.md / *.json / constraints/ / spec-review/
+│   ├── rtl-design/                # *.v / rtl-files.json / semantic-review/
+│   ├── lint-cdc/                  # 报告 + violations JSON + scripts/
+│   ├── synthesis/                 # out/*_syn.{v,sdc,sdf} / reports/qor.rpt
+│   └── timing-analysis/           # timing-report.txt
+└── Verification/
+    ├── simulation-plan/           # verification-plan.md / *.json / plan-review/
+    ├── simulation/                # tb/uvm/ / filelist.f / env.sh / case-results-summary.md
+    ├── simulation-triage/         # 失败分析（仅在触发过时存在）
+    └── power-analysis/            # reports_ptpx/*/power_hier.rpt
+```
+
+每个阶段还会落一份 `result.json`（该轮的状态信封）。
+
+**哪些进 git**（建议，工具不强制）
+
+入库：`intent/`、`events.jsonl`（审计轨迹）、`Design/specification/`、`Design/rtl-design/*.v` + `rtl-files.json`、`Verification/simulation-plan/`、`Verification/simulation/tb/`、各阶段最终报告。
+
+忽略：工具中间产物和运行目录。`*.svf`、`*.pvl`、`command.log`、`pt_shell_command.log`、`simv*`、`csrc/`、综合与 PT 的 work 目录、波形（FSDB 通常很大）。
+
+**卸载**
+
+Claude Code:
+
+```bash
+claude plugin uninstall veripower@chipweaver
+```
+
+opencode：从 `opencode.json` 删掉插件条目，再删掉插件建在 `~/.claude/skills/veripower` 的技能链接（它不会自行消失）：
+
+```bash
+rm ~/.claude/skills/veripower
+```
+
+**脱离这个工具，产物还能用吗**
+
+能。RTL 是标准 `.v` 加一份 filelist（`rtl-files.json`）。TB 是标准 UVM 加 `filelist.f` + `env.sh`，`vcs` 直接能编。约束是标准 SDC/SGDC。综合、时序、功耗的产物就是各工具自己的 netlist 和报告。`events.jsonl` 保存 VeriPower 的审计轨迹，设计产物也可以直接交给 EDA 工具运行。
+
+---
+
+## §2 术语对照表
+
+正文尽量用你熟悉的说法。下面是插件内部和日志里会出现的词。
+
+| 它的词 | 你熟悉的说法 |
+|---|---|
+| stage / rule | 流程阶段。一个阶段 = 一条 rule |
+| proof | 「这一阶段的结果当前可信」的凭据。记了它读了哪些文件、产了哪些文件（内容指纹），以及谁做的判定 |
+| oracle / judge | **判据**，判这一阶段过没过的东西。工具报告，或一份 LLM 写的评审 |
+| grade（`proposed` / `tool` / `human`） | 判据的成色。`proposed` = LLM 写的，签核前要你认可（认可后即 `human`） |
+| pin | 你对一份 LLM 写的判据的**认可**。记的是当时那份内容的指纹 |
+| reopen | 撤回一次认可 |
+| stale | 上游变了，这个结果已失效。不是标出来的，是每次查询现算的 |
+| event log / `events.jsonl` | 审计日志，唯一的持久状态文件 |
+| dispatch / reap | 派发一个阶段去跑 / 收口它的结果 |
+| decide | 调度器。问它「下一步干什么」，返回恰好一个动作 |
+| DISPATCH / REAP / YIELD / DONE / ESCALATE | 派发 / 收口 / 有阶段在跑先等着 / 全绿 / **需要你介入** |
+| workdir / run | 某阶段某一轮的工作目录 / 轮次号 |
+| input closure | 某个结果传递依赖到的全部上游产出 |
+| fix_owner | 这次失败该由哪个阶段去修 |
+| signoff | 签核，在这批结果上落名的那个动作 |
+
+---
+
+## 附录 A 介入点速查
+
+| # | 时机 | 阶段 | 你要决定什么 | 能跳过吗 | 详见 |
+|---|---|---|---|---|---|
+| 1 | 需求对话 | brainstorm（流水线之前） | 需求与架构，含 PPA 目标 | 否 | §1.2 |
+| 2 | 账本与边界门 | specification 需求评审后 | 处理 `unassignable` 行，看流水线之外和留给你的行，核对数值界限，确认划分 | 否，且是**最后一次能改分区** | §1.4 |
+| 3 | 交付回顾 | specification 子设计评审后 | 不用决定什么 —— 读评审、说要改什么；认可在 #6 | 是 | §1.4 |
+| 4 | 交付回顾 | simulation-plan | 同上；计划评审的认可在 #6 | 是 | §1.4 |
+| 5 | ESCALATE | 任意阶段 | 指认该由哪个阶段去修，并给出理由 | 否 | §1.5 |
+| 6 | 认可判据 | 四份 LLM 写的判据 | 读过之后确认，并给一句理由 | 签核前必做 | §1.6 |
+| 7 | 签核 | 全部阶段之后 | 看完签核依据后批准 | 是，不签核就一直停在交付态 | §1.6 |
+
+1–4 是流水线正常推进必经的。5 只在出事时出现。6–7 只在你要签核时出现。**中间没有别的地方会等你**，2、3、4 之间和 4 之后都可以挂着跑。
+
+## 附录 B 报错速查
+
+**调度与返工**
+
+| 消息 | 含义 | 处置 |
+|---|---|---|
+| `no module directory at <path>` | 模块目录不存在，多半是路径给错了 | 用模块目录的绝对路径重说一次 |
+| `<阶段>: envelope named no fix_owner` | 该阶段失败了，但它没说该谁修 | 你来指认该由哪个上游阶段去修，并说明理由（§1.5） |
+| `<阶段>: fix_owner is itself, in-stage remedy exhausted` | 该阶段自己修不动了 | 往上游找。规格阶段出这条通常是**需求本身要改**，重跑 brainstorm 改需求 |
+| `<阶段>: fix_owner '<x>' is outside its input closure` | 出错的那个阶段并没有读到你指的这个阶段的产物 | 重新指认，只能指向它真正读过的上游（含间接） |
+| `<阶段>: diagnosis named no fix_owner` | 分析做了，但没指出该谁修 | 它会把候选列给你，你挑一个并说明理由 |
+| `<阶段>: the oracle that judged this failure was reopened` | 判它失败的那份判据，认可被你撤回了 | 让它重跑这个阶段 |
+| `intent tree incomplete: intent/brainstorm.md is not there…` | 流水线没有可开工的意图文档 | 把你的文档放到 `{module}/intent/brainstorm.md`，它指为权威的文件放在旁边 |
+
+**签核门**
+
+| 消息 | 含义 | 处置 |
+|---|---|---|
+| `signoff blocked: <阶段> not valid` | 该阶段结果已失效 | 让流程继续跑，把它重建出来 |
+| `signoff blocked: <阶段> oracle is proposed (pin it)` | 该阶段那份 LLM 写的判据，你还没认可 | 读过后确认并给出理由，见 §1.6 |
+| `signoff blocked: <阶段> has unverified new input(s) <文件>` | 有文件绕过流程被塞进该阶段的输入里 | 把那个文件移走，或让该阶段重跑一次、正式把它记录下来 |
+
+**环境与工具**
+
+| 症状 | 原因 | 处置 |
+|---|---|---|
+| 某个 EDA 阶段一上来就报变量未设 | `LIB_DB` / `LIB_V` / `UVM_HOME` 没 export | 先 `echo $VAR` 确认真的没设（别急着去文件系统里翻），export 后让它重跑 |
+| `compile_ultra` 检不出 license | 没有 DC-Ultra 授权 | 为 `compile_ultra` 配置 DC-Ultra 授权 |
+| 建 `simv` 时链接报错 | 宿主 GCC 与 VCS 预编译对象不兼容 | `export VCS_CC=<gcc>` / `export VCS_CPP=<g++>`（某些 VCS + 新发行版组合下 4.8 是已知可用组合） |
+| 覆盖率解析失败 | 你的 `urg` 版本报告布局和 L-2016.06 不同 | 换成 L-2016.06，或把版本差异反馈给插件维护者。 |
+| VCS launcher 行为怪异 | `/bin/sh` 不是 bash | Debian/Ubuntu：`sudo dpkg-reconfigure dash` 选 No |
+| 检查环境时卡在 license 探测 | license server 不可达 | 先修网络，或换一台 license server |
+
+---
+
+## 还想看什么
+
+- [`../ARCHITECTURE.zh.md`](../ARCHITECTURE.zh.md)：为什么这样设计。流水线与依赖图怎么推出来的、结果有效性怎么判、失败怎么归因、信任边界，以及验证范围。
+- [`eda-env.md`](eda-env.md)：EDA 工具 / license / 环境要求的完整原文。
+- [`../CONTRIBUTING.md`](../CONTRIBUTING.md)：替换某个阶段的实现（比如换成 Verilator 的 simulation、Yosys 的 synthesis）。

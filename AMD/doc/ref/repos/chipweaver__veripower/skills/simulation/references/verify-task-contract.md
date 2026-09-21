@@ -1,0 +1,85 @@
+# verify sub-Task contract
+
+The simulation main thread dispatches the **verify** child last, only after the
+smoke gate passes and the check-adequacy gate clears. Your job: full regression, coverage iteration
+and the review summary.
+
+## Inputs (paths only; the main thread does not read these bodies)
+
+- `{workdir}`: the **same** shared workdir the env-build child wrote. It already holds the
+  built TB (`tb/uvm/**`), the compiled `simv` and the env-phase artifacts.
+- testpoints path `<scaffold>/tb-scaffold.json`:
+  read `testpoints[].intent` for coverage-gap classification and `testpoints[].seqs` for
+  the sequence to iterate once you have placed an item. (`agents` / `sequences` / `tests` are
+  already materialized; do not re-materialize.)
+- `{module}`: the module name.
+- `<skill>`: the simulation skill's own base directory.
+
+`testpoints[].seqs` is the second half of that classification: you place an uncovered item on a
+testpoint, and that names whose stimulus to iterate. A regress failure needs neither — it routes out
+with `failing_cases` and no check-mapping.
+
+## Work
+
+1. **Regression**: `make regress`.
+2. **Coverage iteration** (see `coverage-iteration.md`): compare
+   `structural-coverage.json`'s row for the DUT module in `per_module` — its
+   `line`/`cond`/`fsm`/`toggle` dims, never the report's `aggregate`, which is the TB top's
+   whole instance tree and reads high wherever the interfaces and any ROMs are fully swept —
+   against the
+   coverage bounds `<requirements>/requirements.json` assigns to simulation (rows whose `target.dim`
+   is `coverage_*`; a dim with no row is reported, not gated). Every bounded dimension satisfied
+   goes straight to summary. Otherwise take the named items from the same file's `uncovered[]`, classify each as a
+   stimulus-layer or intent-layer gap per `coverage-iteration.md`, and either iterate stimulus
+   or report the intent gaps.
+3. **Summary**: `make summary` produces `case-results.json` and `case-results-summary.md`.
+   The exit gates run at the orchestrator's finalize, not here.
+
+## Authority
+
+- **Stimulus iterate only**: seed / tighten existing seq constraint params / testlist append.
+- **A regress failure routes out; you do not repair it here.** Whether it is rooted in wiring or
+  in the checker's semantics makes no difference here: write the `regress` verdict plus
+  `failing_cases` and let the caller decide. Scaffold repair belongs to env-build.
+
+## Write-domain
+
+Writes are confined to `tb/uvm/seq/*` + `tests/testlist.json`. This is **not**
+pure append-only: a stimulus iterate may tune the constraint params of an **existing** seq, and testlist entries
+are appended (do not change the semantics of existing testlist entries). An appended entry carries
+the same four fields the scaffold emits (`test_id`, `uvm_testname`, `suites`, `seqs`);
+`write_summary.py` reads them unconditionally, so an entry missing one aborts the summary. The env child's checker, RM and scaffold structure is **read-only reference** here: do not edit it, and route out a regress failure rooted there instead.
+
+## Prohibitions
+
+- **No Level-2 dispatch:** do not call the Task tool.
+- **No `kernel.py`:** do not call `kernel.py` — the parent session owns state transitions.
+- Stay inside `{workdir}`: all writes confined to the write-domain above. Do not modify the plan or
+  RTL (RTL-class issues belong to the RTL editing stage), and do not re-author the env child's scaffold / checker / RM.
+
+## Red Flag
+
+| Excuse | Reality |
+|---|---|
+| "The uncovered items are outside the testpoints, but I'll iterate stimulus anyway and pass" | An item no testpoint claims is an intent gap: route out with `verdict: coverage` and `gaps_not_in_testpoints`. Stimulus cannot close a hole nobody planned to cover. |
+
+## Output
+
+- Verify-phase artifacts written in `{workdir}`: `regression-log.txt`, `structural-coverage.json`,
+  `case-results.json`, `case-results-summary.md` (what each one is: `artifacts.md`).
+- On a clean pass, end with `STATUS: DONE`. Finalize reads counts and coverage from
+  `case-results.json` and `structural-coverage.json`.
+- On a route-out, return `STATUS: DONE` plus a JSON line carrying the failure fields:
+
+  ```json
+  {"verdict": "coverage", "gaps_not_in_testpoints": ["..."], "gaps_in_testpoints": ["..."]}
+  ```
+
+  On a `regress` route-out each failing case is one `failing_cases[]` entry, and its shape is
+  pinned by `references/result.schema.json`: `test_id` (how triage reaches
+  `logs/<test_id>.log`) and `error_message` (its log anchor) are required, `log_snippet` is
+  optional. A misspelled key fails the envelope rather than leaving triage with nothing to read.
+
+  On a program exception, end with `STATUS: BLOCKED <one-line reason>` instead. That is a
+  harness-level signal, distinct from `result.json`'s `status` enum (`pass`/`fail` only); the
+  orchestrator maps it to `status=fail` plus a `fail_reason`.
