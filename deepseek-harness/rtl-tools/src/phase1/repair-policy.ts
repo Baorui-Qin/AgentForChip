@@ -14,6 +14,12 @@ export function decideRepair(facts: DiagnosticReceipt, context: { calibrated: bo
   if (!failed.complete || !failed.process_normal || !['FAIL', 'INCONCLUSIVE'].includes(failed.status)) return decision('blocked', 'EXECUTION_OR_EVIDENCE', 'Incomplete evidence or independent execution failure.')
   if (failed.functional_failure) return decision('propose_repair', 'FUNCTIONAL_MISMATCH', 'Complete calibrated mismatch evidence; source location remains unknown.')
   const errors = failed.diagnostics.filter(d => d.severity === 'ERROR')
+  const drivers = errors.filter(d => d.origin === 'dut' && d.attribution === 'DUT_COMPILE_ERROR' && d.repairable_by_model && d.kind === 'multiple_drivers')
+  if (failed.stage === 'elaborate' && drivers.length && errors.every(d => drivers.includes(d) || (
+    d.kind === 'consequential' && d.origin === 'unknown' && d.file === null && d.message_id === 'XSIM 43-3322' &&
+    d.message === 'Static elaboration of top level Verilog design unit(s) in library work failed.' && drivers.some(primary => primary.invocation === d.invocation)))) {
+    return decision('propose_repair', 'DUT_MULTIPLE_DRIVERS', 'Observed DUT procedural drivers with only recognized same-invocation elaboration summaries.')
+  }
   const primaryCompile = errors.filter(d => d.origin === 'dut' && ['syntax', 'declaration_order', 'name_resolution', 'type_or_port', 'dependency'].includes(d.kind))
   if (['compile', 'elaborate'].includes(failed.stage) && primaryCompile.length && errors.every(d => primaryCompile.includes(d) || (
     d.origin === 'dut' && d.message_id === 'VRFC 10-8530' && d.message === `module '${context.top}' is ignored due to previous errors` &&

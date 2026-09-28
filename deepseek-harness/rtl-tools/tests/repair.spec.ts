@@ -15,6 +15,7 @@ import type { StageRecord } from '../src/phase1/records.ts'
 import { decideRepair } from '../src/phase1/repair-policy.ts'
 import { extractSource } from '../src/phase1/candidates.ts'
 import { taskSpec } from '../src/phase1/p09-tasks.ts'
+import { revisionScore } from '../src/phase1/p10-revision.ts'
 
 const roots: string[] = [], contexts: Context[] = [], workflows: RepairWorkflow[] = []
 afterEach(async () => {
@@ -267,6 +268,58 @@ it('human rejection terminates without another model request or candidate execut
   expect(result.outcome).toBe('APPROVAL_REJECTED')
   expect((await s.workflow.resume(result.experiment_id, new AbortController().signal)).verification_runs).toHaveLength(1)
   expect(s.prompts).toHaveLength(1)
+})
+
+it.each(['summary', 'missing-log', 'log-truncated', 'parser-limit', 'damaged-asset'])('derives completeness from full retained evidence, not the capped summary: %s', async mode => {
+  const s = await setup()
+  const state = await s.workflow.resume((await s.workflow.start('functional')).experiment_id, new AbortController().signal)
+  const root = state.verification_run!, path = join(root, 'result.json')
+  const record = JSON.parse(await readFile(path, 'utf8'))
+  const stage = record.stages.compile
+  stage.diagnostics_omitted = 1
+  const invocation = stage.invocations.find((item: { version_matches: boolean }) => item.version_matches !== true)
+  if (mode === 'missing-log') await rm(join(root, invocation.stdout_log))
+  if (mode === 'log-truncated') { invocation.process.log_truncated = true; stage.status = 'INCONCLUSIVE'; stage.processes = stage.invocations.map((run: { process: unknown }) => run.process) }
+  if (mode === 'parser-limit') await writeFile(join(root, invocation.stdout_log), Array.from({ length: 101 }, (_, i) => `WARNING: [VRFC 10-1] warning ${i}`).join('\n'))
+  if (mode === 'damaged-asset') await writeFile(invocation.sources.find((source: { role: string }) => source.role === 'dut').path, 'altered')
+  await writeFile(path, JSON.stringify(record))
+  const { receipt } = await readDiagnostics(root, 'diagnostic_replay')
+  expect(receipt.stages[0]!.complete).toBe(mode === 'summary')
+  expect(decideRepair(receipt, { calibrated: true, bound: true, attempts: 0, top: 'counter' }).action).toBe('blocked')
+})
+
+it('attributes elaboration paths using the same run compilation manifest when xelab declares no source inputs', async () => {
+  const s = await setup()
+  const state = await s.workflow.resume((await s.workflow.start('functional')).experiment_id, new AbortController().signal)
+  const root = state.verification_run!, path = join(root, 'result.json')
+  const record = JSON.parse(await readFile(path, 'utf8'))
+  const source = record.stages.compile.invocations.flatMap((run: { sources: unknown[] }) => run.sources).find((source: { role: string }) => source.role === 'dut').path
+  const invocation = record.stages.elaborate.invocations.find((run: { version_matches: boolean }) => run.version_matches !== true)
+  invocation.sources = []; invocation.process.exit_code = 1; record.stages.elaborate.status = 'FAIL'
+  record.stages.elaborate.processes = record.stages.elaborate.invocations.map((run: { process: unknown }) => run.process)
+  await writeFile(join(root, invocation.stdout_log), `ERROR: [VRFC 10-3818] variable 'q1' is driven by invalid combination of procedural drivers [${source}:8]\nERROR: [XSIM 43-3322] Static elaboration of top level Verilog design unit(s) in library work failed.\n`)
+  await writeFile(path, JSON.stringify(record))
+  const { receipt } = await readDiagnostics(root, 'diagnostic_replay')
+  expect(receipt.stages[1]!.diagnostics[0]).toMatchObject({ origin: 'dut', kind: 'multiple_drivers', repairable_by_model: true })
+  expect(receipt.stages[1]!.diagnostics[1]).toMatchObject({ origin: 'unknown', kind: 'consequential', repairable_by_model: false })
+  expect(decideRepair(receipt, { calibrated: true, bound: true, attempts: 0, top: 'counter' }).rule).toBe('UNTRUSTED_EVIDENCE')
+})
+
+it.each(['owned', 'foreign-invocation', 'unknown-extra', 'reference', 'missing-primary', 'wrong-summary', 'incomplete', 'abnormal'])('recognizes only complete same-invocation DUT driver errors: %s', mode => {
+  const primary = { category: 'error', kind: 'multiple_drivers', message_id: 'VRFC 10-3818', file: '/rtl/solution.sv', line: 8,
+    message: "variable 'q1' is driven by invalid combination of procedural drivers", origin: mode === 'reference' ? 'reference' as const : 'dut' as const,
+    attribution: mode === 'reference' ? 'REFERENCE_COMPATIBILITY' as const : 'DUT_COMPILE_ERROR' as const, severity: 'ERROR' as const, invocation: 'elaborate', repairable_by_model: false }
+  const summary = { ...primary, kind: 'unknown', message_id: 'XSIM 43-3322', file: null, line: null, origin: 'unknown' as const, attribution: 'UNKNOWN' as const,
+    invocation: mode === 'foreign-invocation' ? 'foreign' : 'elaborate', message: mode === 'wrong-summary' ? 'unrecognized summary' : 'Static elaboration of top level Verilog design unit(s) in library work failed.' }
+  const diagnostics = mode === 'missing-primary' ? [summary] : [primary, summary]
+  if (mode === 'unknown-extra') diagnostics.push({ ...summary, message_id: 'UNKNOWN 1', message: 'unknown failure' })
+  const stage = normalizeStage({ stage: 'elaborate', status: 'FAIL', processes: [{ exit_code: 1, signal: null, timed_out: mode === 'abnormal', cancelled: false, log_truncated: false, duration_ms: 1 }] } as StageRecord,
+    diagnostics, new SimulationEvidence(), mode !== 'incomplete')
+  const facts = { evidence_kind: 'live_verification', stages: [{ ...stage, stage: 'compile', status: 'PASS', complete: true, process_clean: true, diagnostics: [] }, stage,
+    ...['simulation', 'synthesis'].map(name => ({ ...stage, stage: name, status: 'SKIPPED', diagnostics: [] }))] } as Parameters<typeof decideRepair>[0]
+  expect(decideRepair(facts, { calibrated: true, bound: true, attempts: 0, top: 'TopModule' }).action).toBe(mode === 'owned' ? 'propose_repair' : 'blocked')
+  expect(revisionScore(facts, false)).toEqual(mode === 'owned' ? { rank: 4, checks: null, mismatches: null } : null)
+  expect(primary.repairable_by_model).toBe(false)
 })
 it('changed reviewed bytes block execution and do not produce another request', async () => {
   const s = await setup()

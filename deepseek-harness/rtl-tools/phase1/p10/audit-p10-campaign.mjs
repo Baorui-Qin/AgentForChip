@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import { access, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { auditComparison } from './acceptance-audit.mjs'
 
 const EXPECTED_MANIFEST = '02872f104347a256b0d8564a1b2194621daf98144c5ba89f33ee73fa1c476742'
 const EXPECTED_SUITE = '880f2dabca449f800238edf3458739ca8e37e811bfc5750d8474298af2b80353'
@@ -140,6 +141,9 @@ for (const task of EXPECTED_TASKS) {
     continue
   }
   const comparison = await json(comparisonPath)
+  let acceptanceProtocol = 'INVALID'
+  try { acceptanceProtocol = await auditComparison(comparison, freeze.protocol?.acceptance_protocol ?? generation.acceptance_protocol) }
+  catch { issues.push(`P10_ACCEPTANCE_INVALID:${task}`) }
   selectedSkills.push(...await modelEvents(comparison.model_runs, task, 'repair', events, evidenceModels, skillHashes))
   if (generation.source_sha256 !== comparison.shared_initial_sha256) issues.push(`SHARED_INITIAL_SHA_MISMATCH:${task}`)
   for (const run of comparison.verification_runs ?? []) {
@@ -160,7 +164,7 @@ for (const task of EXPECTED_TASKS) {
     if (attempt.valid !== audited.valid || audited.missing_steps.length) issues.push(`INVALID_REPAIR_ATTEMPT:${task}:${attempt.semantic_round}:${audited.missing_steps.join('+')}`)
   }
   const baselineFailed = comparison.initial_status !== 'PASS'
-  const agentPass = comparison.status === 'VERIFIED'
+  const agentPass = comparison.status === 'VERIFIED' && acceptanceProtocol !== 'INVALID'
   if (agentPass) {
     const finalPath = join(comparisonDirectory, 'final.sv')
     if (!await exists(finalPath)) issues.push(`EXPORT_BINDING_INVALID:${task}:missing`)
@@ -176,8 +180,9 @@ for (const task of EXPECTED_TASKS) {
     baselineToolError ||= record.final_status === 'TOOL_ERROR'
     if (baselineToolError) events.push({ task_id: task, route: 'baseline_verification', category: 'TOOL_ERROR', directory: comparison.baseline_run })
   }
-  rows.push({ task_id: task, evaluator_status: 'EVALUATOR_READY', generation_status: generation.status, baseline_status: comparison.initial_status,
-    agent_status: comparison.status, terminal_reason: comparison.terminal_reason ?? comparison.status, terminal_category: category(comparison.status),
+  rows.push({ task_id: task, evaluator_status: 'EVALUATOR_READY', generation_status: generation.status, baseline_status: acceptanceProtocol === 'INVALID' ? 'INVALID_EVIDENCE' : comparison.initial_status,
+    acceptance_protocol: acceptanceProtocol, netlist_acceptance: comparison.acceptance_results ?? [],
+    agent_status: acceptanceProtocol === 'INVALID' ? 'INVALID_EVIDENCE' : comparison.status, terminal_reason: comparison.terminal_reason ?? comparison.status, terminal_category: category(comparison.status),
     baseline_failed: baselineFailed, baseline_dut_failed: baselineFailed && comparison.repair_eligible === true,
     baseline_infrastructure_failed: baselineFailed && baselineToolError, repair_eligible: comparison.repair_eligible === true,
     repair_requested: comparison.repair_requested === true, bound_feedback_dispatches: comparison.bound_feedback_dispatches ?? 0,
@@ -210,7 +215,7 @@ const totals = { selected: EXPECTED_TASKS.length, evaluable, evaluator_blocked: 
   semantic_repairs: rows.reduce((sum, value) => sum + (value.semantic_repairs ?? 0), 0),
   transport_retries: rows.reduce((sum, value) => sum + (value.transport_retries ?? 0), 0),
   output_recovery_attempts: rows.reduce((sum, value) => sum + (value.output_recovery_attempts ?? 0), 0) }
-const hardIssues = issues.filter(value => /^(FIXED_|COMPATIBILITY_|CAMPAIGN_SOURCE_CHANGED|RESULT_MISSING|VIVADO_RESULT_MISSING|EVALUATOR_IDENTITY_MISMATCH|SHARED_INITIAL_SHA_MISMATCH|EXPORT_BINDING_INVALID|INVALID_REPAIR_ATTEMPT)/.test(value))
+const hardIssues = issues.filter(value => /^(P10_ACCEPTANCE_INVALID|FIXED_|COMPATIBILITY_|CAMPAIGN_SOURCE_CHANGED|RESULT_MISSING|VIVADO_RESULT_MISSING|EVALUATOR_IDENTITY_MISMATCH|SHARED_INITIAL_SHA_MISMATCH|EXPORT_BINDING_INVALID|INVALID_REPAIR_ATTEMPT)/.test(value))
 const comparisonStatus = hardIssues.length ? 'P10_COMPARISON_INVALID' : 'P10_COMPARISON_VALID'
 await mkdir(reportRoot, { recursive: true })
 await writeFile(join(reportRoot, 'agent-opportunity-funnel.json'), JSON.stringify({ schema_version: 'p10-opportunity-funnel-1', task_funnel: funnel, classifications, attempts, rows: rows.map(value => ({ task_id: value.task_id, baseline_status: value.baseline_status, terminal_reason: value.terminal_reason, evidence: value.evidence })) }, null, 2) + '\n')

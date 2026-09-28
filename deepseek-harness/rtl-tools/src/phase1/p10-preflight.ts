@@ -73,7 +73,7 @@ async function run(ctx: Context, config: ReturnType<typeof Config>, signal: Abor
   const catalog = await loadP10Dataset(dataset, revision, tree, eol), selected = selectP10(catalog)
   await mkdir(join(directory, 'manifest')); await mkdir(join(directory, 'tasks'))
   const entries = selected.map(({ task, category, selection_key }, index) => ({ manifest_index: index + 1, task_id: task.task_id, category, selection_key,
-    assets: task.assets, git_crlf_checkout_files: task.git_crlf_checkout_files, public_interface: task.interface, interface_error: task.interface_error, clock: task.clock }))
+    assets: task.assets, git_crlf_checkout_files: task.git_crlf_checkout_files, public_interface: task.interface, interface_error: task.interface_error, clock: task.clock, public_interface_erratum: task.public_interface_erratum }))
   const manifest = { schema_version: 'p10-manifest-1', campaign_id: id, dataset_source: origin, dataset_revision: revision, dataset_task_count: catalog.length,
     selection_algorithm: 'ordered-public-spec-predicates-then-sha256-v1', selection_seed: selectionSeed, selection_rules: selectionRules,
     task_ids: entries.slice(0, 10).map(e => e.task_id), tasks: entries.slice(0, 10), shared_initial_candidate_planned: true }

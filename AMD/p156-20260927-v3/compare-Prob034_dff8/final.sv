@@ -1,0 +1,17 @@
+
+module TopModule (
+    input  logic       clk,
+    input  logic [7:0] d,
+    output logic [7:0] q
+);
+
+    genvar i;
+    generate
+        for (i = 0; i < 8; i = i + 1) begin : dff
+            always_ff @(posedge clk) begin
+                q[i] <= d[i];
+            end
+        end
+    endgenerate
+
+endmodule

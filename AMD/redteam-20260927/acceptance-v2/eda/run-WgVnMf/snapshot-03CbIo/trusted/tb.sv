@@ -1,0 +1,2 @@
+`timescale 1ns/1ps
+module netlist_tb; reg clk=0; wire q; integer checks=0,mismatches=0; TopModule dut(.clk(clk),.q(q)); initial begin #101;  checks=checks+1; if(q !== 1'b1) mismatches=mismatches+1; #1; clk=1; #1; checks=checks+1; if(q !== 1'b0) mismatches=mismatches+1; clk=0; #1; clk=1; #1; checks=checks+1; if(q !== 1'b1) mismatches=mismatches+1; $display("Mismatches: %0d in %0d samples",mismatches,checks); $finish; end endmodule

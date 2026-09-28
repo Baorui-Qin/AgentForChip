@@ -1,0 +1,13 @@
+
+module TopModule (
+    input  logic clk,
+    input  logic x,
+    input  logic [2:0] y,
+    output logic Y0,
+    output logic z
+);
+
+    assign Y0 = x ? (~y[2] & ~y[0]) : (y[0] | (y[2] & ~y[1] & ~y[0]));
+    assign z  = (y[2] & ~y[1] & ~y[0]) | (~y[2] & y[1] & y[0]);
+
+endmodule

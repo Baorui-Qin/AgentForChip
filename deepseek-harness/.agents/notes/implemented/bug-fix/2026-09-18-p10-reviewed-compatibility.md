@@ -24,6 +24,8 @@ The [P10 model entry](../../../../rtl-tools/src/phase1/p10-model.ts) separates o
 
 ## Consequences
 
+[RT-01 netlist acceptance](2026-09-27-p10-netlist-acceptance.md) owns the additional mandatory P10 success check. This adapter still owns byte-preserving evaluator portability, not synthesized functional correctness.
+
 The separately built [full-dataset suite](2026-09-18-p10-full-compat-suite.md) owns structural scanning and sealed runtime loading. It does not change this exact-hash adapter or the model orchestration described here.
 
 Focused tests cover byte reversibility, changed scopes, duplicate declarations, unknown hashes and reference borrowing. Real Vivado positive/negative runs remain necessary. The model protocol fails closed on malformed output and transport failures rather than silently retrying. Official hidden scoring, cross-simulator equivalence and full OS isolation are not claimed. Complete ten-task audit precedes forty-task authorization; unsupported assets are never substituted.

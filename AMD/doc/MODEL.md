@@ -1,25 +1,7 @@
-# MODEL.md — 模型声明模板（未填实测，不是已完成参赛声明）
+# 模型声明入口
 
-本包不包含权重，没有声称已选择最终参赛模型。建议先实测 Qwen2.5-Coder-7B-Instruct FP16；依据留出集与预算结果选择最终候选。
+当前声明维护在方案包的 [model/MODEL.md](../rtl-reference-alignment/rtl-alignment-agent/model/MODEL.md)。
 
-| 项目 | 待填写 |
-|---|---|
-| 原始模型仓库 | 官方仓库地址 |
-| 仓库 commit / release | 完整标识，不只写 main |
-| 权重各文件 SHA256 | 附清单 |
-| tokenizer/chat template | 来源、版本和校验和 |
-| License | 原始许可及衍生权重义务 |
-| 是否微调 | 否/是 |
-| 基座与微调方法 | LoRA/SFT 等参数；无则写无 |
-| 训练数据来源/许可/去重 | 明确不含未授权评测数据 |
-| 微调后开源权重 | 官方接受的权重发布形式与地址 |
-| 量化方法与版本 | FP16/具体量化格式、转换工具和配置 |
-| 推理后端 | 版本、commit、构建参数 |
-| GPU / gfx / ROCm | 实测环境 |
-| 上下文与单次输出上限 | 与 baseline 相同 |
-| 温度 / top_p / seed / 并发 | 明确值 |
-| 服务加载显存 / 运行峰值显存 | 实测，标明 GB 或 GiB |
-| 是否跨卡或 CPU offload | 应符合单卡完整驻留规则 |
-| 单题/总耗时与冷启动 | 原始记录位置 |
+2026-09-28 已按用户授权完成 DeepSeek API 替代小样本，未部署本地千问。保留的本地候选是 `Qwen3-Coder-30B-A3B-Instruct` GGUF Q4_K_M / llama.cpp HIP，不再沿用旧模板中的 Qwen2.5-Coder-7B FP16 建议。
 
-不得把理论权重体积填写成运行峰值显存。填写并验收后，将本文件和权重清单一起冻结。
+权重、tokenizer、模板哈希、GPU/ROCm 和峰值显存尚未实测；API 成功不能替代本地模型或 32 GB 显存验收。详细用量、原版基线哈希和缺口见上述声明及[阶段 2、3 执行记录](RTL_Alignment_Stage23_Execution.zh.md)。

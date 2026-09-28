@@ -1,0 +1,394 @@
+We need answer exactly one complete DUT between [BEGIN] and [DONE]. Need implement TopModule. Need ensure correct Lemmings FSM. Let's reason carefully.
+
+We have spec. Need Moore outputs based on current state. States: walking left, walking right, falling (aaah), digging (maybe digging left/right? outputs digging=1 and direction? Spec says all 4 outputs become 0 when splatter. For digging, what outputs? In Lemmings problem (HDLBits Lemmings4), states likely: LEFT, RIGHT, FALL_L, FALL_R, DIG_L, DIG_R, SPLAT. Outputs walk_left = state LEFT, walk_right = state RIGHT, aaah = fall states, digging = dig states. Digging retains original direction? Spec: "continue digging until it reaches the other side (ground=0). At that point ... fall (aaah!), then continue walking in its original direction once it hits ground again." This implies during digging direction may still be original, but outputs: digging=1, walk outputs probably 0. When ground disappears, transition to falling with direction preserved. Need determine state variables.
+
+Let's recall HDLBits problem Lemmings4 exactly: 
+- States? Common solution: 
+```
+parameter LEFT=0, RIGHT=1, FALL_L=2, FALL_R=3, DIG_L=4, DIG_R=5, SPLAT=6;
+```
+- Inputs: bump_left, bump_right, ground, dig.
+- Outputs: walk_left = (state==LEFT), walk_right = (state==RIGHT), aaah = (state==FALL_L || state==FALL_R), digging = (state==DIG_L || state==DIG_R).
+- Reset to LEFT.
+- Splatter if falling >20 cycles then hits ground. Need counter for falling cycles.
+
+Need exact threshold: "if a Lemming falls for more than 20 clock cycles then hits the ground, it will splatter". So if it falls for 21 or more clock cycles then ground=1, splatter. In HDLBits, often counter counts cycles in fall state, and if counter == 20 and ground == 1 then splatter. Need be precise about inclusive.
+
+Let's analyze "falls for more than 20 clock cycles then hits the ground". Suppose it enters fall at cycle when ground=0. It remains falling for cycles while ground=0. At each positive clock edge, counter increments. If ground becomes 1 on a cycle, it hits ground at that cycle. If it has been falling for >20 clock cycles, splatter. If exactly 20 clock cycles falling then hits ground, does it splatter? "more than 20" => no. So threshold: if fall_count >= 21 when ground=1, splatter. Alternatively if counter reaches 21? Need define counter.
+
+Let's define fall_count as number of clock cycles it has been in falling state (including current? Moore state). At state register update: when in fall state and ground=0, increment. When ground=1, check if fall_count >= 20? Wait.
+
+Let's simulate: 
+- Cycle 1: ground=0, state transitions from walk to fall? Since Moore output based on state, at cycle 1 state might still walk, next cycle fall. Need consider fall detection. Spec: "when ground=0, Lemming will fall" likely on next clock edge enters fall. The fall duration counted in cycles where state is fall? In HDLBits, when ground=0 and state walk, next state fall and counter=0? Or counter=1? Let's recall known solution.
+
+Common HDLBits Lemmings4 solution code:
+```
+module top_module(
+    input clk,
+    input areset,
+    input bump_left,
+    input bump_right,
+    input ground,
+    input dig,
+    output walk_left,
+    output walk_right,
+    output aaah,
+    output digging
+);
+    parameter LEFT=0, RIGHT=1, FALL_L=2, FALL_R=3, DIG_L=4, DIG_R=5, SPLAT=6;
+    reg [2:0] state, next_state;
+    reg [5:0] fall_count;
+    always @(*) begin
+        case(state)
+            LEFT: begin
+                if (!ground) next_state = FALL_L;
+                else if (dig) next_state = DIG_L;
+                else if (bump_left) next_state = RIGHT;
+                else next_state = LEFT;
+            end
+            RIGHT: begin
+                if (!ground) next_state = FALL_R;
+                else if (dig) next_state = DIG_R;
+                else if (bump_right) next_state = LEFT;
+                else next_state = RIGHT;
+            end
+            FALL_L: begin
+                if (ground) begin
+                    if (fall_count > 20) next_state = SPLAT;
+                    else next_state = LEFT;
+                end else next_state = FALL_L;
+            end
+            FALL_R: begin
+                if (ground) begin
+                    if (fall_count > 20) next_state = SPLAT;
+                    else next_state = RIGHT;
+                end else next_state = FALL_R;
+            end
+            DIG_L: begin
+                if (!ground) next_state = FALL_L;
+                else next_state = DIG_L;
+            end
+            DIG_R: begin
+                if (!ground) next_state = FALL_R;
+                else next_state = DIG_R;
+            end
+            SPLAT: next_state = SPLAT;
+        endcase
+    end
+    always @(posedge clk or posedge areset) begin
+        if (areset) begin
+            state <= LEFT;
+            fall_count <= 0;
+        end else begin
+            state <= next_state;
+            if (state == FALL_L || state == FALL_R) begin
+                if (ground) fall_count <= 0;
+                else fall_count <= fall_count + 1;
+            end else begin
+                fall_count <= 0; // or maybe reset when not falling
+            end
+        end
+    end
+```
+But this threshold may be off. Let's derive exact.
+
+We need implement robustly. Let's examine spec: "if a Lemming falls for more than 20 clock cycles then hits the ground, it will splatter". So if fall duration > 20 cycles. A clock cycle is a period between positive edges. When ground=0, at the next posedge it starts falling? The state output aaah becomes 1 after the edge. That cycle is considered falling. It continues until ground=1 and at next posedge it hits ground. The number of cycles where aaah was 1? Let's count from when it enters fall state to when ground=1 is sampled.
+
+Suppose ground=0 at cycle T (before edge). At edge T, state becomes FALL, aaah=1 for cycle T+1? Actually Moore output associated with state after edge. The state is FALL from T+1 to next edge. If ground remains 0, at edge T+1 state stays FALL, counter increments. If ground becomes 1 at cycle T+1 (i.e., sampled before edge T+1? Let's align). Inputs are sampled at posedge. At the posedge where ground=1 and state=FALL, the FSM transitions out. The number of cycles spent falling is the number of posedges where state=FALL and ground=0? Or the number of cycles aaah=1 before hitting ground.
+
+Let's define: At posedge, if current state is FALL and ground=1, it hits ground and exits. The time spent falling is number of cycles since entering FALL up to the cycle before this posedge. If it entered FALL at posedge k, then at posedge k it became FALL. At posedge k+1, if ground=1, it was falling for 1 clock cycle (from k to k+1). If ground=0 at k+1, it remains FALL. At posedge k+2, if ground=1, it was falling for 2 cycles. So if ground=1 at posedge k+n, fall duration = n cycles (number of intervals in FALL). If n > 20, splatter. So if n=21, splatter. Thus if counter counts number of cycles in FALL, at exit if counter >= 21? Let's see: counter increments each posedge while in FALL and ground=0. At entry edge, we set counter? If we set counter=0 at entry, then at posedge k+1 with ground=0, counter becomes 1. At posedge k+2 with ground=0, counter becomes 2. At posedge k+n with ground=1, before update counter = n-1? Let's simulate n=1: entry at k. At k+1, state FALL, ground=1. We check ground before increment? If sequential block: at posedge, if state==FALL and ground==1, we transition out and reset counter. So counter doesn't increment. Fall duration=1. If n=21: entry at k. For edges k+1 through k+20 (20 edges) ground=0, counter increments to 20. At edge k+21, ground=1, counter currently 20. We evaluate next_state based on counter > 20? false, so would not splatter. But duration is 21 cycles, should splatter. So threshold should be counter >= 20? Or counter counts differently.
+
+If counter increments at entry, then n=1: entry edge sets counter=1. At k+1 ground=1, counter=1. Exit. n=21: counter=21. So condition counter > 20 works. Alternatively, if we check next_state based on fall_count > 20, we need fall_count to be number of cycles spent falling before the hit edge. If we increment counter on every posedge in FALL including the entry edge, then at exit edge with ground=1, counter is n. So if n > 20, splatter. That matches condition fall_count > 20.
+
+Let's design counter to count cycles in FALL. At posedge:
+- If reset: counter <= 0.
+- Else if next_state is FALL? Hmm.
+
+Better: Use combinational next_state based on current state and inputs, and counter. Then sequential update counter based on current state and ground.
+
+Let's define states and counter. At posedge:
+```
+if (areset) begin state <= LEFT; fall_count <= 0; end
+else begin
+    state <= next_state;
+    if (state == FALL_L || state == FALL_R) begin
+        if (ground) fall_count <= 0;
+        else fall_count <= fall_count + 1;
+    end else if (next_state == FALL_L || next_state == FALL_R) begin
+        fall_count <= 1; // entering fall this cycle
+    end else begin
+        fall_count <= 0;
+    end
+end
+```
+But next_state is combinational based on current state and inputs. If current state is walking and ground=0, next_state=FALL. At the posedge, state becomes FALL, and fall_count should become 1 (count this cycle as first fall cycle). Then at next posedge, if state==FALL, ground=0, fall_count becomes 2, etc. If ground=1 at next posedge, state==FALL and ground=1, we check next_state based on fall_count. If fall_count=1, duration=1, no splat. Condition for splatter: if fall_count > 20 when ground=1? At the edge where ground=1, fall_count is the number of cycles spent falling so far (including the cycle that just ended). For duration n, fall_count = n. So if n > 20, splatter. So condition fall_count > 20. That means if fall_count=21, splatter. Correct.
+
+But what if we set fall_count=1 at entry, then at next edge ground=1, fall_count=1, no splat. If it falls for 20 cycles then ground=1, fall_count=20, no splat. If 21 cycles, fall_count=21, splat. Good.
+
+Alternatively, some implementations check fall_count == 20 and ground=1 to splat? Let's test: if fall_count counts cycles in FALL and increments each cycle including entry, then at ground=1 after 21 cycles, fall_count=21. So condition >20. If they use counter that starts at 0 and increments on ground=0, then at ground=1 after 21 cycles, counter=20, so condition >=20. Different convention. We must pick consistent.
+
+Let's look at HDLBits official testbench maybe. The problem Lemmings4 on HDLBits. I recall solution often uses:
+```
+if (state == FALL_L || state == FALL_R) begin
+    if (ground) begin
+        if (fall_count == 20) next_state = SPLAT;
+        else next_state = ...
+    end
+end
+```
+Wait, let's recall exact HDLBits Lemmings4. There is a counter `cnt` that increments while falling. Many solutions:
+```
+always @(posedge clk or posedge areset) begin
+    if (areset) begin
+        state <= LEFT;
+        cnt <= 0;
+    end else begin
+        state <= next_state;
+        if (state == FALL_L || state == FALL_R) begin
+            if (ground) cnt <= 0;
+            else cnt <= cnt + 1;
+        end else if (next_state == FALL_L || next_state == FALL_R) begin
+            cnt <= 1; // or 0?
+        end else cnt <= 0;
+    end
+end
+```
+And next_state logic:
+```
+FALL_L: begin
+    if (ground) begin
+        if (cnt > 20) next_state = SPLAT;
+        else next_state = LEFT;
+    end else next_state = FALL_L;
+end
+```
+I've seen condition `cnt == 20`? Let's search memory. HDLBits Lemmings4 solution by user:
+```
+parameter LEFT=0, RIGHT=1, FALL_L=2, FALL_R=3, DIG_L=4, DIG_R=5, SPLAT=6;
+reg [2:0] state, next_state;
+reg [5:0] cnt;
+always @(*) begin
+    case(state)
+        LEFT: next_state = ground ? (dig ? DIG_L : (bump_left ? RIGHT : LEFT)) : FALL_L;
+        RIGHT: next_state = ground ? (dig ? DIG_R : (bump_right ? LEFT : RIGHT)) : FALL_R;
+        FALL_L: next_state = ground ? (cnt > 20 ? SPLAT : LEFT) : FALL_L;
+        FALL_R: next_state = ground ? (cnt > 20 ? SPLAT : RIGHT) : FALL_R;
+        DIG_L: next_state = ground ? DIG_L : FALL_L;
+        DIG_R: next_state = ground ? DIG_R : FALL_R;
+        SPLAT: next_state = SPLAT;
+    endcase
+end
+always @(posedge clk or posedge areset) begin
+    if (areset) begin
+        state <= LEFT;
+        cnt <= 0;
+    end else begin
+        state <= next_state;
+        if (state == FALL_L || state == FALL_R) begin
+            if (ground) cnt <= 0;
+            else cnt <= cnt + 1;
+        end else if (next_state == FALL_L || next_state == FALL_R) begin
+            cnt <= 1;
+        end else cnt <= 0;
+    end
+end
+```
+This uses `cnt > 20`. Let's test: entry to fall sets cnt=1. If ground=0 next cycle, cnt becomes 2. After 20 cycles of falling (including entry), cnt=20. At 21st cycle if ground=1, at the edge state is FALL, ground=1, cnt=20 (since it hasn't incremented yet for this cycle? Wait: At the edge where ground=1, before the edge, state is FALL and cnt is the value from previous edge. Let's trace carefully.
+
+Let's trace cycles. Let posedge times t=0,1,2,...
+
+Suppose at t=0, state=LEFT, ground=0. Combinational next_state=FALL_L. At t=0 edge, state becomes FALL_L, and sequential block sees old state=LEFT, next_state=FALL_L, so sets cnt=1. Now after t=0, state=FALL_L, cnt=1. This represents cycle 0-1: falling, 1st cycle.
+
+At t=1, ground=0. Old state=FALL_L, cnt=1. next_state=FALL_L. At edge, state remains FALL_L, sequential sees old state=FALL_L, ground=0, so cnt <= cnt+1 = 2. After t=1, cnt=2. Cycle 1-2: 2nd cycle.
+
+...
+At t=20, ground=0. Old state=FALL_L, cnt=20. next_state=FALL_L. At edge, cnt <= 21. After t=20, cnt=21. This is 21st cycle? Let's count: entry at t=0 gave cnt=1 (cycle 0-1). t=1 gave cnt=2 (cycle 1-2). ... t=19 gave cnt=20 (cycle 19-20). t=20 with ground=0 gives cnt=21 (cycle 20-21). So at t=20 edge, cnt becomes 21.
+
+Now suppose at t=21, ground=1. Old state=FALL_L, cnt=21. Combinational next_state: ground=1, check cnt > 20 -> 21 > 20 true => SPLAT. At t=21 edge, state becomes SPLAT. How many cycles did it fall? From t=0 to t=21, it was in FALL_L for cycles 0-1, 1-2, ..., 20-21. That's 21 cycles. It hits ground at t=21 edge. It should splatter because >20. The condition cnt > 20 at t=21 uses cnt=21, true. So splatter. If it fell for exactly 20 cycles, say ground=1 at t=20. At t=20, old state=FALL_L, cnt=20 (from t=19). Condition cnt > 20 false, so next_state=LEFT. At t=20 edge, state becomes LEFT. It fell for cycles 0-1 through 19-20 = 20 cycles. No splatter. Correct.
+
+So condition `cnt > 20` with cnt set to 1 at entry works.
+
+But wait: In my sequential block above, when next_state is FALL and old state not FALL, we set cnt=1. What if old state is FALL and ground=0, we increment. That's fine. What if old state is FALL and ground=1, we reset cnt=0. The next_state logic uses cnt before reset. So condition uses cnt value from before the edge. That's what we traced.
+
+So we can implement this. Need ensure all transitions correct.
+
+Let's detail state transitions:
+
+States:
+- LEFT: walking left. Output walk_left=1.
+  - If !ground: next_state = FALL_L (fall, preserve direction left)
+  - Else if dig: next_state = DIG_L (start digging left)
+  - Else if bump_left: next_state = RIGHT (bumped on left, switch to right)
+  - Else: next_state = LEFT
+  Note: "If more than one of these conditions are satisfied, fall has higher precedence than dig, which has higher precedence than switching directions." So order: !ground first, then dig, then bump. What about bump_right when walking left? The spec says: "if a Lemming is bumped on the left (by receiving a 1 on bump_left), it will walk right. If it's bumped on the right (by receiving a 1 on bump_right), it will walk left." For a lemming walking left, bump_left means obstacle on left? Actually if walking left, an obstacle on left would be bump_left? The spec says: "if a Lemming is bumped on the left (by receiving a 1 on bump_left), it will walk right." So regardless of current direction, bump_left makes it walk right? Wait, typical Lemmings problem: If walking left, bump_left makes it walk right? Let's read: "In the Lemmings' 2D world, Lemmings can be in one of two states: walking left (walk_left is 1) or walking right (walk_right is 1). It will switch directions if it hits an obstacle. In particular, if a Lemming is bumped on the left (by receiving a 1 on bump_left), it will walk right. If it's bumped on the right (by receiving a 1 on bump_right), it will walk left." This implies bump_left causes walking right, bump_right causes walking left, regardless of current direction? But consider a Lemming walking right. If it hits an obstacle on the right, it would receive bump_right? The spec says bump_right makes it walk left. So yes, bump_left -> right, bump_right -> left. But what if walking left and bump_right occurs? bump_right makes it walk left, so it would continue walking left? That seems odd. Actually in the original HDLBits Lemmings3/4, the logic is:
+- LEFT: if bump_left -> RIGHT, else if bump_right -> LEFT? Wait.
+Let's recall HDLBits Lemmings3 problem statement: 
+"if a Lemming is bumped on the left (by receiving a 1 on bump_left), it will walk right. If it's bumped on the right (by receiving a 1 on bump_right), it will walk left. If it's bumped on both sides at the same time, it will still switch directions."
+In typical solution, for state LEFT:
+```
+if (!ground) next = FALL_L;
+else if (dig) next = DIG_L;
+else if (bump_left) next = RIGHT;
+else next = LEFT;
+```
+Wait, what about bump_right when in LEFT? If it's walking left, and bump_right=1, does it switch to right? According to "if it's bumped on the right, it will walk left." If already walking left, it stays left. So bump_right has no effect when walking left. Similarly, for state RIGHT:
+```
+if (!ground) next = FALL_R;
+else if (dig) next = DIG_R;
+else if (bump_right) next = LEFT;
+else next = RIGHT;
+```
+So bump_left has no effect when walking right. That matches typical HDLBits Lemmings. Let's verify with spec: "It will switch directions if it hits an obstacle." If walking left, the obstacle must be on its left, so bump_left is the signal. If walking right, obstacle on its right, bump_right. So bump_left only affects when walking left? Actually if walking left, it moves left, so it can hit something on its left -> bump_left. If it's walking right, it moves right, hits something on right -> bump_right. So in LEFT state, only bump_left matters; in RIGHT state, only bump_right matters. What if walking right and bump_left=1? That would be an obstacle on left, but it's moving right, so it's moving away, so no switch. So yes, only relevant bump.
+
+Thus:
+LEFT:
+- if !ground -> FALL_L
+- else if dig -> DIG_L
+- else if bump_left -> RIGHT
+- else -> LEFT
+
+RIGHT:
+- if !ground -> FALL_R
+- else if dig -> DIG_R
+- else if bump_right -> LEFT
+- else -> RIGHT
+
+FALL_L (falling, was walking left):
+- if ground -> check splat: if fall_cnt > 20 -> SPLAT; else -> LEFT
+- else -> FALL_L
+Note: bump and dig ignored.
+
+FALL_R:
+- if ground -> if fall_cnt > 20 -> SPLAT; else -> RIGHT
+- else -> FALL_R
+
+DIG_L (digging left):
+- if !ground -> FALL_L (fall, preserve left)
+- else -> DIG_L (continue digging)
+Note: bump ignored. Dig input ignored? "will continue digging until it reaches the other side (ground=0)." So if dig goes 0 while still digging? Spec: "A Lemming can dig if it is currently walking on ground (ground=1 and not falling), and will continue digging until it reaches the other side (ground=0)." It does not say it stops when dig=0. So it continues digging regardless of dig input until ground=0. So in DIG state, we only check ground. If ground=1, stay DIG even if dig=0. If ground=0, go FALL.
+
+DIG_R similarly.
+
+SPLAT: all outputs 0, forever. No transitions.
+
+Outputs:
+- walk_left = (state == LEFT)
+- walk_right = (state == RIGHT)
+- aaah = (state == FALL_L || state == FALL_R)
+- digging = (state == DIG_L || state == DIG_R)
+
+Reset: asynchronous positive edge triggered. areset resets to walking left. So state <= LEFT, fall_cnt <= 0.
+
+Now, need consider if fall counter should reset when leaving FALL due to splat? In SPLAT, outputs 0, counter irrelevant.
+
+What about when entering FALL from DIG? If digging and ground=0, next_state=FALL_L. The fall counter should start counting from the first cycle of falling. In our sequential block, if old state is DIG_L and next_state is FALL_L, we set cnt=1. That works. What if old state is FALL and ground=0, we increment. What if old state is FALL and ground=1, we reset to 0 (next_state will be LEFT or SPLAT). If next_state is SPLAT, counter reset to 0, fine.
+
+What about when old state is LEFT and next_state is FALL_L, we set cnt=1. That means the cycle when ground=0 is detected, at the next edge it enters FALL and cnt=1. The first cycle of falling is the one after the edge. That seems correct.
+
+Let's test edge cases: bump in same cycle as ground disappears. Spec: "being bumped in the same cycle as ground disappears (but not yet falling), or when the ground reappears while still falling, also does not affect the walking direction." Our priority: in LEFT, if !ground, next_state=FALL_L regardless of bump_left. So bump ignored when ground=0. Correct. When ground reappears while falling, in FALL_L, if ground=1, next_state=LEFT (or SPLAT), bump ignored. Correct.
+
+Dig when falling: ignored because in FALL states we don't check dig. Correct.
+
+Dig when ground=0: ignored because in LEFT, !ground has higher priority. Correct.
+
+Splatter: "if a Lemming falls for more than 20 clock cycles then hits the ground, it will splatter and cease walking, falling, or digging (all 4 outputs become 0), forever". Our SPLAT state outputs all 0. And no transitions out except reset. Correct.
+
+Now, let's verify counter logic with exact cycles. Suppose lemming falls for 20 cycles then hits ground. Should not splatter. Let's trace with our logic.
+
+Define falling cycles as number of posedges where state is FALL and ground=0? Actually duration is time from when it starts falling until it hits ground. Let's simulate with a clock.
+
+Let t=0: reset released, state=LEFT. ground=0 at t=0. next_state=FALL_L. At posedge t=0 (if reset not active), state becomes FALL_L, cnt=1. After t=0, state=FALL_L, cnt=1, aaah=1. This is cycle 0-1: falling cycle 1.
+t=1: ground=0. next_state=FALL_L. posedge: state stays FALL_L, cnt=2. cycle 1-2: falling cycle 2.
+...
+t=19: ground=0. posedge: cnt becomes 20. cycle 19-20: falling cycle 20? Wait: entry at t=0 gave cnt=1 for cycle 0-1. t=1 gave cnt=2 for cycle 1-2. t=18 gave cnt=19 for cycle 18-19. t=19 gave cnt=20 for cycle 19-20. So after t=19, cnt=20. This means we have completed 20 falling cycles? Actually at t=19 edge, we are entering cycle 19-20. The number of falling cycles so far is 20? Let's count: cycle 0-1 (1), 1-2 (2), ..., 18-19 (19), 19-20 (20). So at t=19 edge, cnt=20 means we are about to start the 20th cycle? Or we have completed 20? Let's define cycle index: after edge at t=k, state applies to interval [k, k+1). So at t=0, state=FALL for [0,1). At t=1, state=FALL for [1,2). So at t=19, state=FALL for [19,20). The number of falling intervals before t=20 is 20 intervals ([0,1) through [19,20)). So at t=20, if ground=1, the lemming has been falling for 20 cycles. At t=20, old state=FALL, cnt=20. next_state logic checks ground=1, cnt>20? false, so next_state=LEFT. At t=20 edge, state becomes LEFT. So it fell for 20 cycles and then hits ground at t=20. No splatter. Correct.
+
+If ground=1 at t=21: At t=20, ground=0, so state stays FALL, cnt becomes 21. At t=21, old state=FALL, cnt=21. ground=1, cnt>20 true -> SPLAT. It fell for intervals [0,1) through [20,21) = 21 cycles. Splatter. Correct.
+
+So condition >20 on cnt, with cnt=1 at entry, works.
+
+But wait: What if fall starts from DIG? Suppose state=DIG_L, ground=0 at t=0. next_state=FALL_L. At t=0 edge, state becomes FALL_L, and since old state not FALL and next_state=FALL, cnt=1. Same as above.
+
+What if fall starts from LEFT but ground=0 at t=0, and at t=0 edge reset is active? Reset overrides, state=LEFT, cnt=0. Fine.
+
+Now, consider the case where ground=1 at the same cycle as entering fall? That's contradictory: if ground=1, it wouldn't enter fall. So no.
+
+Now, check DIG states: When digging, if ground=1, stay DIG. If ground=0, go FALL. What if dig=1 while walking, enters DIG. At that same edge, if ground=0, priority fall higher, so enters FALL. Correct.
+
+Now, what about the outputs during DIG? Spec says "digging" output is 1. The walk outputs are 0. So our Moore outputs are correct.
+
+Now, check the splatter output: all 4 outputs 0. In SPLAT state, walk_left=0, walk_right=0, aaah=0, digging=0. Correct.
+
+Now, consider if bump_left and bump_right both 1 while walking. Spec: "If it's bumped on both sides at the same time, it will still switch directions." For LEFT, bump_left=1 causes switch to RIGHT. bump_right has no effect. So if both 1, bump_left=1 -> switch to RIGHT. For RIGHT, bump_right=1 -> switch to LEFT. So both 1 -> switch. Our logic: in LEFT, check bump_left first? Actually we have else if (bump_left) next=RIGHT. If bump_left=1 and bump_right=1, it goes RIGHT. In RIGHT, else if (bump_right) next=LEFT. So both -> switch. Correct.
+
+Now, should we consider bump_left when in RIGHT? If both bump_left and bump_right are 1 while walking right, our logic in RIGHT checks bump_right first? We have: else if (bump_right) next=LEFT. So it goes LEFT. That's a switch. Correct.
+
+What if walking left, bump_left=1, bump_right=0 -> switch to right. Correct.
+What if walking left, bump_left=0, bump_right=1 -> no switch, stays left. Is that correct? Spec: "if a Lemming is bumped on the right (by receiving a 1 on bump_right), it will walk left." If already walking left, it stays left. So no switch. Correct.
+
+Now, let's consider if dig=1 while walking and bump=1. Priority: dig higher than bump. So if ground=1 and dig=1, next_state=DIG regardless of bump. Our logic: if (!ground) ... else if (dig) ... else if (bump) ... So dig takes precedence over bump. Correct.
+
+What if ground=0 and dig=1? !ground takes precedence, so fall. Correct.
+
+Now, implement in SystemVerilog. Single module TopModule. Use parameters for states. Use reg [2:0] state, next_state. Use reg [5:0] fall_cnt (since max 20, need 5 bits? 20 requires 5 bits (0-31), but we might count up to 21 or more. Actually we only care up to >20. If it falls forever, counter could overflow. But spec says "There is no upper limit on how far a Lemming can fall before hitting the ground." So we must handle arbitrarily long falls. Our counter will eventually overflow. If we use 6 bits, max 63. If it falls for 100 cycles, counter overflows and condition may become false. That would be a bug. We need to ensure splatter if fall >20. We can saturate the counter at some value >20, e.g., 21, or use a larger counter. But if it falls for 100 cycles, we still want to splatter when ground reappears. So we need to remember that it exceeded 20. We can use a flag or saturate counter at 21. Since we only need to know if >20, we can clamp counter at 21. When incrementing, if fall_cnt < 21, increment; else keep at 21. Or just use a wider counter, e.g., 32 bits. But in hardware, infinite falls could overflow 32-bit eventually. However, simulation won't run that long. But for correctness, we can saturate at 21. Let's design: fall_cnt is reg [5:0] (0-63). In sequential, when in FALL and ground=0, if fall_cnt < 21, fall_cnt <= fall_cnt + 1; else fall_cnt <= fall_cnt; // saturate at 21. Actually we need to splatter if >20. So if fall_cnt reaches 21, it stays 21. At ground=1, condition fall_cnt > 20 is true if 21. So saturating at 21 works. But what if it falls for exactly 20? fall_cnt becomes 20, condition false. If it falls for 21, fall_cnt becomes 21, condition true. So we can saturate at 21.
+
+Alternatively, use a flag `splatter_ready` that becomes 1 when cnt > 20. But simpler: saturate counter at 21.
+
+Let's define `fall_cnt` as 5 bits? 21 needs 5 bits (0-31). So reg [4:0] fall_cnt. Max 21. When incrementing, if fall_cnt < 21, ++; else keep 21. Or just use 6 bits and saturate. Let's use 6 bits for safety.
+
+Now, write code.
+
+```systemverilog
+module TopModule (
+    input  clk,
+    input  areset,
+    input  bump_left,
+    input  bump_right,
+    input  ground,
+    input  dig,
+    output walk_left,
+    output walk_right,
+    output aaah,
+    output digging
+);
+
+    // State encoding
+    localparam LEFT   = 3'd0,
+               RIGHT  = 3'd1,
+               FALL_L = 3'd2,
+               FALL_R = 3'd3,
+               DIG_L  = 3'd4,
+               DIG_R  = 3'd5,
+               SPLAT  = 3'd6;
+
+    reg [2:0] state, next_state;
+    reg [5:0] fall_cnt;
+
+    // Next state logic (combinational)
+    always @(*) begin
+        case (state)
+            LEFT: begin
+                if (!ground)        next_state = FALL_L;
+                else if (dig)       next_state = DIG_L;
+                else if (bump_left) next_state = RIGHT;
+                else                next_state = LEFT;
+            end
+            RIGHT: begin
+                if (!ground)         next_state = FALL_R;
+                else if (dig)        next_state = DIG_R;
+                else if (bump_right) next_state = LEFT;
+                else                 next_state = RIGHT;
+            end
+            FALL_L: begin
+                if (ground) begin
+                    if (fall_cnt > 20) next_state = SPLAT;
+                    else               next_state = LEFT;
+                end else begin
+                    next_state = FALL_L;
+                end
+            end
+            FALL_R: begin
+                if (ground) begin
+                    if (fall_cnt > 20) next_state = SPLAT;
+                    else               next_state = RIGHT;
+                end else begin
+                    next_state =

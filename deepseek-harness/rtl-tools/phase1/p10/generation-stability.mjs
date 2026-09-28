@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { setTimeout as sleep } from 'node:timers/promises'
+import { auditComparison } from './acceptance-audit.mjs'
 
 const hash = value => createHash('sha256').update(value).digest('hex')
 const json = async path => JSON.parse(await readFile(path, 'utf8'))
@@ -15,6 +16,8 @@ export async function acquireCandidates(tasks, io, maxResumes, continueAfterMode
   for (const task of tasks) {
     let result = await io.read(task)
     if (!result) result = await io.invoke('generate', task)
+    if (['authentication', 'configuration', 'rate_limit'].includes(result.error?.category)) return 'PROVIDER_BLOCKED'
+    if (['CANCELLED', 'HOST_FAILURE', 'CAMPAIGN_BUDGET_EXHAUSTED', 'INVALID_DISPATCH_BUDGET', 'CAMPAIGN_LOCKED_REQUIRES_INSPECTION'].includes(result.status)) return 'CAMPAIGN_BLOCKED'
     if (result.status === 'INFRA_PAUSED' && result.generation_resumes < maxResumes) {
       await io.pause(task)
       if (!(await io.probe(task))) return 'INFRA_PAUSED'
@@ -50,11 +53,12 @@ export function summarize(rows) {
   const opportunities = completed.filter(row => row.repair_eligible)
   const rate = (n, d) => d ? n / d : null
   return { selected: rows.length, complete_model_responses: rows.filter(row => row.response_complete).length, valid_candidates: valid.length,
-    calibration_blocked: rows.filter(row => row.generation_status === 'EVALUATOR_BLOCKED').length,
+    calibration_blocked: rows.filter(row => row.calibration_exclusion || row.generation_status === 'EVALUATOR_BLOCKED').length,
+    interface_blocked: rows.filter(row => row.generation_status === 'INTERFACE_BLOCKED').length,
     infrastructure_pending: rows.filter(row => row.generation_status === 'INFRA_PAUSED').length,
     unstarted: rows.filter(row => row.generation_status === 'NOT_RUN').length,
     acquisition_completion: rate(valid.length, rows.length), e2e_completion: rate(completed.length, rows.length),
-    model_evaluable: valid.length, evaluated: completed.length,
+    model_evaluable: valid.filter(row => !row.calibration_exclusion).length, evaluated: completed.length,
     baseline_pass: completed.filter(row => row.baseline_status === 'PASS').length,
     agent_pass: completed.filter(row => row.agent_status === 'VERIFIED').length,
     baseline_pass_rate: rate(completed.filter(row => row.baseline_status === 'PASS').length, completed.length),
@@ -77,6 +81,8 @@ async function main(root, repo, stage) {
   if (hash(await readFile(join(root, manifestFile))) !== manifestHash || tasks.length !== settings.selected || new Set(tasks).size !== tasks.length) throw new Error('FIXED_MANIFEST_CHANGED')
   const excluded = new Map((settings.calibrationExcluded ?? []).map(item => [item.task_id, item]))
   const runnable = tasks.filter(task => !excluded.has(task))
+  const generationExcluded = new Map((settings.generationExcluded ?? []).map(item => [item.task_id, item]))
+  const generationTasks = settings.generateUncalibrated ? tasks.filter(task => !generationExcluded.has(task)) : runnable
   const lock = await open(join(root, 'stability.lock'), 'wx')
   const read = task => optional(join(root, `generate-${task}`, 'result.json'))
   await mkdir(join(root, 'runner-logs'), { recursive: true })
@@ -98,7 +104,7 @@ async function main(root, repo, stage) {
   }
   let state = 'REPORT_ONLY'
   try {
-    if (stage === 'generation' || stage === 'all') state = await acquireCandidates(runnable, { read, invoke,
+    if (stage === 'generation' || stage === 'all') state = await acquireCandidates(generationTasks, { read, invoke,
       pause: async task => {
         await appendFile(join(root, 'campaign-trace.jsonl'), JSON.stringify({ event: 'CIRCUIT_OPEN', task, cooldown_ms: settings.cooldownMs }) + '\n')
         await sleep(settings.cooldownMs)
@@ -118,7 +124,12 @@ async function main(root, repo, stage) {
         if (!generated || generated.status === 'INFRA_PAUSED' || !settings.continueAfterModelFailure && generated.status !== 'GENERATED_UNVERIFIED') throw new Error('GENERATION_GATE_NOT_READY')
         if (generated.status === 'GENERATED_UNVERIFIED' && !await optional(join(root, `compare-${task}`, 'result.json'))) ready.push(task)
       }
-      await compareCandidates(ready, settings.comparisonWorkers ?? 1, task => invoke('compare', task))
+      await compareCandidates(ready, settings.comparisonWorkers ?? 1, async task => {
+        const result = await invoke('compare', task)
+        const initial = result.baseline_run ? await json(join(result.baseline_run, 'result.json')) : null
+        const directoryError = Object.values(initial?.stages ?? {}).some(stage => stage.errors.some(error => error.message_id === 'Common 17-1257'))
+        if (result.terminal_policy_rule === 'EXECUTION_OR_EVIDENCE' || directoryError) throw new Error('EDA_INFRA_CIRCUIT_OPEN:' + task)
+      })
       state = 'COMPARISON_FINISHED'
     }
     if (stage === 'smoke') { await invoke('repair-control', 'Prob005_notgate'); state = 'SMOKE_FINISHED' }
@@ -136,11 +147,14 @@ async function main(root, repo, stage) {
           if (!valid) throw new Error('CANDIDATE_HASH_CHANGED')
         }
         let trace = []
+        const acceptance = comparison ? await auditComparison(comparison, freeze.protocol?.acceptance_protocol ?? generation?.acceptance_protocol) : null
         if (comparison) {
           try { trace = (await readFile(join(root, `compare-${task}`, 'tool-trace.jsonl'), 'utf8')).trim().split('\n').filter(Boolean).map(JSON.parse) }
           catch (error) { if (error.code !== 'ENOENT') throw error }
         }
-        rows.push({ task_id: task, generation_status: excluded.has(task) ? 'EVALUATOR_BLOCKED' : generation?.status ?? 'NOT_RUN', candidate_valid: valid,
+        rows.push({ task_id: task, generation_status: generation?.status ?? (generationExcluded.has(task) ? 'INTERFACE_BLOCKED' : excluded.has(task) && !settings.generateUncalibrated ? 'EVALUATOR_BLOCKED' : 'NOT_RUN'), candidate_valid: valid,
+          acceptance_protocol: acceptance, netlist_acceptance: comparison?.acceptance_results ?? [],
+          generation_exclusion: generationExcluded.get(task) ?? null,
           calibration_exclusion: excluded.get(task) ?? null,
           response_complete: generation?.generation_attempts?.some(a => a.response_complete) ?? false,
           physical_provider_attempts: generation?.physical_dispatches ?? 0, transport_retries: generation?.transport_retries ?? 0,
@@ -160,7 +174,7 @@ async function main(root, repo, stage) {
       process.stdout.write(JSON.stringify(report.summary) + '\n')
     } finally { await lock.close(); await unlink(join(root, 'stability.lock')) }
   }
-  if (['INFRA_PAUSED', 'GENERATION_FAILED'].includes(state)) process.exitCode = 2
+  if (['INFRA_PAUSED', 'GENERATION_FAILED', 'PROVIDER_BLOCKED', 'CAMPAIGN_BLOCKED'].includes(state)) process.exitCode = 2
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await main(...process.argv.slice(2))

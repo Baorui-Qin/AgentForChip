@@ -25,6 +25,7 @@ export interface AutoSettings {
   registry: 'minimal' | 'full'; campaignRoot: string; bucket: 'preflight' | 'ablation'; sampleId: string
   runtimeRoot: string; runtimeManifestSha256: string; maxToolSteps: number
   maxDispatches?: number
+  campaignDispatchLimit?: number
   validationSkillId?: string
 }
 /** One actual response, never treated as verification evidence. */
@@ -35,6 +36,7 @@ export interface ActionResponse {
   observation: ModelObservation; feedback_in_request_sha256: string | null; feedback_projection_sha256: string | null
   consumed_feedback_sha256: string | null
   context_compacted?: boolean
+  truncation_reason?: 'response_bytes' | 'provider_max_tokens'
 }
 /** Official runtime identity with every selected executable/data dependency hashed. */
 export interface CounterManifest { revision: string; executable: string; tokenizer: string; files: Record<string, string>; compiler: string }
@@ -146,7 +148,7 @@ export async function callAction(args: {
     await publish(recorder.directory, 'context-audit.json', JSON.stringify(audit, null, 2))
     await publish(recorder.directory, 'prompt-final.txt', JSON.stringify(body, null, 2))
     await recorder.append({ type: 'agent_request', link, value: { wire: body, audit } })
-    const ticket = await reserveDispatch(args.auto.campaignRoot, args.auto.bucket, { experiment: args.experiment, sequence: args.sequence, request_sha256: result.prompt_sha256 }, signal, args.auto.maxDispatches)
+    const ticket = await reserveDispatch(args.auto.campaignRoot, args.auto.bucket, { experiment: args.experiment, sequence: args.sequence, request_sha256: result.prompt_sha256 }, signal, args.auto.maxDispatches, args.auto.campaignDispatchLimit)
     await publish(recorder.directory, 'dispatch.json', JSON.stringify({ ticket, request_sha256: result.prompt_sha256 }))
     result.dispatched = true
     telemetry.value.request_prepared = true
@@ -157,7 +159,7 @@ export async function callAction(args: {
       if (chunk.type === 'text-delta' || chunk.type === 'reasoning-delta') result.response_bytes += Buffer.byteLength(chunk.text)
       if (chunk.type === 'tool-call-delta') result.response_bytes += Buffer.byteLength(chunk.argumentsDelta) + Buffer.byteLength(chunk.name ?? '')
       if (chunk.type === 'block-end') result.response_bytes += Buffer.byteLength(JSON.stringify(chunk.block))
-      if (result.response_bytes > args.model.maxResponseBytes) throw new Error('OUTPUT_TRUNCATED')
+      if (result.response_bytes > args.model.maxResponseBytes) { result.truncation_reason = 'response_bytes'; throw new Error('OUTPUT_TRUNCATED') }
       if (chunk.type === 'finish') {
         finished = true; result.finish_kind = chunk.reason.kind
         if (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted') {
@@ -168,10 +170,9 @@ export async function callAction(args: {
         }
       }
       chunks.push(chunk); assembler.push(chunk)
-      if (Buffer.byteLength(JSON.stringify(chunks)) > args.maxEventBytes / 2) throw new Error('OUTPUT_TRUNCATED')
     }
     if (!finished) throw new Error('MODEL_PROTOCOL_ERROR')
-    if (result.finish_kind === 'max-tokens') result.error_code = 'OUTPUT_TRUNCATED'
+    if (result.finish_kind === 'max-tokens') { result.error_code = 'OUTPUT_TRUNCATED'; result.truncation_reason = 'provider_max_tokens' }
     if (!result.error_code) result.message = assembler.message({ kind: 'model', provider: prepared.config.provider, model: prepared.config.model,
       ...(assembler.replayState === undefined ? {} : { replayState: assembler.replayState }) })
     if (forced && result.message) {

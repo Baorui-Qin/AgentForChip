@@ -1,0 +1,2 @@
+`timescale 1ns/1ps
+module netlist_tb; reg clk=0; wire q; integer checks=0,mismatches=0; TopModule dut(.clk(clk),.q(q)); initial begin #101; if(glbl.GSR !== 1'b0 || glbl.GTS !== 1'b0) $fatal(1,"GSR_STARTUP_INVALID"); checks=checks+1; if(q !== 1'b1) mismatches=mismatches+1; #1; clk=1; #1; checks=checks+1; if(q !== 1'b0) mismatches=mismatches+1; clk=0; #1; clk=1; #1; checks=checks+1; if(q !== 1'b1) mismatches=mismatches+1; $display("PHASE1_COMPLETE checks=%0d mismatches=%0d",checks,mismatches); $finish; end endmodule

@@ -1,0 +1,26 @@
+
+module TopModule (
+    input  logic clk,
+    input  logic load,
+    input  logic [511:0] data,
+    output logic [511:0] q
+);
+
+    logic [511:0] next;
+
+    always_comb begin
+        for (int i = 0; i < 512; i++) begin
+            next[i] = q[i] ? ( ~((i == 511) ? 1'b0 : q[i+1]) | ~((i == 0) ? 1'b0 : q[i-1]) )
+                           : ( (i == 0) ? 1'b0 : q[i-1] );
+        end
+    end
+
+    always_ff @(posedge clk) begin
+        if (load) begin
+            q <= data;
+        end else begin
+            q <= next;
+        end
+    end
+
+endmodule

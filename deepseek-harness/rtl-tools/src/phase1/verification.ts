@@ -24,7 +24,8 @@ export interface VerificationResult { schema_version: '1.3'; snapshot_id: PhaseI
 
 function fact(value: CommandResult): ProcessFact { return { exit_code: value.exitCode, signal: value.signal, timed_out: value.timedOut, cancelled: value.aborted, log_truncated: value.logTruncated, duration_ms: value.durationMs } }
 
-async function sizeOf(path: string, index?: { path: string; bytes: number }[], root = path): Promise<number> {
+/** Audit bounded EDA artifacts without following links. @param path - owned directory. @param index - optional relative file index. @param root - traversal root. */
+export async function sizeOf(path: string, index?: { path: string; bytes: number }[], root = path): Promise<number> {
   let size = 0
   // Vivado removes transient child directories during the live quota scan.
   const entries = await readdir(path, { withFileTypes: true }).catch(error => {

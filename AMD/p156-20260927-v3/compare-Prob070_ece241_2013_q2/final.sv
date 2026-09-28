@@ -1,0 +1,12 @@
+
+module TopModule(
+    input a,
+    input b,
+    input c,
+    input d,
+    output wire out_sop,
+    output wire out_pos
+);
+    assign out_sop = (~a & ~b & c) | (c & d);
+    assign out_pos = c & (~b | d) & (~a | d);
+endmodule

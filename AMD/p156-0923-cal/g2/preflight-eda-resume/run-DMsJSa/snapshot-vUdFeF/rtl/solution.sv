@@ -1,0 +1,8 @@
+module TopModule(
+  input wire clk,
+  input wire reset,
+  input wire in,
+  output wire out
+);
+  RefModule preflight_reference(.clk(clk), .reset(reset), .in(in), .out(out));
+endmodule

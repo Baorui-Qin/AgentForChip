@@ -1,0 +1,279 @@
+We need answer only DUT between [BEGIN] [DONE]. Need implement FSM.
+
+We need infer spec carefully. TopModule inputs clk resetn x y, outputs f g. Reset synchronous active low. As long as reset asserted, stays state A. When reset de-asserted, then after next clock edge FSM set f=1 for one clock cycle. Then monitor x. When x produced values 1,0,1 in three successive clock cycles, then g=1 on following clock cycle. While maintaining g=1 monitor y. If y has value 1 within at most two clock cycles, then maintain g=1 permanently until reset. But if y does not become 1 within two clock cycles, set g=0 permanently until reset.
+
+Need design.
+
+Let's model states.
+Resetn=0 synchronously -> A. Outputs? likely f=0 g=0 during reset. State A.
+
+When reset deasserted: "after next clock edge FSM has to set output f to 1 for one clock cycle." At clock edge leaving A? Let's define states: A (reset), B f=1 for one cycle, then C detect 1,0,1, D g=1 wait y, E g=1 permanently, F g=0 permanently.
+
+At reset asserted, state A, outputs f=0 g=0. If resetn=1, on next posedge go to B. In state B, output f=1. Then next edge go to C with f=0. So f is Moore output based on state B. That matches "after next clock edge set f to1 for one clock cycle": Edge from A to B occurs after reset deassert, state B for one cycle, f=1.
+
+Then monitor x for sequence 1,0,1 in three successive clock cycles. Need g=1 on following clock cycle. Interpret: while in C maybe track sequence. When x values are 1 then 0 then 1 on successive cycles, then the following cycle g=1. We need determine if x=1 in state C counts as first? Let's sequence: after f cycle, FSM monitors x. If x becomes 1,0,1 in three successive clock cycles, then g set to 1 on following clock cycle. So need detect three cycles, then next state output g=1. Could have states S0 waiting for 1, S1 got 1 wait 0, S2 got 1,0 wait 1, then G state. If x sequence occurs, transition on third x=1 edge to G state, then g=1 during following cycle. In Moore, state G output 1. So from S2 with x=1 at posedge -> G. Then g=1 for that cycle, "following clock cycle" after third cycle. Correct.
+
+While g=1 monitor y. If y has value 1 within at most two clock cycles, maintain g=1 permanently. If y does not become 1 within two clock cycles, set g=0 permanently. Need define window relative to entering G? "While maintaining g=1 the FSM has to monitor the y input. If y has the value 1 within at most two clock cycles" Means during g=1 state, check y for next two cycles? Need be precise. At the clock cycle when g first becomes 1 (state G), FSM monitors y? If y is 1 in that cycle, then maintain permanent. If y is 1 in first or second clock cycle while g=1. If not, set g=0 on following? Let's design states to count 2 cycles of g=1 waiting y.
+
+State G: g=1, waiting window count. Need if y=1 in state G at current cycle? Since sequential at posedge, state G output g=1 during a cycle. Input y sampled at end of that cycle (next posedge). If y=1 at that posedge, go to E (g permanently 1). Else go to H (second wait cycle g=1). In H, output g=1. If y=1 at next posedge, go E; else go F (g=0 permanently). Is that "within at most two clock cycles"? Suppose y becomes 1 in cycle 1 (while state G), at next edge go E; outputs g=1 during E. Actually g remains 1 continuously: state G (cycle1) then E (cycle2...). Good. If y is 1 in cycle 2 while H, at edge to E after cycle2, g remains 1. If y never 1 in cycles 1&2, at edge from H (after cycle2) go F, g becomes 0 in cycle3. This means didn't become 1 within two cycles. Good.
+
+But ambiguity: If y=1 at same edge entering G? Not sampled in G? Since G entered on x=1 cycle, y could be 1 during that cycle or after? "While maintaining g=1 monitor y. If y has value 1 within at most two clock cycles" Usually starts once g=1. So sample y during G and H cycles. Good.
+
+Alternatively some solutions use states with g=1 and counter, if y=1 in first/second. Our design likely accepted.
+
+Need implement SystemVerilog. Single DUT. Use localparam states. Synchronous reset active low. Output f,g assigned combinational from state.
+
+Need ensure f pulse exactly one cycle after reset deassert. Let's state transitions:
+
+localparam A=0, F1=1, S0=2, S1=3, S2=4, G1=5, G2=6, GPERM=7, GZERO=8;
+reg [3:0] state, next;
+
+always @(posedge clk) begin
+ if(!resetn) state <= A;
+ else state <= next;
+end
+
+always @(*) begin
+ next = state;
+ f=0; g=0;
+ case(state)
+  A: begin
+     f=0; g=0;
+     if(resetn) next=F1; else next=A;
+  end
+  F1: begin f=1; g=0; next=S0; end
+  S0: begin f=0; g=0; if(x) next=S1; else next=S0; end
+  S1: begin f=0; g=0; if(!x) next=S2; else next=S1? Need handle sequence 1,0. If x=0 from S1 go S2. What if x=1? We have seen first 1 but now sequence could restart? Actually looking for successive 1,0,1. In S1 waiting for 0. If x=1, since just got 1 then 1, no 0. Could this x=1 serve as new first 1? Sequence "1,0,1 in three successive". If after 1 we get another 1, the last cycle is 1, so it could be first of new sequence. Need decide. For overlapping detection, if x=1 while waiting for 0, we should stay S1 (have current first 1). If x=0 go S2. So if (x) next=S1; else next=S2. Good.
+  S2: begin f=0; g=0; if(x) next=G1; else next=S0? If x=0 after 1,0, sequence 1,0,0 fails. Could the last 0 be first? first needed 1, so reset to S0. If x=1, detected 1,0,1 -> next G1. 
+  G1: begin f=0; g=1; if(y) next=GPERM; else next=G2; end
+  G2: begin f=0; g=1; if(y) next=GPERM; else next=GZERO; end
+  GPERM: begin f=0; g=1; next=GPERM; end
+  GZERO: begin f=0; g=0; next=GZERO; end
+ endcase
+end
+
+Wait G1 output g=1. If y=1 in same cycle as G1, next GPERM. If y=0, next G2. In G2 output g=1. If y=1, next GPERM; if not, GZERO. This gives two cycles of g=1 regardless (unless y=1 early). If y=1 in first cycle G1, then GPERM next, g remains 1. If y=1 in second cycle G2, GPERM next, g remains 1. If not, GZERO next, g=0 after second. Good.
+
+But potential subtle: "If y has the value 1 within at most two clock cycles" Maybe if y=1 at the exact cycle g becomes 1 (the following clock cycle after x sequence), should maintain. Our G1 samples y during that cycle, so yes. If y was 1 during the x sequence cycle before g=1? Does that count? "While maintaining g=1 monitor y" implies no. But if y=1 before g=1, maybe should count? Let's parse: "then g should be set to 1 on the following clock cycle. While maintaining g = 1 the FSM has to monitor the y input. If y has the value 1 within at most two clock cycles..." That suggests after g set. So not count before. Good.
+
+Need reset behavior: "as long as reset asserted, FSM stays in state A. When reset de-asserted, then after next clock edge FSM set f=1 for one clock cycle." Our state A with resetn=1 next F1, at edge state becomes F1, f=1. Good. But what about synchronous reset: if resetn=0 at posedge, state A. If resetn deasserts asynchronously between edges, at next posedge state goes F1. Good.
+
+Output logic in same always_comb sets f/g. Using assign maybe. Need ensure no latches. Use always @(*) with defaults.
+
+Potential issue: f should be 1 for one clock cycle after reset deassert. In state F1 if resetn goes 0, next cycle reset. Fine.
+
+Need decide if state encoding param. We can write compact. No tools.
+
+Let's consider if there is an alternative interpretation of x sequence: "When x has produced the values 1, 0, 1 in three successive clock cycles, then g should be set to 1 on the following clock cycle." Could require checking after reset/f pulse. Our S0 starts after f pulse. If x=1 on the same cycle f=1? In F1, f=1, and we ignore x. The spec says after f one cycle, then monitor x. So okay. What if x sequence starts immediately at first cycle after f? Our transition from F1 to S0 at edge ending f cycle, then S0 during next cycle. At that cycle, we check x. If x=1, next edge to S1. This means the first x=1 cycle is the cycle immediately following f=1. That seems correct.
+
+Let's map timeline:
+cycle 0 resetn=0 state A f=0.
+resetn deassert before posedge cycle 1.
+posedge cycle1 -> state F1, f=1 during cycle1.
+posedge cycle2 -> state S0, sample x during cycle2? In S0 next = x? At posedge cycle3, if x=1 during cycle2, go S1. So first x cycle is cycle2.
+If x=1 cycle2, x=0 cycle3, x=1 cycle4. At posedge cycle5 -> state G1, g=1 during cycle5. So g set on following cycle after third x=1 (cycle4). Yes.
+
+Wait our transition S2->G1 occurs at posedge after cycle4 (third x=1). So state G1 during cycle5. Good.
+
+Now y monitoring: g=1 during cycle5 (G1). If y=1 during cycle5, posedge cycle6 -> GPERM, g=1 cycle6 onward. If y=0 cycle5 -> G2 g=1 cycle6. Then if y=1 cycle6 -> GPERM cycle7. If y=0 cycle6 -> GZERO cycle7, g=0 cycle7. So y=1 in cycle6 counts as within two cycles (cycle5 and cycle6). Good.
+
+Potential issue: "If y has the value 1 within at most two clock cycles" Could mean y sampled at the clock edge following g=1? Actually in synchronous FSM, inputs sampled at clock edges. But outputs based on state after edge. The "clock cycle" while g=1 starts after edge. The y value in that cycle is sampled at next edge. Our counting cycles of g=1 is correct.
+
+Let's test corner: If y=1 exactly at posedge entering G1 (i.e., y was 1 in previous cycle before g=1). Our design doesn't count it. "While maintaining g=1 monitor y" excludes. If they intended count from g=1 cycle, okay.
+
+Could there be requirement "if y becomes 1 within at most two cycles" meaning after g goes 1, wait two clock cycles including the cycle g becomes 1? We do.
+
+Let's consider common problem maybe from HDLBits "Fsm motor" or "2013 q2bfsm". I vaguely recall this is from an exam problem. There may be known state diagram. Let's search memory: This is from MIT 6.004? Actually "2013 q2bfsm" maybe from Digital Design and Computer Architecture? The FSM has states: A, B (f=1), C,D,E? Sequence 101, then g=1, wait y. It says "If y has the value 1 within at most two clock cycles, then the FSM should maintain g = 1 permanently... But if y does not become 1 within two clock cycles, then set g=0 permanently." There may be a specific state diagram where g=1 immediately after detecting 101, and if y=0 in first cycle, g remains 1 for one more cycle then if y=1 then permanent else 0. Our design matches.
+
+Need produce final answer exactly one complete DUT between [BEGIN] and [DONE]. No explanation. Use SystemVerilog. Could use module TopModule. Include ports. Use reg [3:0] state, next; always @(*) etc. Need avoid SystemVerilog features not allowed? "SystemVerilog, single self-contained TopModule DUT." Use always_comb maybe fine. But to be safe use always @(*) and reg. Outputs f,g as reg? We can declare output reg f, g? Interface says output f, g. In SystemVerilog, output logic f, g. Use logic. Need be compatible. We can write:
+
+module TopModule(
+    input clk,
+    input resetn,
+    input x,
+    input y,
+    output logic f,
+    output logic g
+);
+
+typedef enum logic [3:0] { A, F1, S0, S1, S2, G1, G2, GPERM, GZERO } state_t;
+state_t state, next;
+
+always_ff @(posedge clk) begin
+    if (!resetn) state <= A;
+    else state <= next;
+end
+
+always_comb begin
+    f = 1'b0;
+    g = 1'b0;
+    next = state;
+    case (state)
+        A: begin
+            if (resetn) next = F1;
+        end
+        F1: begin
+            f = 1'b1;
+            next = S0;
+        end
+        S0: begin
+            if (x) next = S1;
+            else next = S0;
+        end
+        S1: begin
+            if (x) next = S1;
+            else next = S2;
+        end
+        S2: begin
+            if (x) next = G1;
+            else next = S0;
+        end
+        G1: begin
+            g = 1'b1;
+            if (y) next = GPERM;
+            else next = G2;
+        end
+        G2: begin
+            g = 1'b1;
+            if (y) next = GPERM;
+            else next = GZERO;
+        end
+        GPERM: begin
+            g = 1'b1;
+            next = GPERM;
+        end
+        GZERO: begin
+            next = GZERO;
+        end
+        default: next = A;
+    endcase
+end
+
+endmodule
+
+Need check default outputs for default: f,g already 0. Fine.
+
+Potential issue with S1: if x=1 stay S1, if x=0 go S2. Suppose sequence 1,1,0,1: At cycle1 x=1 -> S1. cycle2 x=1 -> stay S1 (last 1). cycle3 x=0 -> S2. cycle4 x=1 -> G1. This detects 1,0,1 using cycle2-4? Actually cycle2=1, cycle3=0, cycle4=1. Yes, correct. Suppose 1,0,1,0,1: cycle1 1 S1, cycle2 0 S2, cycle3 1 G1. Then g=1. If y not... but if x sequence maybe after? g path. If sequence detection overlaps? No need.
+
+What about S2 with x=0: we go S0. Suppose sequence 1,0,0,1,0,1. At cycle1 1 S1, cycle2 0 S2, cycle3 0 -> S0. cycle4 1 -> S1... detects from cycle4. Correct.
+
+Could x=1 in S2 and y maybe? We go G1. Good.
+
+Now let's think about resetn during operation. If resetn asserted (low) at any posedge, state <= A. Outputs in next cycle? At posedge state becomes A, then f/g based on A =0. Synchronous. "As long as reset input asserted, FSM stays in beginning state A." Good.
+
+Do we need f=1 immediately after reset deassert? Our F1 state outputs f=1. But if resetn deasserts and then at same posedge? Synchronous reset checked first. If resetn=1 at posedge, state F1. So f=1 during next cycle. "after next clock edge" yes.
+
+Potential subtle: In state A, if resetn=1, next F1. But what if resetn is asserted asynchronously and deasserted between edges? At next posedge state F1. That's one cycle after reset deassert? Actually if reset deasserted just after posedge, next posedge is up to one cycle later. f=1 after next edge. Good.
+
+Let's consider if f should be 1 on the same edge that reset deasserts? The spec says "When reset signal is de-asserted, then after the next clock edge the FSM has to set output f to 1 for one clock cycle." So after next clock edge. Our f becomes 1 after next edge (state F1). Good.
+
+Now final answer should be between [BEGIN] and [DONE]. No explanation. We need include exact code. Ensure no markdown? The protocol likely expects [BEGIN] code [DONE]. We'll output.
+
+But let's double-check if there's any hidden trap: "All input and output ports are one bit unless otherwise specified." So output f,g one bit. Use logic.
+
+Could use assign f = (state == F1); g = (state == G1 || state == G2 || state == GPERM); But always_comb is fine.
+
+Need ensure SystemVerilog enum with typedef inside module is okay. If simulator doesn't support? SystemVerilog yes. But maybe simpler localparam reg [3:0]. To avoid any enum issues, use localparam [3:0] A=0, F1=1, etc. Reg [3:0] state, next. That is universal. Let's do that.
+
+Code:
+
+module TopModule (
+    input clk,
+    input resetn,
+    input x,
+    input y,
+    output reg f,
+    output reg g
+);
+
+    localparam [3:0] A     = 4'd0,
+                     F1    = 4'd1,
+                     S0    = 4'd2,
+                     S1    = 4'd3,
+                     S2    = 4'd4,
+                     G1    = 4'd5,
+                     G2    = 4'd6,
+                     GPERM = 4'd7,
+                     GZERO = 4'd8;
+
+    reg [3:0] state, next;
+
+    always @(posedge clk) begin
+        if (!resetn)
+            state <= A;
+        else
+            state <= next;
+    end
+
+    always @(*) begin
+        f = 1'b0;
+        g = 1'b0;
+        next = state;
+
+        case (state)
+            A: begin
+                if (resetn)
+                    next = F1;
+                else
+                    next = A;
+            end
+            F1: begin
+                f = 1'b1;
+                next = S0;
+            end
+            S0: begin
+                if (x)
+                    next = S1;
+                else
+                    next = S0;
+            end
+            S1: begin
+                if (x)
+                    next = S1;
+                else
+                    next = S2;
+            end
+            S2: begin
+                if (x)
+                    next = G1;
+                else
+                    next = S0;
+            end
+            G1: begin
+                g = 1'b1;
+                if (y)
+                    next = GPERM;
+                else
+                    next = G2;
+            end
+            G2: begin
+                g = 1'b1;
+                if (y)
+                    next = GPERM;
+                else
+                    next = GZERO;
+            end
+            GPERM: begin
+                g = 1'b1;
+                next = GPERM;
+            end
+            GZERO: begin
+                next = GZERO;
+            end
+            default: begin
+                next = A;
+            end
+        endcase
+    end
+
+endmodule
+
+This is good.
+
+Wait: In S1, if x=1, we stay S1. But what if sequence requires "1,0,1 in three successive clock cycles" and after seeing first 1, if next is 1, then the 0 is not there. The last 1 could be first of new attempt, yes. But what about after seeing 1,0 and then x=0, we go S0. But the last 0 cannot be first (needs 1). However, could the last 0 be second of a sequence started earlier? No. So S0 correct.
+
+Now consider if x=0 in S1, go S2. In S2, if x=0, go S0. What if x=1? go G1. Good.
+
+Potential issue: After G=0 permanently, if resetn high, state remains GZERO. If resetn low, resets to A. Good.
+
+Now final. Ensure no extra text. Use [BEGIN] and [DONE].

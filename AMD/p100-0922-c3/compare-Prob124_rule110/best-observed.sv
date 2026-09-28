@@ -1,0 +1,32 @@
+
+module TopModule (
+  input  logic clk,
+  input  logic load,
+  input  logic [511:0] data,
+  output logic [511:0] q
+);
+
+  logic [511:0] next_q;
+
+  function automatic logic rule110(input logic left, input logic center, input logic right);
+    rule110 = (~left & (center | right)) | (center ^ right);
+  endfunction
+
+  always_comb begin
+    for (int i = 0; i < 512; i++) begin
+      logic l, c, r;
+      l = (i == 511) ? 1'b0 : q[i+1];
+      c = q[i];
+      r = (i == 0)   ? 1'b0 : q[i-1];
+      next_q[i] = rule110(l, c, r);
+    end
+  end
+
+  always_ff @(posedge clk) begin
+    if (load)
+      q <= data;
+    else
+      q <= next_q;
+  end
+
+endmodule

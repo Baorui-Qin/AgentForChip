@@ -1,0 +1,235 @@
+We need answer exactly one complete DUT between [BEGIN] and [DONE], no explanation. Need implement 12-hour clock counters in SystemVerilog. Need infer BCD outputs widths 8 bits each: hh is two BCD digits: bits [7:4] tens, [3:0] ones. mm, ss same. Reset synchronous active high to 12:00 AM. pm 0 for AM, 1 for PM. Count sequence: 12:00:00 AM -> ... -> 11:59:59 AM -> 12:00:00 PM -> ... -> 11:59:59 PM -> 12:00:00 AM.
+
+Input ena increments once per second when high. reset priority. Need handle ena pulse synchronous.
+
+Design straightforward: registers for ss ones/tens, mm ones/tens, hh ones/tens, pm.
+
+On posedge clk:
+ if reset: ss=0; mm=0; hh = 8'h12? Wait BCD 12: tens=1, ones=2 => 8'h12. pm=0.
+ else if ena:
+   increment seconds. Need cascade correctly.
+   if ss ones == 9 then ss ones=0; if ss tens==5 then ss tens=0; increment minute; else ss tens++; else ss ones++.
+ Then minutes cascade. Then hours: sequence ones and tens digits. Hours valid 01? Actually reset 12. Hours counting: after 12:59:59 -> 01:00:00 (AM/PM toggle at 12->01? Wait PM indicator: 12 PM is noon, then 01 PM. 11 PM -> 12 AM, then 01 AM. Need careful.
+
+Hours BCD states: 12, 01, 02, ..., 09, 10, 11, then 12. pm toggles when hours transition from 11 to 12. Let's determine:
+Start 12 AM (pm=0). After 12:59:59 AM, next is 01:00:00 AM (pm remains 0). Continue to 11:59:59 AM. Next should 12:00:00 PM (pm becomes 1, hours=12). Continue 12 PM -> 01 PM (pm remains 1). ... 11:59:59 PM -> 12:00:00 AM (pm becomes 0, hours=12).
+
+So hours increment logic:
+- If hh == 12 and AM/PM? Actually hh=12 at both noon start PM and midnight start AM. Increment from 12 to 01 without toggling pm. Increment from 11 to 12 toggles pm. Reset sets 12 AM.
+- So if hh tens/ones == 11, next hh=12, pm toggles.
+- Else if hh ones == 9? For 09 -> 10. If hh == 09, next hh=10 (tens=1, ones=0). Else if hh == 12, next hh=01 (tens=0, ones=1). Else hh ones++.
+Specifically BCD hour cases:
+12 -> 01
+01 -> 02
+...
+09 -> 10
+10 -> 11
+11 -> 12 (toggle pm)
+
+Need decide hh output format: Two BCD digits for hours (01-12). So hh[7:4] tens, hh[3:0] ones. Reset hh=8'h12. When 12 -> 01, hh=8'h01. When 09 -> 10, hh=8'h10. 11 -> 12, hh=8'h12.
+
+We can code with case on hh value high nibble and low nibble.
+
+Simpler: maintain small binary hour 1..12? Then encode BCD. But interface wants BCD. Could implement counters directly.
+
+Implement with always_ff @(posedge clk). Use local variables? In always_ff can do nested if.
+
+Pseudo:
+reg [3:0] ss_ones, ss_tens;
+reg [3:0] mm_ones, mm_tens;
+reg [3:0] hh_ones, hh_tens;
+reg pm_reg;
+assign pm = pm_reg;
+assign ss = {ss_tens, ss_ones};
+assign mm = {mm_tens, mm_ones};
+assign hh = {hh_tens, hh_ones};
+
+always_ff @(posedge clk) begin
+ if (reset) begin
+   ss_tens <= 0; ss_ones <= 0;
+   mm_tens <= 0; mm_ones <= 0;
+   hh_tens <= 4'd1; hh_ones <= 4'd2;
+   pm_reg <= 1'b0;
+ end else if (ena) begin
+   // seconds
+   if (ss_ones == 9) begin
+     ss_ones <= 0;
+     if (ss_tens == 5) begin
+       ss_tens <= 0;
+       // increment minutes
+       if (mm_ones == 9) begin
+         mm_ones <= 0;
+         if (mm_tens == 5) begin
+           mm_tens <= 0;
+           // increment hours
+           if (hh_tens == 1 && hh_ones == 1) begin
+             // 11 -> 12, toggle pm
+             hh_tens <= 1;
+             hh_ones <= 2;
+             pm_reg <= ~pm_reg;
+           end else if (hh_tens == 1 && hh_ones == 2) begin
+             // 12 -> 01
+             hh_tens <= 0;
+             hh_ones <= 1;
+           end else if (hh_tens == 0 && hh_ones == 9) begin
+             // 09 -> 10
+             hh_tens <= 1;
+             hh_ones <= 0;
+           end else begin
+             // 01-08, 10 -> next ones
+             hh_ones <= hh_ones + 1;
+             // hh_tens unchanged
+           end
+         end else begin
+           mm_tens <= mm_tens + 1;
+         end
+       end else begin
+         mm_ones <= mm_ones + 1;
+       end
+     end else begin
+       ss_tens <= ss_tens + 1;
+     end
+   end else begin
+     ss_ones <= ss_ones + 1;
+   end
+ end
+end
+
+Wait cascade logic: when ss_tens == 5 and ss_ones ==9, ss resets, increment minute. Correct. When mm_tens==5 and mm_ones==9, mm resets, increment hour. Correct.
+
+Need be careful with hh_tens ==1 && hh_ones==2 for 12 -> 01. But what about hh=12 initially and ena increments? Yes, goes to 01. pm toggling only at 11->12. Also at 12->01 pm unchanged. For PM 12->01 stays PM. For AM 12->01 stays AM. Correct.
+
+Check 11 ->12 toggles pm. Start 11:59:59 AM -> 12:00:00 PM, pm toggles from 0 to 1. 11:59:59 PM -> 12:00:00 AM, pm toggles from 1 to 0. Correct.
+
+Reset has priority over ena: if reset high, reset regardless ena. The code does that.
+
+Need output widths: hh, mm, ss 8 bits. pm 1 bit. Ports as specified. Module named TopModule.
+
+Potential issue: In always_ff, assignments to hh_tens when increment 10 -> 11: hh_tens=1, hh_ones=0. Our else branch for 10 -> 11: hh_tens==1 && hh_ones==0, falls into else (not 11, not 12, not 09) -> hh_ones <= 1. hh_tens unchanged 1. So 10 -> 11. Correct.
+
+What about 01-08: hh_tens=0, hh_ones 1..8 -> else hh_ones+1. Correct. 08->09. 09->10 handled. 12->01 handled.
+
+What about hh_tens=1 hh_ones=1 for 11->12 toggles pm. Good.
+
+Need ensure no latches. All branches assign.
+
+Could simplify using case, but above is fine.
+
+Need output hh mm ss continuous assignments. Use wire? We can use logic.
+
+SystemVerilog syntax:
+module TopModule (
+    input  logic clk,
+    input  logic reset,
+    input  logic ena,
+    output logic pm,
+    output logic [7:0] hh,
+    output logic [7:0] mm,
+    output logic [7:0] ss
+);
+    logic [3:0] ss_ones, ss_tens;
+    logic [3:0] mm_ones, mm_tens;
+    logic [3:0] hh_ones, hh_tens;
+    logic pm_reg;
+
+    assign pm = pm_reg;
+    assign ss = {ss_tens, ss_ones};
+    assign mm = {mm_tens, mm_ones};
+    assign hh = {hh_tens, hh_ones};
+
+    always_ff @(posedge clk) begin
+        if (reset) begin
+            ss_tens <= 4'd0;
+            ss_ones <= 4'd0;
+            mm_tens <= 4'd0;
+            mm_ones <= 4'd0;
+            hh_tens <= 4'd1;
+            hh_ones <= 4'd2;
+            pm_reg <= 1'b0;
+        end else if (ena) begin
+            if (ss_ones == 4'd9) begin
+                ss_ones <= 4'd0;
+                if (ss_tens == 4'd5) begin
+                    ss_tens <= 4'd0;
+                    if (mm_ones == 4'd9) begin
+                        mm_ones <= 4'd0;
+                        if (mm_tens == 4'd5) begin
+                            mm_tens <= 4'd0;
+                            // Increment hours
+                            if (hh_tens == 4'd1 && hh_ones == 4'd1) begin
+                                hh_tens <= 4'd1;
+                                hh_ones <= 4'd2;
+                                pm_reg <= ~pm_reg;
+                            end else if (hh_tens == 4'd1 && hh_ones == 4'd2) begin
+                                hh_tens <= 4'd0;
+                                hh_ones <= 4'd1;
+                            end else if (hh_tens == 4'd0 && hh_ones == 4'd9) begin
+                                hh_tens <= 4'd1;
+                                hh_ones <= 4'd0;
+                            end else begin
+                                hh_ones <= hh_ones + 4'd1;
+                            end
+                        end else begin
+                            mm_tens <= mm_tens + 4'd1;
+                        end
+                    end else begin
+                        mm_ones <= mm_ones + 4'd1;
+                    end
+                end else begin
+                    ss_tens <= ss_tens + 4'd1;
+                end
+            end else begin
+                ss_ones <= ss_ones + 4'd1;
+            end
+        end
+    end
+endmodule
+
+Check width of addition: hh_ones + 4'd1 yields 4-bit? hh_ones is 4 bits. Adding 1 may overflow if hh_ones=15, but branch excludes 9 and 11,12; hh_ones max 8 or 10? For 10, hh_ones=0 -> +1=1. Fine. No overflow.
+
+Need consider ena pulse synchronous. It says "pulse on ena whenever your clock should increment". So if ena high on posedge, increment. Reset synchronous active high. Good.
+
+Potential issue: The problem likely from HDLBits "Count clock" maybe expects BCD outputs and pm. The typical solution uses nested ifs. Our code matches.
+
+Need output exactly between [BEGIN] and [DONE]. No explanation. Ensure no stray text. Use [BEGIN] then code then [DONE].
+
+Let's double-check hour logic for all transitions:
+- hh=12 (tens=1, ones=2), ena increment at 12:59:59: seconds/minute cascade sets hh next. Condition hh_tens==1 && hh_ones==2 -> hh=01. pm unchanged. Correct: 12:59:59 AM -> 01:00:00 AM. pm 0. 12:59:59 PM -> 01:00:00 PM. pm 1.
+- hh=11 (1,1) -> 12, toggle pm. 11:59:59 AM -> 12:00:00 PM. pm 0->1. 11:59:59 PM -> 12:00:00 AM. pm 1->0.
+- hh=09 (0,9) -> 10 (1,0). 09:59:59 -> 10:00:00.
+- hh=10 (1,0) -> else hh_ones+1 => 11. Correct.
+- hh=01 (0,1) -> 02. etc.
+
+What about hh=00? Should never occur except maybe if reset? reset sets 12. So no.
+
+What about mm/ss tens valid? Start 00. When ss_ones=9 and ss_tens=5 -> reset to 00. So max 59. When mm_ones=9 and mm_tens=5 -> reset 00. So max 59.
+
+Potential issue: Reset priority. In code, if (reset) else if (ena). So reset wins. Correct.
+
+Potential issue: "Assume all sequential logic is triggered on the positive edge of the clock." Using always_ff posedge clk. Good.
+
+Potential issue: "All input and output ports are one bit unless otherwise specified." pm is one bit. hh, mm, ss 8 bits. We use logic. Good.
+
+Potential issue: The spec says hh, mm, ss are two BCD digits each for hours (01-12), minutes (00-59), seconds (00-59). They might expect hh[7:4] tens, hh[3:0] ones. Our assignment does that.
+
+Potential issue: In reset, hh=8'h12, mm=8'h00, ss=8'h00, pm=0. That's 12:00 AM. Good.
+
+Potential issue: Does ena increment even during reset? No, reset higher priority.
+
+Potential issue: "Reset is active high synchronous signal that resets the clock to 12:00 AM." Yes.
+
+Potential issue: "pm is asserted if the clock is PM, or is otherwise AM." pm=1 for PM. Our pm_reg toggles at 11->12. So 12 PM has pm=1? Let's trace: Start 12 AM pm=0. At 11:59:59 AM -> 12:00:00 PM, pm toggles to 1. So 12 PM has pm=1. Correct. At 11:59:59 PM -> 12:00:00 AM, pm toggles to 0. So 12 AM has pm=0. Correct.
+
+Potential issue: The hour counting from 12 AM: 12 AM, 01 AM, ... 11 AM, 12 PM, 01 PM, ... 11 PM, 12 AM. Our logic: 12->01 (pm unchanged), 01->02... 11->12 (toggle). So at 12 PM pm=1. Then 12->01 (pm unchanged, stays 1). Then ... 11->12 (toggle to 0). So 12 AM pm=0. Correct.
+
+Everything seems fine.
+
+Could write with case statements for clarity, but current nested ifs are okay. Need ensure synthesis okay. xczu3eg. 5 ns clock. Fine.
+
+Let's consider if the problem expects hours to reset to 1? No, spec says 12:00 AM.
+
+Now, output format: exactly one complete DUT between [BEGIN] and [DONE]. No explanation. I'll output code block? The instruction says "Return exactly one complete DUT between [BEGIN] and [DONE], without explanation." Could include code directly, no markdown code fences? Usually these tasks expect raw code between markers. I'll provide raw Verilog/SystemVerilog code.
+
+Ensure no extra text after [DONE].
+
+Let's produce final.

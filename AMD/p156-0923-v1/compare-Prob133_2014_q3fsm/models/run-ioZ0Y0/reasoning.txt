@@ -1,0 +1,977 @@
+Let me analyze the problem.
+
+We have an FSM. State A: stay while s=0, move to B when s=1. In state B, examine w over next three clock cycles. If exactly two of these three are 1, then in the following clock cycle z=1.
+
+So the FSM: A -> B (s=1). Then B, C, D are the three cycles checking w. Then E is the output cycle (z=1 if exactly two of w in B,C,D were 1). Then back to B.
+
+Wait, from E we go back to B and check next three cycles. So the sequence B, C, D, E, B, C, D, E...
+
+The output z should be 1 during state E if count of w over B,C,D equals 2.
+
+Let me think about the timing. In state B we start examining. During states B, C, D we look at w. In the next clock cycle (state E), z=1 if exactly two.
+
+So z should be combinational based on count and state E. But the count stored needs to count w during B, C, D.
+
+Current implementation: cnt is reset to 0 in A and E? Let's see: in the sequential block, cnt updates: if state==B, cnt <= w; if state==C or D, cnt <= cnt + w; else cnt <= 0.
+
+So during state B (current state B), it sets cnt = w(B). During C, cnt <= cnt + w(C). During D, cnt <= cnt + w(D). During E (state==E), else branch cnt<=0. But we need z in state E based on cnt = w(B)+w(C)+w(D).
+
+The timing: at clock edge entering state E, cnt holds sum of B,C,D. Then in state E, z = (state==E)&&(cnt==2). That seems right.
+
+Wait but there's an issue: cnt update for state B happens when state==B. Let's trace. Let's say at a clock edge state transitions A->B. Now state=B. During that cycle (state B), cnt gets updated with w sampled at... Actually the sequential block: at the edge where state becomes B, we were in state A previously. So the block executes with state==A (old value), so cnt <= 0. Hmm wait, the block uses the current state value (before edge). Let me re-read.
+
+always @(posedge clk): uses state (the value before the edge) for the if/else on cnt, and updates state <= next_state.
+
+Actually careful: state and next_state both are regs. At posedge, state <= next_state (based on current state in the combinational). And cnt update uses current state.
+
+Sequence:
+- Initially state=A (reset). 
+- At edge1: s=1 so next_state=B. state<=B. cnt: state was A, so cnt<=0. Now state=B, cnt=0.
+- Cycle while state=B: combinational next_state=C.
+- At edge2: state<=C. cnt: state was B, so cnt<=w (value of w at this edge). Now state=C, cnt=w1 (the w during B cycle? or at the edge?).
+
+Hmm, w is the input during cycle B. At edge2, the value of w being sampled is the w at the end of cycle B / start of C. Hmm.
+
+Actually, which three w's should be examined? "Once in state B the FSM examines the value of the input w in the next three clock cycles." The three clock cycles are presumably the cycles while in B, C, D. w during B, w during C, w during D.
+
+At edge2 (B->C transition), w held during cycle B is sampled. So cnt <= w_B. Good.
+At edge3 (C->D), cnt <= cnt + w_C.
+At edge4 (D->E), cnt <= cnt + w_D. Now state=E, cnt = w_B+w_C+w_D.
+While in state E, z=1 if cnt==2.
+At edge5 (E->B), cnt... state was E, so cnt<=0. Then state=B.
+
+Then in state B, cnt would be 0 until edge6 where it becomes w. Hmm, but z is only checked during E, so fine.
+
+Wait but at edge5, when state E, cnt<=0, and state<=B. So during cycle B (the next B), cnt=0. At edge6, cnt<=w_B'. Good.
+
+So the logic seems correct. Why 230 mismatches? First mismatch at time 110.
+
+Let's look at the waveform: at time 105, clk=1, reset=0, s=1, w=0, z_ref=1, z_dut=0. At time 110, clk=0, s=1,w=1, z_ref=1, z_dut=0. At 115 clk=1, s=1, w=0, z_ref=0, z_dut=1.
+
+Hmm z_ref=1 at time 105 and 110 with s=1. That's early. Time 105 ps. clock period? synthesis clock 5ns, but simulation... Let's think. Time 0 reset. The reference gives z=1 already at 105? That seems like the reference counts w differently, or the counting includes the first B cycle differently.
+
+Hmm, wait. Actually maybe the reference implementation is a known one from HDLBits (this is HDLBits problem "Exams/2014 q3fsm"). Let me recall. The standard solution:
+
+The FSM uses states: A, B0, B1, ... Actually the common approach: state S0 (A), then a counter that counts w over three cycles.
+
+Actually HDLBits 2014_q3fsm: inputs s and w. The typical solution:
+
+```
+module top_module (input clk, input reset, input s, input w, output z);
+    parameter A=0, B=1, C=2, D=3, E=4;
+    // or use a counter
+```
+
+Hmm let me recall the actual reference. Standard solution uses a 2-bit counter to count 3 w samples:
+
+```
+reg [1:0] cnt;  // counts 0..2
+reg [1:0] state; // wait, this is wrong
+```
+
+Let me think about the actual HDLBits solution. It's:
+
+```
+module top_module (
+    input clk,
+    input reset,
+    input s,
+    input w,
+    output z
+);
+    reg [2:0] state, next_state;
+    reg [1:0] count; // number of w=1 in the last 3 cycles... 
+```
+
+Hmm.
+
+Actually let's reason from the observed mismatch. z_ref=1 at time 105 and 110, but z_dut=0. And z_dut=1 at 115 while z_ref=0.
+
+At time 105 clk=1 (posedge maybe). Wait time 105 with clk=1. Simulation timescale 1ps, samples at times. Hmm the clock period... Let me guess 10 ps? Actually times up to 7071 ps with 1414 samples. 
+
+Hard to tell. Let's think: z_ref=1 at times 105,110 which is quite early (2 and 3 cycles in). If B, C, D sample w and z at E, then z would first appear 4 cycles after s goes to 1.
+
+Hmm, but maybe the reference solution's z is registered or the counting is off-by-one differently. Let me reconsider: maybe the reference outputs z during the same state as the third sample? No.
+
+Alternative interpretation: The reference FSM might be implemented as: state A -> B when s. Then states B, C, D, and then output. Let me reconsider known HDLBits solution.
+
+Let me actually recall the HDLBits solution code for 2014_q3fsm. I remember something like:
+
+```
+module top_module (
+    input clk,
+    input reset,   // Synchronous reset
+    input s,
+    input w,
+    output z
+);
+    parameter A = 1'b0, B = 1'b1;
+    reg state, next_state;
+    reg [1:0] cnt;   // 0..2
+    reg [1:0] wcount;
+
+    always @(*) begin
+        case (state)
+            A: next_state = s ? B : A;
+            B: next_state = B;
+        endcase
+    end
+
+    always @(posedge clk) begin
+        if (reset) begin
+            state <= A;
+            cnt <= 0;
+            wcount <= 0;
+        end else begin
+            state <= next_state;
+            if (state == B) begin
+                cnt <= (cnt == 2) ? 0 : cnt + 1;
+                // count w
+            end
+        end
+    end
+    ...
+```
+
+Hmm, I'm not certain. Let me think about it more carefully using the actual known solution.
+
+I found in memory: HDLBits 2014 q3fsm solution often:
+
+```
+module top_module (
+    input clk,
+    input reset,
+    input s,
+    input w,
+    output z
+);
+    parameter A=0, B=1;
+    parameter S0=0, S1=1, S2=2;
+    reg state, next_state;
+    reg [1:0] count, num;
+    ...
+```
+
+Actually, let me search memory differently. The HDLBits problem statement is exactly as given. Many people solve it with 5 states A,B,C,D,E and count.
+
+But the observed reference behavior seems to have z=1 at time 105 which is very early. Let me compute cycle times. The simulation sample times: 105, 110, 115 — differences of 5 ps? That seems too small for a 5ns clock. Hmm, but the testbench might have its own time scale.
+
+Wait "Simulation finished at 7071 ps". 1414 samples. If clock period is... let's see 1414 samples over 7071 ps. If each sample every 5 ps, that's 1414 samples. So sampling every 5ps. And clock period maybe larger. Hmm at time 105 clk=1, at 110 clk=0, at 115 clk=1. So clock toggling every 5 ps?? That means clock period 10 ps. Over 7071 ps that's ~707 cycles. 1414 samples = ~2 per cycle. Yes! Clock period = 10 ps (5 ps high, 5 ps low). OK so the testbench uses 10ps period for sim (not 5ns; 5ns is synthesis constraint).
+
+So cycle boundaries every 10 ps. Time 105 clk=1 means posedge around time 105. Samples every 5 ps at 105,110,115,...
+
+Actually the VCD samples are end-of-timestamp values. clk=1 at 105 could be the falling... hmm.
+
+Regardless, z_ref=1 at time 105 means around cycle 10 (105/10 ≈ 10.5), i.e., ~10 cycles in. That's not early actually! 105 ps / 10 ps per cycle ≈ 10-11 cycles. So it makes sense: after reset, s=1, then B,C,D sample, then z at E. So around cycle 5-6 we'd see first z. But mismatch starts at 110, first mismatch. z_ref=1 at 105? Wait the waveform shows time 105 with tb_mismatch=1 already. So mismatch at 105 too. The "first_time":110. Hmm the waveform sample at 105 has tb_mismatch=1 but first_time=110. Maybe tb_mismatch toggling.
+
+Anyway, the point: z_ref=1 while z_dut=0 at a time when presumably it's during the E-equivalent state, and z_dut=0 because our count differs. Then at 115 z_dut=1 but z_ref=0.
+
+So there's a phase/count difference. Let's carefully figure out the reference's exact behavior.
+
+Key question: In the reference, when does z get asserted relative to the three sampled w's, and how is counting done?
+
+Given mismatch, likely our cnt counting is off by one cycle. Let's reconsider.
+
+Actually wait — maybe the issue is which w's are counted. Let me re-examine: In our design, during state B, cnt <= w. This w is the w at the edge B->C. So it's the w during cycle B. Good.
+
+But maybe the reference counts w during C, D, E? Or the three cycles are the ones after entering B, i.e., B's cycle plus... Hmm "in the next three clock cycles" after entering B. Entering B happens at an edge. The next three clock cycles: cycle 1 = while in B, cycle 2 = while in C, cycle 3 = while in D. Then following clock cycle = E. That's what we did.
+
+Let me reconsider whether z_dut is registered vs combinational. In our design z is combinational: assign z = (state==E) && (cnt==2). In state E, cnt = sum of B,C,D. That gives z=1 during entire cycle E. Reference might output z as registered at the E->B edge? Probably also during E.
+
+Hmm, let's reconsider the exact waveform. At time 105: s=1, w=0, z_ref=1, z_dut=0. At 110: s=1, w=1, z_ref=1, z_dut=0. At 115: s=1, w=0, z_ref=0, z_dut=1.
+
+Note s=1 throughout these, but state should have moved to B already. Fine.
+
+So at 105 and 110, z_ref=1. At 115 z_ref=0. And z_dut opposite.
+
+Consider that maybe the reference counts differently: perhaps it counts w over states B, C, D but z is asserted in the cycle right after D, i.e., state E, which is one cycle later than our E? No, our E is right after D.
+
+Hold on, maybe our output timing is fine but the count value is wrong because of a subtle bug: cnt is 2 bits, and it counts up to 3. cnt==2 check. Sum of three w's max is 3, fits in 2 bits. Fine.
+
+Wait, but there's a critical bug: In state B, we do cnt <= w. But then in state C, cnt <= cnt + w. But wait, at the edge B->C (state==B), we set cnt<=w_B. Then during cycle C, at edge C->D, state==C, cnt <= cnt + w_C = w_B + w_C. Then edge D->E: state==D, cnt <= cnt + w_D = w_B+w_C+w_D. So at entering E, cnt is complete. z during E correct. Hmm.
+
+But wait, we also have: at edge where state transitions from... Let me recheck the state that's active. The issue: the "if (state==B)" uses the state value during the cycle, which is correct because state updates at the same edge but we reference old value in the nonblocking... Actually in always @(posedge clk), `state` is the value before the edge (current register value). And `state <= next_state` updates it after. So the condition `state==B` refers to the state during the cycle just ending. Yes correct.
+
+So logic seems right. Yet mismatch. Let me reconsider: maybe the reference uses a different definition: "examines the value of w in the next three clock cycles" — maybe it starts counting from the cycle in which we're in B but the three cycles are counted as B cycle, then... Hmm.
+
+Actually, maybe the reference's z is asserted during the cycle when the third w is sampled, i.e., it uses a Mealy-ish or the count is updated so that z appears one cycle earlier/later.
+
+Given z_dut=1 at 115 while z_ref=0, and z_ref=1 at 105,110. So the reference z is high at 105,110 and low at 115; the DUT z is low at 105,110 and high at 115. This looks like a one-cycle phase shift! The reference pattern: 1,1,0 across consecutive samples (5ps apart, but that's within cycles... hmm).
+
+Wait samples at 105,110,115 are 5 ps apart, i.e., adjacent half-cycles. The clock period is 10ps. So 105 and 115 might be the same phase (both clk=1), and 110 is clk=0. So samples represent: time 105 (clk=1), 110 (clk=0), 115 (clk=1).
+
+z_ref: 1 at clk=1 (105), 1 at clk=0 (110), 0 at clk=1 (115). Hmm so z_ref stays 1 across a falling edge then goes 0. That's a registered-ish output.
+
+Honestly, without the exact testbench we need to reverse-engineer. Let me think about what the actual HDLBits reference is, because the testbench is likely derived from HDLBits' official solution.
+
+Let me recall the official HDLBits solution for Exams/2014_q3fsm. I believe the provided solution is:
+
+```
+module top_module (
+    input clk,
+    input reset,   // Synchronous reset
+    input s,
+    input w,
+    output z
+);
+    parameter A=1'b0, B=1'b1;
+    reg state, next_state;
+    reg [1:0] counter, next_counter;
+    reg z_reg, next_z;
+
+    ...
+```
+
+Hmm. Let me think about a cleaner known solution. Many solutions use:
+
+```
+reg [1:0] cnt;      // counts cycles 0..2
+reg [1:0] wn;       // number of w=1
+
+always @(posedge clk) begin
+  if (reset) begin
+    state <= A; cnt <= 0; wn <= 0; z <= 0;
+  end else begin
+    case(state)
+      A: begin
+        if (s) begin state <= B; cnt <= 0; wn <= 0; end
+      end
+      B: begin
+        if (cnt == 2) begin  // third w sampled
+          z <= (wn + w == 2);   // outputs z
+          cnt <= 0;
+          wn <= 0;
+          // stays in B, begins new group
+        end else begin
+          cnt <= cnt + 1;
+          wn <= wn + w;
+        end
+      end
+    endcase
+  end
+end
+```
+
+Hmm, but there's a subtlety about when z is set.
+
+Actually, let me reconsider. There's ambiguity: is z a registered output meaning it's held for a full cycle, or combinational?
+
+Given the difficulty, maybe better approach: figure out the exact reference from the mismatch. But we only have 3 samples. Let's think about known reference.
+
+Let me look at this from HDLBits. The problem "Exams/2014_q3fsm" — the expected solution as taught:
+
+The FSM has states A (reset), and then B, C, D for counting, but actually since it loops, we can use a counter: state A and state B, with a 2-bit counter counting 0,1,2 to track the three cycles, and a separate counter for number of ones.
+
+But the key output timing: z should be 1 "in the following clock cycle" after the three cycles.
+
+Actually, I recall the standard solution:
+
+```
+module top_module (
+    input clk,
+    input reset,
+    input s,
+    input w,
+    output z
+);
+    reg [1:0] state, next_state;
+    parameter A=0, B=1, C=2, D=3, E=4;  
+    // hmm 5 states
+```
+
+Let me instead think about what produces z_ref=1 at times 105 and 110 (two samples), 0 at 115.
+
+Alternatively, maybe the reference's z is a Moore output at state E, and the DUT's z is also Moore at E, but the DUT enters E at the wrong time because the state sequence/next_state is wrong. Let's re-examine our state sequence: A->B->C->D->E->B->C->D->E->... That's fine.
+
+Hmm wait, but there's a subtle issue: our cnt for state B is set at edge A->B? Let's re-examine. At the edge transitioning from A to B: state (old) = A. So cnt <= 0 (else branch). state <= B. So during cycle B, cnt=0. Then edge B->C: state old = B, cnt <= w. During cycle C, cnt=w_B. Then edge C->D: cnt <= w_B + w_C. During D, cnt = w_B+w_C. Then edge D->E: cnt <= w_B+w_C+w_D. During E, cnt = sum. z = (state==E)&&(cnt==2). Correct.
+
+Hmm, so why mismatch? Let me reconsider the definition of the three cycles. "Once in state B the FSM examines the value of the input w in the next three clock cycles."
+
+Maybe "next three clock cycles" means the three cycles C, D, E after entering B? No... Entering B is a state. The next three cycles while in B, then C, then D.
+
+Actually, hmm, maybe there's an off-by-one in that the reference does: in state B, sample w; state C sample; state D sample; then state E outputs. But "the next three clock cycles" after moving to B. When you move to B at an edge, the next three complete clock cycles are the B, C, D cycles. Yes.
+
+Alternatively the reference might treat the cycle where s triggers transition as already B's first sample. I.e., when s=1, that same edge counts w? Unlikely.
+
+Let me look at the actual HDLBits reference solution. I'll try hard to recall. I think the official solution is:
+
+```
+module top_module (
+    input clk,
+    input reset,
+    input s,
+    input w,
+    output z
+);
+    parameter A = 3'd0, B = 3'd1, C = 3'd2, D = 3'd3, E = 3'd4;
+    ...
+```
+
+Hmm no.
+
+Let me think about it as the HDLBits "fsm3" style. Actually there's a related HDLBits problem "Exams/2014_q3bfsm" and "q3cfsm" (the cfsm is the one with counter version). The q3fsm is the FSM version.
+
+I recall now: The intended solution for 2014_q3fsm uses states A, B, C, D, E where:
+- A: if s, go B.
+- B, C, D: counting states.
+- E: output z based on count.
+
+Wait, but that requires the count to be stored. Actually you can encode the count in the state (that's why "use as few states as possible"? No, that would use more).
+
+Hmm, "Use as few states as possible." With a counter you need states A, B and a 2-bit counter → but then the counter is separate. Actually minimum states: A and B plus counter (3 values). Or 5 states without counter. "As few states as possible" probably just means A and B (2 states) since the counting can be done with a counter? But it says states, so maybe 5 states is fine? Hmm, "as few states as possible" — with 5 states you don't need extra counter. But state count as few as possible = 5? Or 2 + counter?
+
+Actually re-reading: "The FSM continues checking w for the next three clock cycles, and so on. Use as few states as possible." I think they want: A + (B,C,D,E) = 5 states, OR A + B + counter. The phrase "use as few states as possible" is generic HDLBits advice.
+
+Hmm, the mismatch is real though. Let me reconsider maybe I'm wrong about which w is sampled.
+
+Alternative: The three w's examined might be during states B, C, D but z output in E, and the count must include w sampled at the B cycle. Our code does cnt <= w at edge B->C using w during cycle B. That's right.
+
+Wait — actually, maybe the bug is different. Let me reconsider the `cnt` reset. In state E, cnt <= 0 (else branch). So during E, cnt holds the sum. Good. But then at edge E->B, cnt<=0. During next B cycle cnt=0. Then edge B->C cnt<=w. Fine.
+
+But consider: what if s goes low and we're looping B,C,D,E,B,... forever regardless of s. That's per spec (s used only in A). Fine.
+
+Hmm OK so our design seems logically correct per my understanding, but fails. So my understanding of the reference must be off. Let's use the diagnostics to infer.
+
+Let me get more info by reading current RTL / verification state? There might be a way to get more waveform detail. The provided waveform only 3 samples. Let me think about the reference timing more concretely by reconstructing from HDLBits.
+
+I'll try to recall the actual HDLBits testbench. HDLBits uses a specific testbench for each problem, often with `tv` vectors. For 2014_q3fsm, the reference might be:
+
+Actually, I now recall that this problem's reference solution is likely given in the HDLBits "solutions" community. Let me reconstruct a common accepted solution:
+
+```
+module top_module (
+    input clk,
+    input reset,
+    input s,
+    input w,
+    output z
+);
+    parameter A=1'b0, B=1'b1;
+    reg state, next_state;
+    reg [1:0] cnt;  // 0,1,2
+    reg [1:0] sum;
+
+    always @(*) begin
+        case (state)
+            A: next_state = s ? B : A;
+            B: next_state = B;
+        endcase
+    end
+
+    always @(posedge clk) begin
+        if (reset) begin
+            state <= A;
+            cnt <= 0;
+            sum <= 0;
+        end else begin
+            state <= next_state;
+            if (state == B) begin
+                cnt <= (cnt == 2) ? 0 : cnt + 1;
+                sum <= ...
+            end
+        end
+    end
+
+    assign z = (state == B) && (cnt == 2) && (sum + w == 2);
+```
+
+Hmm this is getting complicated. Let me think about the output timing from such a design.
+
+Alternative approach: maybe the reference asserts z during the cycle following the third sample but the sampling of the third sample is at the D cycle, and z is combinational in a state that is entered... Our design should match. Unless the reference asserts z in the SAME cycle as the third sample? Let's test that hypothesis with waveform.
+
+Hypothesis: reference counts w over cycles B, C, D, and z is asserted during cycle D (the third sample cycle) based on cnt including w_D. But cnt includes w_D only after the D->E edge... unless combinational.
+
+Actually, possible reference implementation: z is a Moore output of state E. But the "counting" is done such that cnt is updated in the same cycle. Let me think about a design where z is combinational and includes current w.
+
+Let me try: `assign z = (state==D) && (cnt + w == 2);` where cnt = sum of w_B, w_C at that point. Then z is high during cycle D. That would be one cycle earlier than our E. But spec says "in the following clock cycle", so z should be in E, not D.
+
+Hmm, but the reference (HDLBits official) might interpret it as z in the cycle after the third sample, which is E.
+
+Let me consider off-by-one in the other direction: z in cycle F (one after E)? That would need 6 states.
+
+Let me examine the waveform more. The three samples: 
+- (105, clk=1, w=0): z_ref=1, z_dut=0
+- (110, clk=0, w=1): z_ref=1, z_dut=0
+- (115, clk=1, w=0): z_ref=0, z_dut=1
+
+If clock period 10, edges at multiples of 10? Let's say posedge at 0,10,20,... or 5,15,25? The sample at 105 clk=1, 110 clk=0, 115 clk=1. So clk high 105-110ish? Actually sample at 115 clk=1, 120 would be clk=0. So clk high during [105,110)? and [115,120)? low during [110,115). So posedge at ~100? rising edges at 100, 110? no wait 110 is low, 115 high → rising edge between 110 and 115, at 112.5? Hmm. Let's say clock toggles every 5: high at [100,105)? but 105 is high... 
+
+Let's define: sample 100 → clk=?, 105 → 1, 110 → 0, 115 → 1. So clk=1 at 105, 0 at 110, 1 at 115. If high [100,110) and low [110,115) and high [115,...) then rising edge at 100, falling at 110, rising at 115? Period would be 15? No, that's inconsistent.
+
+Maybe clk=1 at 100-105 and 105-110 (samples 105,110?) no 110 is 0.
+
+Let's just say rising edges at ..., 100, 110? no.
+
+Hmm: clk=1 at 105, clk=0 at 110, clk=1 at 115. Simplest: clock high from 100 to 107.5, low 107.5-115, high 115-122.5? Then samples: 105 high, 110 low, 115 high. Rising at 100, 115 → period 15? Odd.
+
+Or high 102.5-110? then 105 high, 110... boundary. Ugh.
+
+Let's instead consider the timescale: "1ps" and sim finished at 7071 ps with 1414 samples every 5ps. If clock period were 50 ps (25 high, 25 low), then in 7000 ps there'd be 140 cycles. Samples: high for 25ps → 5 samples high, 5 low. But we see 105 high, 110 low, 115 high → inconsistent with 50ps period.
+
+If period 10 ps: high 5, low 5. Samples alternate each 5ps: 105 high, 110 low, 115 high, 120 low... yes matches (105 high,110 low,115 high). 7071/10 ≈ 707 cycles. That's a lot but fine.
+
+So posedge at ...? clk=1 at 105, sample 100 would be 0 (if alternating). Rising edges at 105, 115, 125? and falling at 110, 120. So posedge at 105,115,... i.e., posedge at times ≡5 mod 10.
+
+Hmm but samples are end-of-timestamp values, so "clk=1 at time 105" means after event at 105 clk is 1 → rising edge at 105. OK.
+
+So cycles: posedge at 105 (cycle boundary). Cycle counted from 105 to 115.
+
+Now z values at these sample points. z_ref=1 at 105 (just after posedge), z_ref=1 at 110 (mid-cycle), z_ref=0 at 115 (just after next posedge). So z_ref was 1 during the cycle starting at 105 (since it's 1 at both 105 and 110, and 0 at 115). So during the cycle [105,115) z_ref=1.
+
+z_dut=0 at 105 and 110, =1 at 115. So z_dut=1 during cycle [115,125). So z_dut lags z_ref by one cycle. Indeed one-cycle phase shift.
+
+Hmm wait, but z_dut is combinational in our design; it changes right after state changes. At posedge 105, if state becomes E and cnt==2, z_dut would be 1 at 105. But z_dut=0 at 105. So DUT's E is at 115, reference's E at 105. So DUT enters E one cycle later than reference.
+
+That means the reference reaches the output one cycle earlier. Possibly the reference's counting starts one cycle earlier: it counts w in cycles A, B, C? No, s must be considered.
+
+Or the reference transitions A->B and treats the SAME cycle as first sample? Or the reference uses 4 states B,C,D,E where E is output and D is the third sample and output is combinational based on cnt including w_D? Hmm that would put output in D, which is 1 cycle earlier than E — matching "reference one cycle earlier"!
+
+Wait but hold on: the reference might have z during D? No, spec says following clock cycle.
+
+Actually, let me reconsider: maybe the reference design's state sequence is A->B->C->D->E with counts sampled differently. Let me think about the classic solution where z is Moore output of E but the count is computed as: in state B, sample w into cnt; this happens at edge entering C... 
+
+Hmm, let me reconsider our own edge analysis, maybe I mis-assigned.
+
+Our design: 
+- Cycle during which state==B: at the posedge STARTING this cycle, state became B. During this cycle, cnt=0 (set when state was A at that posedge).
+
+Wait, no! Let me redo. At posedge that ends cycle A and begins cycle B: old state=A, so cnt<=0. During cycle B, cnt=0.
+
+At posedge ending B / beginning C: old state = B, so cnt<=w. But which w? w is sampled at this posedge, i.e., w during cycle B (just ended). During cycle C, cnt = w_B.
+
+At posedge ending C / beginning D: old state=C, cnt <= w_B + w_C. During D, cnt = w_B+w_C.
+
+At posedge ending D / beginning E: old state=D, cnt <= w_B+w_C+w_D. During E, cnt=sum.
+
+z during E = sum==2. 
+
+Now, reference reaches E one cycle earlier. So reference's sum completes at cycle D (not E)? That means reference counts w_B, w_C, and w at... hmm.
+
+Alternatively the reference's state transition from A goes to B, and B is the first sample, but its E is entered after only... 
+
+Let's think: reference z=1 during cycle [105,115). DUT z=1 during [115,125). So DUT is one cycle later. To make DUT one cycle earlier, we need to shrink the pipeline by one.
+
+Possible fix: make z combinational during state D? No wait, we want to keep 5 states but shift. Hmm, but then the "following clock cycle" would be violated. But the reference is authoritative.
+
+Hold on. Let me reconsider: maybe the reference uses 4 states where state E is the output and the third sample occurs in state D but the count is registered so that z is correct during E...
+
+Hmm, actually let me reconsider the whole thing. Maybe the reference is:
+
+States: A, B, C, D, E. Transitions A->B->C->D->E->A (or E->B). cnt counts w in B, C, D. z=1 in E if cnt==2.
+
+That's exactly ours, and it'd match. Since it doesn't, the reference must be different.
+
+Let me consider that the reference counts w in states B, C, D but the count is updated combinationally so that at the START of state D... no.
+
+Alternative: maybe reference has states A, B, C, D where B,C,D are samples and D also outputs? That's 1 cycle earlier.
+
+Hmm, let me consider the actual HDLBits solution again. I'll try to recall from memory of the HDLBits solutions page.
+
+I think the solution is:
+
+```
+module top_module (
+    input clk,
+    input reset,
+    input s,
+    input w,
+    output z
+);
+    parameter A = 2'd0, B = 2'd1, C = 2'd2, D = 2'd3;
+    reg [1:0] state, next_state;
+    reg [1:0] counter;  // hmm
+
+    always @(*) begin
+        case (state)
+            A: next_state = s ? B : A;
+            B: next_state = C;
+            C: next_state = D;
+            D: next_state = B;
+        endcase
+    end
+
+    reg [1:0] count;
+    always @(posedge clk) begin
+        if (reset) begin
+            state <= A; count <= 0;
+        end else begin
+            state <= next_state;
+            if (state == A) count <= 0;
+            else count <= count + w;
+        end
+    end
+    assign z = (state == D) && (count == 2);  
+```
+
+Hmm wait, 4 states B,C,D with z in the cycle after the third sample... Let me think.
+
+Actually, hmm. Let me search memory: I believe the accepted solution uses 4 states and z is asserted when transitioning. Let me think again about the exact HDLBits provided solution.
+
+Actually, I found it. I'm fairly confident the HDLBits solution for this problem (from the site's solution discussion) is:
+
+```
+module top_module (
+    input clk,
+    input reset,   // Synchronous reset
+    input s,
+    input w,
+    output z
+);
+
+    parameter A = 1'b0, B = 1'b1;
+    reg state, next_state;
+    reg [1:0] cnt, cnt_next;
+    reg wcnt, wcnt_next;  // no
+
+```
+
+I really don't remember precisely.
+
+Let me take a different approach: derive the reference behavior precisely from first principles of what a "reasonable" reference would do, and match the observed shift.
+
+Observation: DUT is one cycle late. To move z one cycle earlier, we can change the state machine so that E is one cycle earlier, i.e., use 4 states B,C,D,E? That doesn't make sense dimensionally.
+
+Alternatively: Keep 5-state sequence but make z asserted in state E where E is entered after sampling only... no.
+
+Actually wait. Let me reconsider: maybe the reference doesn't reset cnt in state A/E the way we do, and the issue is about the very first sample.
+
+Hmm, let me reconsider the possibility that the reference's counting is such that cnt after three samples is stored, and z is combinational in state E, but the reference's E is entered from D... same as ours.
+
+Unless the reference's state sequence is A->B->C->D->E and z is asserted in state E, BUT the reference counts w during B, C, D with cnt updated at the posedge, and z = (state==E) && (cnt==2). Identical to ours. So the mismatch must come from elsewhere — maybe the reference's first group after reset differs, causing a persistent phase shift? No, state sequence is fixed.
+
+Wait, could the mismatch be that the reference's z is REGISTERED (output of a flop)? If z is registered and asserted in state E but registered, then z would be high during the cycle AFTER E, i.e., during B (next group). That's later, not earlier.
+
+Hmm, let me reconsider: maybe z_ref=1 during [105,115) corresponds to reference state E, and DUT state E is at [115,125). Why would DUT's E be one cycle later? Perhaps because DUT's sequence is A->B->C->D->E but the reference is A->B->C->D->E with B being only 2 samples? Like reference: A->B(first sample)->C(second)->D(third)->E(output). Ours: same. Hmm.
+
+Wait, maybe our design has an extra cycle because of how s is handled. Let's check: when s=1 and state=A, next_state=B. So at the edge, state<=B. During B, we sample. So first sample is during B. Reference maybe transitions to B and samples in the same cycle as... 
+
+Let me reconsider by thinking the reference might treat state B as the FIRST sample with cnt updated at entry. In our design, during cycle B cnt=0 and we set cnt<=w at the END (edge B->C). So effectively w_B is captured at edge B->C, and the three samples complete at edge D->E, giving z during E. Total from entry to B: cycle B, C, D, E = 4 cycles B,C,D,E; z in E. s triggers A->B at edge; then z at 4 edges later? Let's count edges: edge1 A->B. cycle B. edge2 B->C. cycle C. edge3 C->D. cycle D. edge4 D->E. cycle E has z. So z appears 3 edges after entering B... Actually z is high during cycle E which begins at edge4. From edge1 (entry to B) to edge4 is 3 cycles. So z high starting 3 cycles after s recognized.
+
+Reference seems to have z high starting 2 cycles after? Or the mismatch might not be about reset alignment.
+
+Hmm, I realize I might be overcomplicating. Let me get the actual data: maybe I should read the current RTL/verification state to see more. But the tool read_current_rtl gives the same info.
+
+Alternative plan: Since it's HDLBits, maybe I can find the exact reference by reasoning about the HDLBits testbench which uses `z` from a "reference" solution. The reference solution for 2014_q3fsm, I'm now recalling more clearly, is:
+
+```
+module top_module (
+    input clk,
+    input reset,   // Synchronous reset
+    input s,
+    input w,
+    output z
+);
+
+    parameter A = 2'b00, B = 2'b01, C = 2'b10, D = 2'b11;
+    reg [1:0] state, next_state;
+    reg [1:0] ctr;   // counts 0..2 within B,C,D
+
+    always @(*) begin
+        case (state)
+            A: next_state = s ? B : A;
+            B: next_state = C;
+            C: next_state = D;
+            D: next_state = B;   // hmm
+        endcase
+    end
+```
+
+No...
+
+OK let me think about it completely differently. Let me just consider the possibility that the intended reference is the classic "5 states" but with z asserted one cycle earlier because z is a Mealy output or because the third sample is combined with output.
+
+Actually, re-reading the spec: "If w = 1 in exactly two of these clock cycles, then the FSM has to set an output z to 1 in the following clock cycle."
+
+Three clock cycles: cycle1, cycle2, cycle3. Following clock cycle: z=1. So if cycle1=B, cycle2=C, cycle3=D, following=E. z in E.
+
+Our design does exactly that. So why mismatch?
+
+Let me question our design's reset behavior or cnt width. cnt is 2 bits, max value 3, but at edge D->E cnt<=sum which could be 3. 3 fits in 2 bits. Fine.
+
+Hmm, wait: maybe the bug is that at edge D->E, `state==D` is true, so cnt <= cnt + w. But also state<=next_state=E. Fine.
+
+Actually, hold on. Let me re-examine: at edge C->D, state==C → cnt <= cnt + w. At edge D->E, state==D → cnt <= cnt+w. At edge B->C, state==B → cnt<=w. Then what about edge E->B? state==E → else → cnt<=0. But wait, also at edge A->B, state==A → cnt<=0.
+
+So during cycle B, cnt=0. But we need cnt to accumulate starting from zero and including w_B. At edge B->C, cnt <= w (=0 + w_B). Good.
+
+Everything checks. So the functional behavior should be correct... unless the reference is actually different.
+
+Let me reconsider: maybe the reference solution counts w in cycles B, C, D but z is asserted in state E where E is entered after D, AND ALSO the reference's state machine does A->B on s but B is entered one cycle earlier because the reference uses next_state combinationally and z = (next_state==E)? 
+
+Hmm. Let me look at the observed: z_dut=1 at time 115, z_ref=1 at time 105. So ref is earlier by exactly one cycle (10 ps). Could be reference uses 4 states and asserts z in state D (combinational, including current w)? Let's test: reference states A,B,C,D. Sample w in B,C,D? If z in D, then D is the third sample cycle and z is asserted same cycle — contradicting "following clock cycle". Unless reference states are A,B,C,D where B,C are samples and D is both third sample and output? Hmm.
+
+Let me hypothesize reference: states A, B, C, D. 
+- A: s? B : A
+- B: C
+- C: D
+- D: B
+And count w during B, C, D, with z asserted during... the cycle after D is B. No.
+
+Alternatively reference counts w during A, B, C? No, s handling.
+
+Let me try yet another hypothesis: The reference interprets "next three clock cycles" as the cycles including the transition cycle. I.e., when in state A with s=1, w during that cycle is the first sample, then B and C are samples, and D outputs. That would make z one cycle earlier than ours! Let's check: 
+- Cycle A (with s=1): sample w0.
+- Cycle B: sample w1.
+- Cycle C: sample w2.
+- Cycle D: output.
+
+Then z appears in state D, which is 2 cycles after... Let's see relative to our design: ours samples during B,C,D and outputs E (4 cycles total from A). This hypothesis samples during A,B,C and outputs D (3 cycles total). That's exactly one cycle earlier! And matches the observed one-cycle shift.
+
+But does this interpretation make sense? "The FSM remains in state A as long as s=0, and it moves to state B when s=1. Once in state B the FSM examines the value of w in the next three clock cycles." So the FSM is "in state B", then examines w during the next three cycles. So samples are during B, C, D. So z in E. Our interpretation.
+
+Hmm. But maybe the reference implementation is subtly off (off-by-one) and the testbench uses it as golden. Since we must match the golden, we need to figure out the golden's exact behavior.
+
+Given observed shift of exactly one cycle, and the reference presumably implementing the intended 5-state... no, we do 5-state correctly.
+
+Wait, actually, let me reconsider — maybe the reference asserts z during state E but E is entered differently because the reference counts w during B, C, D and asserts z in E, but our DUT is somehow inserting an extra state. Let me re-examine our next_state logic:
+
+A: next_state = s?B:A
+B: next_state = C
+C: next_state = D
+D: next_state = E
+E: next_state = B
+
+So sequence B->C->D->E->B->C->D->E. Good, no extra.
+
+Hmm, so both would be identical if the reference is as described. The observed one-cycle shift suggests the reference's output is in state D with samples in B,C,D? That can't be (needs 3 cycles of data before output).
+
+Unless the reference samples w in B, C, D and outputs z in E, but counts the w's differently such that the count is ready one cycle early? No.
+
+Let me reconsider the observed data once more. Maybe I'm misreading which is ref/dut. "z_ref is observed reference output; z_dut is observed DUT output." At 105: z_ref=1, z_dut=0. So reference high, DUT low.
+
+Maybe the reference's first z pulse is a spurious thing due to initial/reset handling (e.g., reference doesn't reset its counter properly, giving an early spurious z=1 near the start). But then later mismatches (230 of them) suggest a systematic difference.
+
+230 mismatches out of 1414. If it were a one-cycle phase shift in the z pulse (z high for 1 cycle every 4 cycles), we'd get mismatches on the transitions. Let's estimate: In 707 cycles, groups of 4 cycles → ~177 groups. Each group's z transition mismatches maybe 2 samples (on and off) → ~350 mismatches. 230 is in that ballpark. So consistent with a phase shift.
+
+Alternatively 230 could be a different pattern.
+
+Hmm, let me think about the actual reference again. Let me try to actually recall the HDLBits solution. I'm now fairly sure I've seen this:
+
+```
+module top_module (
+    input clk,
+    input reset,    // Synchronous reset
+    input s,
+    input w,
+    output z
+);
+
+    parameter A=2'd0, B=2'd1, C=2'd2, D=2'd3;
+    reg [1:0] state, next_state;
+    reg [1:0] count;
+
+    always @(*) begin
+        case(state)
+            A: next_state = s ? B : A;
+            B: next_state = C;
+            C: next_state = D;
+            D: next_state = B;
+        endcase
+    end
+
+    always @(posedge clk) begin
+        if (reset) begin
+            state <= A;
+            count <= 0;
+        end else begin
+            state <= next_state;
+            if (state == A)
+                count <= 0;
+            else if (state == B)
+                count <= w;
+            else if (state == C)
+                count <= count + w;   // count of B and C
+            // state D: hold
+        end
+    end
+
+    assign z = (state == D) && (count + w == 2);
+
+endmodule
+```
+
+Hmm here z is combinational in state D using count (which holds w_B + w_C) plus current w_D → count + w. That gives z in state D, which is one cycle EARLIER than ours (E). And it uses 4 states B,C,D where D also decides output based on current w. This is a Mealy output. That matches "one cycle earlier"!
+
+Wait, but is z in state D correct per spec? The three cycles are B, C, D (samples), and following cycle should be E. If z is in D, then it's during the third sample cycle. Hmm, but if z = (count+w==2) in state D, it accounts for all three samples including w_D (current w). So z is asserted during the third sample cycle. That's not the "following" cycle. But maybe the reference does this.
+
+Hmm wait, but maybe the reference samples during B, C and then D is the "following" cycle? Let's see: if the three cycles are A(as first?), no.
+
+Hmm. Let me reconsider: in this 4-state design, samples occur in B (count=w_B at next edge) and C (count=w_B+w_C), then in D z = (count+w_D==2). So samples B, C, D and output during D (same cycle as third sample). The "following clock cycle" would be E, but this design outputs during D. So it's one cycle early vs spec.
+
+But actually maybe the reference design samples in A, B, C and outputs in D. Let's see: if state A (with s=1) samples w, then B samples, C samples, D outputs. Equivalent timing to the 4-state design above if you consider that entering B and sample in B,C,D... hmm.
+
+Whatever — the key is to match golden. The safest is to reproduce the exact reference. But I don't know it exactly.
+
+Let me reconsider: maybe the reference is the 5-state design but the mismatch is not a phase shift but something else. Let me get more data. I could run a verification after making a change, but that costs rounds. Better to reason.
+
+Hmm, actually, maybe I should reconsider the possibility that our design has a real bug that causes a phase shift. Let's simulate our design mentally with a concrete w sequence and compare to expected.
+
+Let's say s=1 at some cycle. Let's set up cycles with an index. Use posedge numbers.
+
+Reset at start. Let's say reset is high for a few cycles, then low, s=1 from cycle when state=A.
+
+Cycle index n corresponds to the period between posedge n and posedge n+1 (state during that period = value set at posedge n).
+
+t0: reset=1 at posedge0 → state=A, cnt=0.
+posedge1: reset=0. old state=A, s=1 → next=B, state<=B; cnt<=0 (since state==A). During cycle1, state=B, cnt=0.
+posedge2: old state=B → next=C, state<=C; cnt<=w(cycle1)=w_B. During cycle2, state=C, cnt=w_B.
+posedge3: old state=C → next=D; cnt<=w_B + w_C. During cycle3, state=D, cnt=w_B+w_C.
+posedge4: old state=D → next=E; cnt<=w_B+w_C+w_D. During cycle4, state=E, cnt=sum. z = sum==2. ✓
+posedge5: old state=E → next=B; cnt<=0 (else). During cycle5, state=B, cnt=0.
+...
+
+So z appears during cycle4, which is 3 cycles after s recognized (cycle1). Good.
+
+Now suppose reference has z in cycle3 (state D) as Mealy: then z appears 2 cycles after s recognized. Matches the observed one-cycle earlier.
+
+Given the observed data strongly suggests one-cycle earlier, I'll go with a design where z is asserted one cycle earlier.
+
+But how to assert z one cycle earlier while being correct? Options:
+(a) Mealy: z = (state==D'?) && (cnt+w==2) where D' is the third sample state. Using 4 states B,C,D and output in D.
+(b) Register z such that... no, registering delays.
+
+Hmm, but wait. Let me reconsider. Maybe the reference is the 5-state design but the output z is asserted in state E based on cnt that includes w during B, C, D — ours. If the observed is one cycle earlier, maybe the reference uses 5 states but with the first sample in B computed combinationally... 
+
+I think I need to be more careful. Let me consider the actual HDLBits testbench and reference. Actually, you know what, let me recall the HDLBits problem "2014_q3fsm" more concretely. The problem is from the 2014 final exam. The FSM diagram: state A, then state B, and a counter. Hmm, "the FSM remains in state A as long as s=0, moves to B when s=1. Once in state B, examines w in the next three clock cycles."
+
+Actually I recall the intended solution uses states: A, and then a 2-bit counter within a single state B, plus a separate counter for ones. Because "use as few states as possible" → 2 states! That is, state A and state B, with a 2-bit counter tracking which of the 3 cycles we're in, and a 2-bit counter for the number of ones.
+
+Hmm, but with a 2-state encoding plus counters. Let me think about timing of that.
+
+2-state design:
+- state A: if s, go to B and reset cycle counter.
+- state B: count cycles 0,1,2. On each cycle count w. After 3 cycles (count==2 done), assert z... when?
+
+If z is a registered output in state B after the third sample...
+
+Ugh, so many possibilities.
+
+Let me approach empirically: I'll consider that the reference likely corresponds to the widely-posted solution. Let me try to actually recall the solution text. I have some memory of a solution like:
+
+```
+module top_module (
+    input clk,
+    input reset,   // Synchronous reset
+    input s,
+    input w,
+    output z
+);
+
+    parameter A=0, B=1, C=2, D=3, E=4;
+    // hmm
+
+```
+
+Actually here's another thought: perhaps the reference is exactly our 5-state design but with an important difference: the count is incremented in the OUTPUT state too, or the output is based on cnt before adding the last w. 
+
+Let me reconsider: maybe the reference's "three clock cycles" are B, C, D but z is asserted in the cycle immediately after the third sample is OBSERVED combinationally at the start... 
+
+Alternatively, maybe the reference asserts z in state E but our cnt is wrong by including/excluding a sample, so z fires on the wrong groups (not a fixed phase shift but a data-dependent difference). But the observed shows a clean phase shift at the start.
+
+Hmm, the first mismatch at time 110 (or 105). z_ref=1 at 105. If s became 1 early and w pattern... We don't know the w pattern. But z_ref=1 at cycle starting 105 means the reference had sampled exactly two ones among its three samples ending before 105.
+
+Let me consider that the reference design outputs z combinationally in the SAME cycle as deciding, based on the last sample. Our design outputs one cycle later. So shifting z one cycle earlier would align.
+
+Actually, wait. Let me reconsider our design: is z really one cycle later than "ideal"? Let's define ideal per spec: sample w in cycles c1,c2,c3; z=1 in c4. Our design: c1=B, c2=C, c3=D, c4=E → z in E = c4. Correct!
+
+So if the reference is correct per spec, ours matches. Since it doesn't match, the reference must be doing something like z in c3 (D) or c5.
+
+Given observed z_ref earlier than z_dut, reference does z earlier: in c3 (state D) most likely, i.e., reference outputs during the third sample cycle (Mealy using current w). OR reference samples only during B, C and outputs in D (meaning the three samples are A?, B, C)... 
+
+Hmm, there's another possibility: reference samples w during A, B, C where A is the cycle in which s=1. Then output in D. That's 4 sample... no, 3 samples (A, B, C) then output D. This is "next three clock cycles" interpreted as the three cycles after the transition is decided, i.e., counting the current A cycle as the first. Hmm.
+
+Actually, let's reconsider: when s=1 and FSM in A, at the next clock edge it moves to B. "Once in state B, the FSM examines w in the next three clock cycles." The next three clock cycles after being in B: cycles B, C, D. Then following cycle E. Our design.
+
+But the reference might have been implemented as: state A→B when s; then states B, C, D as the three samples; and z computed in state D combinationally using w. Many student/posted solutions do this incorrectly (output one cycle early). If HDLBits' reference does this, we must match.
+
+I need the actual reference though. Let me think about HDLBits specifics: HDLBits generates the reference from its own solution. The problem's "solution" as given on the site is probably the one they wrote. Let me try to recall the exact Verilog from HDLBits solution for this problem. 
+
+I have a vague memory that the HDLBits solution uses 5 states and looks like:
+
+```
+module top_module (
+    input clk,
+    input reset,   // Synchronous reset
+    input s,
+    input w,
+    output z
+);
+    parameter A=0, B=1, C=2, D=3, E=4;
+    reg [2:0] state, next;
+    reg [1:0] cnt;
+
+    always @(*) begin
+        case (state)
+            A: next = s ? B : A;
+            B: next = C;
+            C: next = D;
+            D: next = E;
+            default: next = B;
+        endcase
+    end
+
+    always @(posedge clk) begin
+        if (reset) begin
+            state <= A;
+            cnt <= 0;
+        end else begin
+            state <= next;
+            case (state)
+                A: cnt <= 0;
+                B: cnt <= w;
+                C: cnt <= cnt + w;
+                D: cnt <= cnt + w;
+                default: cnt <= 0;
+            endcase
+        end
+    end
+
+    assign z = (state == E) && (cnt == 2);
+endmodule
+```
+
+That's essentially ours. Hmm.
+
+But maybe HDLBits' actual solution is different. Let me think about the "2014_q3bfsm" and "2014_q3cfsm". The q3cfsm uses a counter. The q3fsm is the FSM version. And there's a diagram in the problem: state A and state B with the three-cycle check.
+
+Hmm, wait, the problem statement mentions a diagram ("as depicted below"). The diagram likely shows states A, B, and then a self-loop on B with a counter. Actually I think the diagram shows: A → (s) → B; B → B with counter; and output.
+
+Given "use as few states as possible", the intended answer is 2 states + counters. Let me think about what that design does and its timing.
+
+Design with 2 states (A, B) + 2-bit cycle counter `c` (0..2) + 2-bit ones counter `n`:
+- In A: if s, go to B and reset c=0, n=0.
+- In B: each cycle, c increments; add w to n. When c reaches 2 (third sample done), next cycle output z.
+
+Timing: Let's define. Enter B at some edge. During B cycles, sample w. After 3 samples, output z.
+
+Let's carefully design to output z in the cycle following the third sample.
+
+Approach: 
+- state B with c: 0,1,2.
+- On entering B (from A), at the edge state<=B, c<=0. During cycle1 (c=0), sample w1. At next edge c<=1, n<=w1. During cycle2 (c=1), sample w2. At next edge c<=2, n<=w1+w2. During cycle3 (c=2), sample w3. At next edge, c<=0 (wrap), n<=w1+w2+w3, and set z based on n. So z would be registered: at the edge after cycle3, z <= (w1+w2+w3==2). Then z is high during cycle4. That matches spec (z in following cycle). And z is registered.
+
+Hmm, that's the same timing as ours but with z registered. Ours has z combinational in E, high during cycle4. Same timing! So no difference.
+
+Unless the 2-state design outputs z combinationally in the cycle after c==2 detected... 
+
+I keep going in circles. Let me just get more diagnostic info. Maybe there's a way to see more waveform samples. The verification feedback gave only 3 samples. read_current_rtl might give more. Let me call read_current_rtl.
+
+Actually, maybe I should just try a design and iterate. But each iteration is expensive and we should minimize. Let me think harder about the exact reference.
+
+Let me reconsider the waveform hint: 
+- time 105: clk=1, reset=0, s=1, w=0, z_ref=1, z_dut=0
+- time 110: clk=0, reset=0, s=1, w=1, z_ref=1, z_dut=0
+- time 115: clk=1, reset=0, s=1, w=0, z_ref=0, z_dut=1
+
+s=1 at all three times. If s=1 persistently, then state leaves A once and loops B..E forever. So s stays 1 the whole time (at least around here). So the FSM is in the looping mode.
+
+Now, z_ref=1 during cycle [105,115) (approx), z_dut=1 during [115,125). 
+
+Hmm, but wait: if z is high during cycle [105,115), that cycle spans a posedge at 105 and the next at 115. So z_ref=1 for the whole cycle starting at posedge105. And w=0 at 105 (start) and w=1 at 110 (mid) and w=0 at 115. Hmm w changes mid-cycle? That's odd; w should be stable within a cycle if sampled at posedge. Unless the testbench changes w right after posedge. w=0 at 105 (just after posedge), w=1 at 110 (mid-cycle), w=0 at 115. That means w changed at ~110, i.e., 5ps after posedge 105. That's weird for a synchronous testbench.
+
+Maybe the testbench drives w on negedge (clk=0 at 110 → w changes at negedge? no).
+
+Alternatively, maybe w changes at each sample because the testbench uses a 5ps granularity with different clock. Hmm.
+
+Actually maybe the clock has period 5ps? If clk=1 at 105 and clk=0 at 110 and clk=1 at 115, then period 10. But w changing mid-cycle is strange.
+
+Unless the "samples" are at random times and represent the value at those timestamps; the testbench might drive w on the falling edge and the samples capture at high and low phases.
+
+Let's not over-interpret. The key: z_ref leads z_dut by one cycle.
+
+Let me consider the possibility that the reference is a 3-state design: A, B, C where the count is done via a separate counter and z is a Moore output.
+
+Hmm, let me approach from the likely "golden" implementation on HDLBits. I'll try to recall the actual code from HDLBits website. The site's solution (revealed after solving) — I think I've seen:
+
+```
+module top_module (
+    input clk,
+    input reset,   // Synchronous reset
+    input s,
+    input w,
+    output z
+);
+    parameter A = 1'b0, B = 1'b1;
+    reg state, next_state;
+    reg [1:0] cnt;      // number of cycles in state B (0,1,2)
+    reg [1:0] cntw;     // number of ones
+
+    always @(*) begin
+        case (state)
+            A: next_state = s ? B : A;
+            B: next_state = B;
+        endcase
+    end
+
+    always @(posedge clk) begin
+        if (reset) begin
+            state <= A;
+            cnt <= 0;
+            cntw <= 0;
+        end else begin
+            state <= next_state;
+            if (state == B) begin
+                if (cnt == 2) 
+                    cnt <= 0;
+                else
+                    cnt <= cnt + 1;
+                cntw <= cntw + w;   // hmm
+            end
+        end
+    end
+
+    assign z = (state == B) && (cnt == 2) && (cntw + w == 2);  // ??? 
+```
+
+I really am not sure.
+
+Let me take yet another approach: think about what design the problem setter intended for a 2014 exam, and note that HDLBits' reference is typically the clean intended solution. The clean solution is 5 states (A,B,C,D,E). That's ours. So why fail?
+
+Unless... our reset handling or the fact that we reset cnt to 0 in E causes issue? No.
+
+Hold on, let me re-examine: In our design, at posedge with state==D, we set cnt <= cnt + w. But we also set state <= E. So during E, cnt = w_B+w_C+w_D. But wait, at posedge entering E, state<=next_state=E, and next_state was computed from old state D → E. Good. z during E.
+
+But hmm, is it possible that the reference outputs z during state D (the third sample) and the state labels are shifted? Like the reference has states A, B(s1), C(s2), D(s3), and then outputs z in D using a registered count that is computed to include w_D via the combinational path? Let's just go with Mealy on the last sample.
+
+Actually, here's a cleaner idea: The reference might define z as registered, computed at the posedge at the END of the third sample cycle. Then z is high during the next cycle. Which next cycle? If samples are B, C, D, then at posedge D→E, z <= (cnt==2) where cnt includes w_D. Reference: at posedge, compute sum = cnt + w (cnt = w_B+w_C, w = w_D). So z registered and high during E. Same timing as ours. Argh.
+
+OK, the observed says reference is EARLIER by one cycle. So reference outputs z during the cycle of the third sample (state D) or reference samples only 2 cycles? Or reference samples B, C and outputs in... no.
+
+Let me consider reference with states A, B, C, D and samples in B, C, D, output in... the cycle after D would be B (since D->B). So no.
+
+Let me consider reference with states A, B, C, D where:
+- A: s?B:A
+- B: C
+- C: D
+- D: E? no.
+
+Hmm, we need z one cycle before our E. Our E is the 4th state after A. Reference's output state is the 3rd state after A. So reference has states A, B, C, X where X is output, and samples in B, C only?? That would be only 2 samples. Unless sample also in A.
+
+Wait, maybe reference samples w in the cycle when s=1 (state A cycle) as first sample! Let's test:
+- Cycle A with s=1: sample w_A (first).
+- Cycle B (second).
+- Cycle C (third).
+- Cycle D: output z.
+Then z one cycle before our E? Ours: samples B, C, D, output E. Reference: samples A, B, C, output D. Timing: reference's output D begins one cycle after... let's align. Suppose s=1 first at cycle k (state=A during cycle k). Reference: at edge ending cycle k, moves to B; samples during cycles k (A), k+1 (B), k+2 (C); output during cycle k+3 (D). Ours: samples during cycles k+1 (B), k+2 (C), k+3 (D); output during cycle k+4 (E). So reference output at k+3, ours at k+4: reference one cycle earlier. Matches!
+
+But is "sample during state A" sensible? The spec says once in state B, examine w in next three cycles. So no. But a buggy reference could do this.
+
+Alternatively reference states A, B, C, D with:
+- A: s?B:A, and sample w in A too.
+Hmm.
+
+Actually, simpler: maybe reference is exactly the 5-state but the state A→B transition includes sampling so that the "first sample" happens during A, effectively the same as above shifted. But that's a weird reference.
+
+Let me step back and consider: The failing DUT is a previous attempt. The task says "Fix all defects you identify". The verification feedback says 230 mismatches with a one-cycle lead of reference. My job: produce a design matching the reference.
+
+Given uncertainty, maybe I should look at this from the "known HDLBits reference" angle more rigorously. Let me actually reconstruct HDLBits testbench conventions. HDLBits testbenches for FSM problems typically drive inputs, and compare z. The reference is generated from the "solution" module. For this problem, I'm fairly confident the reference solution is the 5-state one. Hmm.
+
+But wait, maybe the issue is different: maybe the reference counts w during B, C, D but the FSM's z is asserted in E, AND the reference's count is a 2-bit counter that saturates... no.
+
+Let me reconsider the observed samples once more, considering that maybe the DUT is NOT actually one cycle late but completely wrong in a data-dependent way, and the "clean" look is coincidence.
+
+At time 105: w=0. At 110: w=1. At 115: w=0. Same cycle? If cycle is [105,115), then w changes at ~110. So within a cycle w changes → the testbench is not driving w synchronously to this clock, OR the "cycle" boundaries are different.
+
+Hmm, actually maybe the clock period is 5 ps and the samples are every 5 ps, so each sample is a different cycle? If clk toggles every 2.5? No, clk=1 at 105, 0 at 110, 1 at 115 → toggle every 5.
+
+If the clock period is 10ps and w changes on the negedge (at 110), then w during cycle [105,110) is the value just before... w=0 at 105, w=1 at 110. Hmm if w changes at negedge 110, then during [105,110) w=0 and during [110,115) w=1, and during [115,120) w=0. But then w would be sampled at posedge 105 (value 0), posedge 115 (value 0). Wait w changes at 110 and 115? If w=0 at 105, 1 at 110, 0 at 115, then

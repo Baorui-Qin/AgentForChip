@@ -1,0 +1,127 @@
+/** Frozen public task selection and host-only evaluator assets. @module rtl-tools/phase1/p10-dataset */
+import { readFile, readdir, realpath } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { checkedFile, sha256, type Evaluation } from './snapshots.ts'
+import { datasetRevision } from './protocol.ts'
+import { checkInterface, declaredInterface, type DUTInterface } from './candidates.ts'
+
+/** Public prompt and immutable asset identities; reference contents never belong to a model prompt. */
+export interface P10Task {
+  task_id: string; spec: string; assets: Record<string, string>
+  interface: DUTInterface | null; interface_error: string | null
+  clock: { kind: 'physical' | 'virtual'; port: string | null; period_ns: 5 } | null
+  git_crlf_checkout_files?: string[]
+}
+/** Selection predicates are frozen before observing evaluator or model outcomes. */
+export const selectionRules = [
+  ['combinational', 'implement a (NOT|NOR|XNOR|AND) gate'],
+  ['counter', 'decade counter'], ['edge', 'detect any edge'], ['state_behavior', 'finite state machine'],
+  ['width_split', 'splits an input half-word'], ['signed_arithmetic', 'signed\\) overflow'],
+  ['bit_manipulation', 'reverse the byte order'], ['comparison', 'A = B'],
+  ['multibit_datapath', '256-to-1 multiplexer'], ['sequential_control', 'one stage in a larger n-bit shift register'],
+] as const
+/** Stable across execution dates; hash ordering is not a random-number-library dependency. */
+export const selectionSeed = 'p10-verilogeval-v1:20260917:'
+
+/** Parse public port lists or a unique inline module; ambiguity blocks rather than guesses. @param spec - unchanged public task. @returns constant-width public interface. */
+export function publicInterface(spec: string): DUTInterface {
+  const declarations = spec.split(/\r?\n/).filter(line => /^\s*-\s+(input|output|inout)\b/.test(line))
+  if (!declarations.length) {
+    const modules = [...spec.matchAll(/\bmodule\s+TopModule\s*\([\s\S]*?\bendmodule\b/g)]
+    if (modules.length !== 1) throw new Error('PUBLIC_INTERFACE_UNSUPPORTED')
+    const parsed = declaredInterface(modules[0]![0], 'TopModule')
+    if (/8-bit 2-to-1 mux/.test(spec) && parsed.ports.some(port => port.direction === 'output' && port.width !== 8)) throw new Error('PUBLIC_INTERFACE_CONFLICT')
+    return parsed
+  }
+  const ports = declarations.map(line => {
+    const match = /^\s*-\s+(input|output)\s+([A-Za-z_][A-Za-z_0-9]*)\s*(?:\(\s*(\d+)\s+bits?\s*\))?\s*,?\s*$/.exec(line)
+    if (!match) throw new Error('PUBLIC_INTERFACE_UNSUPPORTED')
+    const width = Number(match[3] ?? 1)
+    if (!Number.isSafeInteger(width) || width < 1 || width > 65536) throw new Error('PUBLIC_INTERFACE_UNSUPPORTED')
+    return { name: match[2]!, direction: match[1] as 'input' | 'output', width, signed: false }
+  })
+  if (new Set(ports.map(p => p.name)).size !== ports.length) throw new Error('PUBLIC_INTERFACE_DUPLICATE_PORT')
+  return { top: 'TopModule', ports }
+}
+
+/** Read every triplet and compare its Git blob identity to the pinned tree. @param directory - canonical local dataset. @param revision - observed HEAD. @param tree - git ls-tree output for dataset_spec-to-rtl. @param eol - git ls-files --eol evidence; only declared LF-to-CRLF checkouts permit identity normalization, never asset rewriting. @returns sorted catalog with exact worktree byte hashes. */
+export async function loadP10Dataset(directory: string, revision: string, tree: string, eol = ''): Promise<P10Task[]> {
+  if (revision.trim() !== datasetRevision) throw new Error('DATASET_REVISION_CHANGED')
+  const root = await realpath(directory), blobs = new Map<string, string>()
+  for (const line of tree.trim().split(/\r?\n/)) {
+    const match = /^100[0-7]{3} blob ([a-f0-9]{40})\t([^\r\n]+)$/.exec(line)
+    if (!match) throw new Error('DATASET_TREE_UNSUPPORTED')
+    blobs.set(match[2]!, match[1]!)
+  }
+  const names = (await readdir(root + '/dataset_spec-to-rtl')).filter(name => /^Prob\d+_[A-Za-z0-9_]+_prompt\.txt$/.test(name)).sort()
+  if (names.length !== 156) throw new Error('DATASET_TASK_COUNT_CHANGED')
+  const tasks: P10Task[] = []
+  const crlf = new Set(eol.split(/\r?\n/).filter(line => /^i\/lf\s+w\/crlf\s/.test(line)).map(line => line.split('\t')[1]))
+  for (const name of names) {
+    const task_id = name.replace(/_prompt\.txt$/, ''), assets: Record<string, string> = {}
+    const converted: string[] = []
+    let spec = ''
+    for (const suffix of ['prompt.txt', 'ref.sv', 'test.sv']) {
+      const path = `dataset_spec-to-rtl/${task_id}_${suffix}`
+      const bytes = await readFile(await checkedFile(root, path))
+      const blob = (value: Buffer) => createHash('sha1').update(`blob ${value.length}\0`).update(value).digest('hex')
+      if (blobs.get(path) !== blob(bytes)) {
+        if (!crlf.has(path) || blobs.get(path) !== blob(Buffer.from(new TextDecoder('utf-8', { fatal: true }).decode(bytes).replace(/\r\n/g, '\n')))) throw new Error('DATASET_ASSET_CHANGED: ' + path)
+        converted.push(path)
+      }
+      assets[path] = sha256(bytes)
+      if (suffix === 'prompt.txt') spec = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+    }
+    let ports: DUTInterface | null = null, interface_error: string | null = null, clock: P10Task['clock'] = null
+    try {
+      ports = publicInterface(spec)
+      const clocks = ports.ports.filter(p => p.direction === 'input' && /^(clk|clock)$/i.test(p.name))
+      if (clocks.length > 1 || clocks.some(p => p.width !== 1)) throw new Error('PUBLIC_CLOCK_UNSUPPORTED')
+      clock = { kind: clocks.length ? 'physical' : 'virtual', port: clocks[0]?.name ?? null, period_ns: 5 }
+    } catch (error) { interface_error = error instanceof Error ? error.message : 'PUBLIC_INTERFACE_UNSUPPORTED' }
+    tasks.push({ task_id, spec, assets, interface: ports, interface_error, clock, git_crlf_checkout_files: converted })
+  }
+  return tasks
+}
+
+/** Select ten representatives, followed by thirty precommitted hash-ranked tasks. @param tasks - checked full catalog. @returns frozen order and selection explanations. */
+export function selectP10(tasks: P10Task[]) {
+  const ordered = [...tasks].sort((a, b) => a.task_id < b.task_id ? -1 : a.task_id > b.task_id ? 1 : 0)
+  const selected: { task: P10Task; category: string; selection_key: string }[] = []
+  for (const [category, pattern] of selectionRules) {
+    const task = ordered.find(t => !selected.some(s => s.task.task_id === t.task_id) && new RegExp(pattern, 'i').test(t.spec.replace(/\s+/g, ' ')))
+    if (!task) throw new Error('SELECTION_CATEGORY_UNAVAILABLE: ' + category)
+    selected.push({ task, category, selection_key: pattern })
+  }
+  const rest = ordered.filter(t => !selected.some(s => s.task.task_id === t.task_id))
+    .map(task => ({ task, category: 'hash_extension_unclassified', selection_key: sha256(selectionSeed + task.task_id) }))
+    .sort((a, b) => a.selection_key < b.selection_key ? -1 : a.selection_key > b.selection_key ? 1 : a.task.task_id < b.task.task_id ? -1 : 1)
+  if (rest.length < 30) throw new Error('SELECTION_TOO_SMALL')
+  return [...selected, ...rest.slice(0, 30)]
+}
+
+/** Produce a transparent reference delegate, not a hand-authored implementation. @param task - public interface. @returns one host-only wrapper; never accepted as model output. */
+export function referenceWrapper(task: P10Task): string {
+  if (!task.interface || task.interface_error || !task.clock) throw new Error(task.interface_error ?? 'PUBLIC_INTERFACE_UNSUPPORTED')
+  const ports = task.interface.ports
+  const source = `module TopModule(\n${ports.map(p => `  ${p.direction} wire ${p.width === 1 ? '' : `[${p.width - 1}:0] `}${p.name}`).join(',\n')}\n);\n  RefModule preflight_reference(${ports.map(p => `.${p.name}(${p.name})`).join(', ')});\nendmodule\n`
+  checkInterface(source, task.interface)
+  return source
+}
+
+/** Read unchanged evaluator bytes and construct task-specific host settings. @param directory - dataset root. @param task - frozen catalog entry. @returns assets and evaluator configuration. */
+export async function p10PreflightAssets(directory: string, task: P10Task): Promise<{ assets: Record<string, string>; evaluation: Evaluation }> {
+  const root = await realpath(directory), contents: Record<string, string> = {}
+  for (const [path, expected] of Object.entries(task.assets)) {
+    const bytes = await readFile(await checkedFile(root, path))
+    if (sha256(bytes) !== expected) throw new Error('DATASET_ASSET_CHANGED: ' + path)
+    contents[path] = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+  }
+  const wrapper = referenceWrapper(task)
+  const xdc = task.clock!.kind === 'physical' ? `create_clock -name p10_clock -period 5.000 [get_ports {${task.clock!.port}}]\n` : 'create_clock -name p10_virtual -period 5.000\n'
+  return { assets: { 'rtl/solution.sv': wrapper, 'trusted/ref.sv': contents[`dataset_spec-to-rtl/${task.task_id}_ref.sv`]!,
+    'trusted/tb.sv': contents[`dataset_spec-to-rtl/${task.task_id}_test.sv`]!, 'trusted/clock.xdc': xdc },
+  evaluation: { top: 'TopModule', tbTop: 'tb', language: 'systemverilog', sources: [
+    { path: 'rtl/solution.sv', role: 'dut' }, { path: 'trusted/ref.sv', role: 'reference' }, { path: 'trusted/tb.sv', role: 'testbench' },
+  ], evaluatorId: `p10-verilogeval-${task.task_id}-original-v1`, seed: 1, datasetRevision } }
+}

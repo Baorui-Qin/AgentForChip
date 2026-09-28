@@ -70,6 +70,9 @@ it('accepts a frozen campaign dispatch cap without changing the global maximum',
   await reserveDispatch(root, 'preflight', { i: 2 }, signal, 2)
   await expect(reserveDispatch(root, 'preflight', { i: 3 }, signal, 2)).rejects.toThrow('CAMPAIGN_BUDGET_EXHAUSTED')
   await expect(reserveDispatch(root, 'preflight', {}, signal, 376)).rejects.toThrow('INVALID_DISPATCH_BUDGET')
+  await expect(reserveDispatch(root, 'preflight', {}, signal, 376, 376)).resolves.toBeTruthy()
+  await expect(reserveDispatch(root, 'preflight', {}, signal, 20125, 20125)).rejects.toThrow('INVALID_DISPATCH_BUDGET')
+  await expect(reserveDispatch(root, 'preflight', {}, signal, 376, 375)).rejects.toThrow('INVALID_DISPATCH_BUDGET')
 })
 it('indexes terminal event bytes and hashes, excluding only its own manifest', async () => {
   const root = await temp()

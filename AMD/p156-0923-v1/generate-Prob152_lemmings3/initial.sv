@@ -1,0 +1,85 @@
+
+module TopModule (
+  input  logic clk,
+  input  logic areset,
+  input  logic bump_left,
+  input  logic bump_right,
+  input  logic ground,
+  input  logic dig,
+  output logic walk_left,
+  output logic walk_right,
+  output logic aaah,
+  output logic digging
+);
+
+  typedef enum logic [2:0] {
+    LEFT,
+    RIGHT,
+    FALL_L,
+    FALL_R,
+    DIG_L,
+    DIG_R
+  } state_t;
+
+  state_t state, next;
+
+  always_ff @(posedge clk or posedge areset) begin
+    if (areset) state <= LEFT;
+    else        state <= next;
+  end
+
+  always_comb begin
+    walk_left  = 1'b0;
+    walk_right = 1'b0;
+    aaah       = 1'b0;
+    digging    = 1'b0;
+    next       = LEFT;
+
+    case (state)
+      LEFT: begin
+        walk_left = 1'b1;
+        if (!ground)         next = FALL_L;
+        else if (dig)        next = DIG_L;
+        else if (bump_left)  next = RIGHT;
+        else if (bump_right) next = LEFT;
+        else                 next = LEFT;
+      end
+
+      RIGHT: begin
+        walk_right = 1'b1;
+        if (!ground)         next = FALL_R;
+        else if (dig)        next = DIG_R;
+        else if (bump_right) next = LEFT;
+        else if (bump_left)  next = RIGHT;
+        else                 next = RIGHT;
+      end
+
+      FALL_L: begin
+        aaah = 1'b1;
+        if (ground) next = LEFT;
+        else        next = FALL_L;
+      end
+
+      FALL_R: begin
+        aaah = 1'b1;
+        if (ground) next = RIGHT;
+        else        next = FALL_R;
+      end
+
+      DIG_L: begin
+        digging = 1'b1;
+        if (ground) next = DIG_L;
+        else        next = FALL_L;
+      end
+
+      DIG_R: begin
+        digging = 1'b1;
+        if (ground) next = DIG_R;
+        else        next = FALL_R;
+      end
+
+      default: next = LEFT;
+    endcase
+  end
+
+endmodule

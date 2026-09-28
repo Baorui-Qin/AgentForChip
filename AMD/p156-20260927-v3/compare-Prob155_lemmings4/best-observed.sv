@@ -1,0 +1,138 @@
+
+module TopModule (
+    input clk,
+    input areset,
+    input bump_left,
+    input bump_right,
+    input ground,
+    input dig,
+    output walk_left,
+    output walk_right,
+    output aaah,
+    output digging
+);
+
+    localparam LEFT   = 3'd0,
+               RIGHT  = 3'd1,
+               FALL_L = 3'd2,
+               FALL_R = 3'd3,
+               DIG_L  = 3'd4,
+               DIG_R  = 3'd5,
+               SPLAT  = 3'd6;
+
+    reg [2:0] state, next_state;
+    reg [4:0] cnt, next_cnt;
+
+    always @(*) begin
+        next_state = state;
+        next_cnt = cnt;
+
+        case (state)
+            LEFT: begin
+                if (!ground) begin
+                    next_state = FALL_L;
+                    next_cnt = 5'd1;
+                end else if (dig) begin
+                    next_state = DIG_L;
+                end else if (bump_left) begin
+                    next_state = RIGHT;
+                end else begin
+                    next_state = LEFT;
+                end
+            end
+
+            RIGHT: begin
+                if (!ground) begin
+                    next_state = FALL_R;
+                    next_cnt = 5'd1;
+                end else if (dig) begin
+                    next_state = DIG_R;
+                end else if (bump_right) begin
+                    next_state = LEFT;
+                end else begin
+                    next_state = RIGHT;
+                end
+            end
+
+            DIG_L: begin
+                if (!ground) begin
+                    next_state = FALL_L;
+                    next_cnt = 5'd1;
+                end else begin
+                    next_state = DIG_L;
+                end
+            end
+
+            DIG_R: begin
+                if (!ground) begin
+                    next_state = FALL_R;
+                    next_cnt = 5'd1;
+                end else begin
+                    next_state = DIG_R;
+                end
+            end
+
+            FALL_L: begin
+                if (ground) begin
+                    if (cnt > 5'd20) begin
+                        next_state = SPLAT;
+                        next_cnt = 5'd0;
+                    end else begin
+                        next_state = LEFT;
+                        next_cnt = 5'd0;
+                    end
+                end else begin
+                    next_state = FALL_L;
+                    if (cnt < 5'd21)
+                        next_cnt = cnt + 5'd1;
+                    else
+                        next_cnt = cnt;
+                end
+            end
+
+            FALL_R: begin
+                if (ground) begin
+                    if (cnt > 5'd20) begin
+                        next_state = SPLAT;
+                        next_cnt = 5'd0;
+                    end else begin
+                        next_state = RIGHT;
+                        next_cnt = 5'd0;
+                    end
+                end else begin
+                    next_state = FALL_R;
+                    if (cnt < 5'd21)
+                        next_cnt = cnt + 5'd1;
+                    else
+                        next_cnt = cnt;
+                end
+            end
+
+            SPLAT: begin
+                next_state = SPLAT;
+                next_cnt = 5'd0;
+            end
+
+            default: begin
+                next_state = LEFT;
+                next_cnt = 5'd0;
+            end
+        endcase
+    end
+
+    always @(posedge clk or posedge areset) begin
+        if (areset) begin
+            state <= LEFT;
+            cnt <= 5'd0;
+        end else begin
+            state <= next_state;
+            cnt <= next_cnt;
+        end
+    end
+
+    assign walk_left  = (state == LEFT);
+    assign walk_right = (state == RIGHT);
+    assign aaah       = (state == FALL_L) || (state == FALL_R);
+    assign digging    = (state == DIG_L)  || (state == DIG_R);
+
+endmodule

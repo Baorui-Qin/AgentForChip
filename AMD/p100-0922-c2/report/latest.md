@@ -1,0 +1,112 @@
+# P10 Transport and Tool Trace
+
+State: HOST_FAILURE
+
+Selected: 100; complete responses: 91; valid candidates: 90; infrastructure pending: 0; unstarted: 0.
+
+Acquisition: 90/100; E2E evaluated: 8/100.
+
+Baseline: 6/8; Agent: 6/8; natural repair opportunities: 0; repair success: N/A.
+
+| Task | Generation | Baseline | Agent | Tool calls | Agent XSim | Feedback consumed |
+|---|---|---|---|---:|---:|---:|
+| Prob005_notgate | GENERATED_UNVERIFIED | PASS | VERIFIED | 0 | 0 | 0 |
+| Prob035_count1to10 | GENERATED_UNVERIFIED | PASS | VERIFIED | 0 | 0 | 0 |
+| Prob045_edgedetect2 | GENERATED_UNVERIFIED | PASS | VERIFIED | 0 | 0 | 0 |
+| Prob074_ece241_2014_q4 | GENERATED_UNVERIFIED | PASS | VERIFIED | 0 | 0 | 0 |
+| Prob015_vector1 | GENERATED_UNVERIFIED | PASS | VERIFIED | 0 | 0 | 0 |
+| Prob033_ece241_2014_q1c | GENERATED_UNVERIFIED | PASS | VERIFIED | 0 | 0 | 0 |
+| Prob004_vector2 | GENERATED_UNVERIFIED | ABORTED | POLICY_BLOCKED | 0 | 0 | 0 |
+| Prob020_mt2015_eq2 | GENERATED_UNVERIFIED | ABORTED | POLICY_BLOCKED | 0 | 0 | 0 |
+| Prob018_mux256to1 | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob061_2014_q4a | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob094_gatesv | TRANSPORT | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob149_ece241_2013_q4 | OUTPUT_TRUNCATED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob086_lfsr5 | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob104_mt2015_muxdff | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob140_fsm_hdlc | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob151_review2015_fsm | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob011_norgate | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob023_vector100r | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob043_vector5 | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob127_lemmings1 | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob113_2012_q1g | OUTPUT_TRUNCATED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob138_2012_q2fsm | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob130_circuit5 | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob066_edgecapture | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob135_m2014_q6b | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob064_vector3 | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob085_shift4 | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob121_2014_q3bfsm | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob155_lemmings4 | OUTPUT_TRUNCATED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob029_m2014_q4g | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob040_count10 | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob042_vector4 | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob079_fsm3onehot | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob078_dualedge | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob081_7458 | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob117_circuit9 | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob137_fsm_serial | OUTPUT_TRUNCATED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob067_countslow | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob046_dff8p | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob026_alwaysblock1 | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob058_alwaysblock2 | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob027_fadd | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob142_lemmings2 | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob073_dff16e | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob068_countbcd | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob037_review2015_count1k | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob056_ece241_2013_q7 | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob122_kmap4 | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob051_gates4 | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob039_always_if | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob131_mt2015_q4 | INVALID_OUTPUT | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob091_2012_q2b | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob071_always_casez | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob144_conwaylife | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob145_circuit8 | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob077_wire_decl | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob088_ece241_2014_q5b | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob044_vectorgates | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob008_m2014_q4h | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob084_ece241_2013_q12 | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob007_wire | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob098_circuit7 | OUTPUT_TRUNCATED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob125_kmap3 | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob036_ringer | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob076_always_case | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob101_circuit4 | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob047_dff8ar | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob070_ece241_2013_q2 | OUTPUT_TRUNCATED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob065_7420 | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob124_rule110 | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob100_fsm3comb | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob154_fsm_ps2data | OUTPUT_TRUNCATED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob075_counter_2bc | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob059_wire4 | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob063_review2015_shiftcount | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob083_mt2015_q4b | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob034_dff8 | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob022_mux2to1 | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob114_bugs_case | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob041_dff8r | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob136_m2014_q6 | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob139_2013_q2bfsm | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob109_fsm1 | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob134_2014_q3c | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob143_fsm_onehot | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob054_edgedetect | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob105_rotate100 | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob096_review2015_fsmseq | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob060_m2014_q4k | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob014_andgate | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob017_mux2to1v | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob021_mux256to1v | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob030_popcount255 | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob090_circuit1 | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob146_fsm_serialdata | OUTPUT_TRUNCATED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob148_2013_q2afsm | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob152_lemmings3 | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob025_reduction | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob102_circuit3 | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |
+| Prob057_kmap2 | GENERATED_UNVERIFIED | NOT_RUN | NOT_RUN | 0 | 0 | 0 |

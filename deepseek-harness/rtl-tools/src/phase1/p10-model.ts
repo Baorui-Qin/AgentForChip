@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto'
 import { setTimeout as sleep } from 'node:timers/promises'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import { createToolResultMessage, type Message } from '@deepseek-ai/dsh-llm'
+import { createToolResultMessage, ReasoningEffortId, type Message } from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-cmdline'
 import type {} from '@deepseek-ai/dsh-subprocess'
 import type {} from '@deepseek-ai/dsh-sandbox-policy'
@@ -20,7 +20,7 @@ import { textWire } from './p09-tokenizer.ts'
 import { callAction, checkCounterRuntime, countActionWire, type AutoSettings } from './p09-action-call.ts'
 import { loadP09Skills, readP09Settings, retrieveP09Skills } from './p09-proposal.ts'
 import { reserveDispatch } from './p09-claims.ts'
-import { autoTools, checkAutoSource, parseAutoAction } from './p09-auto-policy.ts'
+import { autoTools, checkAutoSource, parseAutoAction, RtlDirectiveError } from './p09-auto-policy.ts'
 import { readDiagnostics } from './repair-diagnostics.ts'
 import { decideRepair } from './repair-policy.ts'
 import { retryableTransport } from './repair-loop.ts'
@@ -29,20 +29,26 @@ import { VerificationRunner, type VerificationLimits } from './verification.ts'
 import type { PhaseId } from './contracts.ts'
 import { appendToolTrace, verificationEvidence } from './p10-trace.ts'
 import { compareRevision, revisionScore } from './p10-revision.ts'
+import { acceptNetlist, acceptanceProtocol } from './p10-netlist.ts'
+import { assertAcceptance } from '../../phase1/p10/acceptance-audit.mjs'
 
 export const name = 'rtl-p10-model'
 export const inject = ['cmdlineArgs', 'appReady', 'llm', 'subprocess', 'sandboxPolicy']
 export const Config = z.object({ campaignRoot: z.string().required(), preflightRoot: z.string().required(), datasetRoot: z.string().required(),
   settingsFile: z.string().required(), p09File: z.string().required(), autoFile: z.string().required(), freezeFile: z.string().required(),
   allowUnisolatedAutomatic: z.boolean().default(false), model: z.string().required(), maxTokens: z.natural().required(), temperature: z.number().required(),
-  timeoutMs: z.natural().min(1).required(), activeMs: z.natural().min(1).max(1200000).required(), maxResponseBytes: z.natural().required(),
+  timeoutMs: z.natural().min(1).required(), activeMs: z.natural().min(1).max(43200000).required(), maxResponseBytes: z.natural().required(),
   maxTransportRetries: z.natural().max(2).default(2), transportBackoffMs: z.array(z.natural().max(60000)).default([1000, 2000]),
   maxOutputRecoveryAttempts: z.natural().max(1).default(1),
+  maxCandidateRecoveryAttempts: z.natural().max(2).default(2), generationRecoveryMaxTokens: z.natural().min(1).default(16384),
+  generationRecoveryMaxResponseBytes: z.natural().min(1).default(262144),
   repairMaxTokens: z.natural().min(1).default(16384), forcedActionMaxTokens: z.natural().min(1).default(4096),
   repairMaxResponseBytes: z.natural().min(1).default(262144), compactThreshold: z.number().min(0.1).max(1).default(0.8),
-  maxRepairRounds: z.natural().min(1).max(3).default(3),
+  maxRepairRounds: z.natural().min(1).max(15).default(15), maxAgentRequests: z.natural().min(1).max(120).default(120),
+  campaignMaxDispatches: z.natural().min(1).max(20124).default(375),
   maxGenerationResumes: z.natural().max(2).default(1),
-  selectedTaskCount: z.natural().min(1).max(40).default(10),
+  selectedTaskCount: z.natural().min(1).max(156).default(10),
+  netlistMs: z.natural().min(1).max(900000).default(120000),
   compileMs: z.natural().min(1).required(), elaborateMs: z.natural().min(1).required(), simulationMs: z.natural().min(1).required(),
   totalMs: z.natural().min(1).required(), maxArtifactBytes: z.natural().min(1).required(), artifactPollMs: z.natural().min(1).required(), maxEventBytes: z.natural().min(1).required() })
 
@@ -84,9 +90,13 @@ async function run(ctx: Context, config: ReturnType<typeof Config>, command: str
   const calibrations = JSON.parse(await readFile(join(preflight, 'compat-positive-negative-results.json'), 'utf8')) as { task_id: string; evaluable: boolean }[]
   const task = catalog.find(t => t.task_id === taskId)
   if (!task?.interface || !(command === 'repair-control' ? taskId === 'Prob038_count15' || order.slice(0, config.selectedTaskCount).includes(taskId) : order.slice(0, config.selectedTaskCount).includes(taskId))) throw new Error('TASK_NOT_FROZEN')
-  if (!calibrations.find(r => r.task_id === taskId)?.evaluable) throw new Error('EVALUATOR_NOT_CALIBRATED')
+  const calibrated = calibrations.find(r => r.task_id === taskId)?.evaluable === true
+  if (!calibrated && command !== 'generate') throw new Error('EVALUATOR_NOT_CALIBRATED')
   const policy = JSON.parse(await readFile(join(preflight, 'evaluator-policy.json'), 'utf8'))
-  const p09 = await readP09Settings(config.p09File), auto = JSON.parse(await readFile(config.autoFile, 'utf8')) as AutoSettings
+  const p09 = await readP09Settings(config.p09File)
+  const auto: AutoSettings = { ...JSON.parse(await readFile(config.autoFile, 'utf8')), campaignDispatchLimit: config.campaignMaxDispatches }
+  if (!Number.isSafeInteger(auto.maxToolSteps) || auto.maxToolSteps < 2 * config.maxRepairRounds || auto.maxToolSteps > 60 ||
+    config.maxAgentRequests < 2 * config.maxRepairRounds) throw new Error('P10_REPAIR_BUDGET_CONFIGURATION_INVALID')
   if (auto.campaignRoot !== root.replace(/\\/g, '/') && auto.campaignRoot !== root) throw new Error('CAMPAIGN_ROOT_MISMATCH')
   const counterRuntime = await checkCounterRuntime(auto)
   await loadP09Skills(p09)
@@ -112,7 +122,8 @@ async function run(ctx: Context, config: ReturnType<typeof Config>, command: str
     }
   }
   const model: ModelSettings = { model: config.model, maxTokens: config.maxTokens, temperature: config.temperature, timeoutMs: config.timeoutMs, maxResponseBytes: config.maxResponseBytes }
-  const publicTask = { id: taskId, spec: task.spec, interface: task.interface, constraints: 'SystemVerilog, single self-contained TopModule DUT; xczu3eg-sbva484-1-e; 5 ns synthesis clock; simulator seed 1. No reference dependencies, hierarchy outside the DUT, file access, includes or DPI.' }
+  const publicTask = { id: taskId, spec: task.spec, interface: task.interface, constraints: 'SystemVerilog, exactly one self-contained TopModule DUT. Inline all helper logic inside TopModule; do not define auxiliary modules. xczu3eg-sbva484-1-e; 5 ns synthesis clock; simulator seed 1. No reference dependencies, hierarchy outside the DUT, file access, includes or DPI.' }
+  if (task.public_interface_erratum) publicTask.constraints += `\nPublic interface erratum (${task.public_interface_erratum.id}): ${task.public_interface_erratum.explanation}`
   const active = new AbortController(), timer = setTimeout(() => active.abort(), config.activeMs)
   const signal = AbortSignal.any([caller, active.signal])
   let runner: VerificationRunner | undefined
@@ -120,6 +131,7 @@ async function run(ctx: Context, config: ReturnType<typeof Config>, command: str
   const transportRetryRecords: Record<string, unknown>[] = previous?.transport_retry_records ?? [], outputRecoveryRecords: Record<string, unknown>[] = previous?.output_recovery_records ?? []
   const generationAttempts: Record<string, unknown>[] = previous?.generation_attempts ?? []
   const repairDecisions: Record<string, unknown>[] = [], repairAttempts: RepairAttemptAudit[] = []
+  const acceptances: (Awaited<ReturnType<typeof acceptNetlist>> & { run: string })[] = []
   let dispatches = previous?.physical_dispatches ?? 0, logicalAgentRequests = 0, transportRetries = previous?.transport_retries ?? 0, outputRecoveryAttempts = 0, boundFeedbackDispatches = 0
   let promptTokens = previous?.prompt_tokens ?? 0, completionTokens = previous?.completion_tokens ?? 0, unknownUsageRequests = previous?.unknown_usage_requests ?? 0, modelWallMs = previous?.model_wall_ms ?? 0
   const accountModel = (value: { prompt_tokens: number | null; completion_tokens: number | null; request_wall_ms: number }) => {
@@ -128,9 +140,12 @@ async function run(ctx: Context, config: ReturnType<typeof Config>, command: str
     else { promptTokens += value.prompt_tokens; completionTokens += value.completion_tokens }
   }
   let result: Record<string, unknown> = { task_id: taskId, command, experiment_id: experiment, status: 'INCONCLUSIVE', full_os_isolation_verified: false,
+    acceptance_protocol: acceptanceProtocol, acceptance_results: acceptances,
     shared_initial: command === 'compare', counted_in_model_score: command === 'compare', model_runs: requests, actions, revisions, verification_runs: runs,
     transport_retry_records: transportRetryRecords, output_recovery_records: outputRecoveryRecords, repair_decisions: repairDecisions, repair_attempts: repairAttempts,
-    generation_attempts: generationAttempts, generation_resumes: previous ? previous.generation_resumes + 1 : 0, freeze_sha256: sha256(freezeBytes) }
+    generation_attempts: generationAttempts, generation_resumes: previous ? previous.generation_resumes + 1 : 0, freeze_sha256: sha256(freezeBytes),
+    evaluator_calibrated: calibrated, budget_limits: { rtl_modifications: config.maxRepairRounds, agent_requests: config.maxAgentRequests,
+      tool_actions: auto.maxToolSteps, candidate_recoveries: config.maxCandidateRecoveryAttempts, campaign_dispatches: config.campaignMaxDispatches } }
   try {
     if (command === 'probe') {
       const recorder = await EventRecorder.create(join(target, 'models'), { experiment_id: experiment, task_id: taskId as PhaseId, sample_id: 0, mode: 'baseline' }, config.maxEventBytes, '1.3')
@@ -140,7 +155,7 @@ async function run(ctx: Context, config: ReturnType<typeof Config>, command: str
         const runtime = { prepareCall: async (...args: Parameters<typeof ctx.llm.prepareCall>) => {
             const prepared = await ctx.llm.prepareCall(...args)
             if (prepared.retryPolicy.mode !== 'normal' || prepared.retryPolicy.maxRetries !== 0) throw new Error('LOWER_LEVEL_RETRY_ENABLED')
-            await reserveDispatch(root, auto.bucket, { experiment, purpose: 'provider_health_probe' }, signal, auto.maxDispatches)
+            await reserveDispatch(root, auto.bucket, { experiment, purpose: 'provider_health_probe' }, signal, auto.maxDispatches, auto.campaignDispatchLimit)
             return prepared
           } }
         const response = await callText(runtime, model, 'Reply with OK only. This is a provider health check, not an RTL task.', recorder,
@@ -162,20 +177,33 @@ async function run(ctx: Context, config: ReturnType<typeof Config>, command: str
         transportRetries++
         transportRetryRecords.push({ phase: 'initial_generation', request_sha256: expectedRequestHash, recovery: 'explicit_same_task_resume', previous_window: previous.generation_resumes })
       }
-      let recoveryParent: { request_sha256: string; model_run: string } | null = null
+      const recoveryState: { parent: { request_sha256: string; model_run: string } | null } = { parent: null }
       while (true) {
+        const recovering = input.generation_recovery !== undefined
+        const requestModel = recovering ? { ...model, maxTokens: config.generationRecoveryMaxTokens,
+          maxResponseBytes: config.generationRecoveryMaxResponseBytes, reasoningEffort: ReasoningEffortId('off') } : model
         const recorder = await EventRecorder.create(join(target, 'models'), { experiment_id: experiment, task_id: taskId as PhaseId, sample_id: requests.length, mode: 'baseline' }, config.maxEventBytes, '1.3')
         requests.push(recorder.directory)
         let observation: ModelObservation | null = null, requestHash: string | null = null
+        const recoverCandidate = async (response: Awaited<ReturnType<typeof callText>>, rejection: { stage: string; code: string; detail: string | null }): Promise<boolean> => {
+          if (signal.aborted || !requestHash || outputRecoveryAttempts >= config.maxCandidateRecoveryAttempts) return false
+          outputRecoveryAttempts++; recoveryState.parent = { request_sha256: requestHash, model_run: recorder.directory }
+          input = { ...input, purpose: 'format_recovery', format_response: response.content, source_log_truncated: !(!response.error && !response.truncated),
+            generation_recovery: { attempt: outputRecoveryAttempts, limit: config.maxCandidateRecoveryAttempts, ...rejection,
+              previous_reasoning: await readFile(join(recorder.directory, 'reasoning.txt'), 'utf8') } }
+          expectedRequestHash = null; retriesForRequest = 0
+          return true
+        }
         try {
-          const response = await callText(ctx.llm, model, '', recorder, { call_id: randomUUID() as PhaseId, revision_id: null }, signal, value => { observation = value }, async (prepared, callSignal) => {
+          const response = await callText(ctx.llm, requestModel, '', recorder, { call_id: randomUUID() as PhaseId, revision_id: null }, signal, value => { observation = value }, async (prepared, callSignal) => {
             if (prepared.retryPolicy.mode !== 'normal' || prepared.retryPolicy.maxRetries !== 0) throw new Error('LOWER_LEVEL_RETRY_ENABLED')
-            if (!prepared.context?.contextWindow || prepared.config.maxTokens !== p09.limits.output) throw new Error('CONTEXT_CONFIGURATION_ERROR')
+            if (!prepared.context?.contextWindow || prepared.config.maxTokens !== requestModel.maxTokens) throw new Error('CONTEXT_CONFIGURATION_ERROR')
             const resolved = JSON.stringify({ config: prepared.config, defaults: prepared.adapterDefaults, context: prepared.context })
-            try { await publish(target, 'resolved-model.json', resolved) }
-            catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST' || await readFile(join(target, 'resolved-model.json'), 'utf8') !== resolved) throw new Error('CONFIG_CHANGED') }
+            const resolvedName = recovering ? 'resolved-generation-recovery-model.json' : 'resolved-model.json'
+            try { await publish(target, resolvedName, resolved) }
+            catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST' || await readFile(join(target, resolvedName), 'utf8') !== resolved) throw new Error('CONFIG_CHANGED') }
             let seq = 0
-            const built = await buildContext(input, { ...p09.limits, window: Math.min(p09.limits.window, prepared.context.contextWindow) }, {
+            const built = await buildContext(input, { ...p09.limits, output: requestModel.maxTokens, window: Math.min(p09.limits.window, prepared.context.contextWindow) }, {
               quality: 'exact_local', identity: { implementation: 'official-rust-deepseek-recipe', revision: counterRuntime.revision, manifest_sha256: auto.runtimeManifestSha256, cloud_equivalence: 'unconfirmed' },
               count: (view, countSignal) => countActionWire(counterRuntime, auto, ctx.subprocess, join(recorder.directory, 'token-' + ++seq), textWire(prepared, view), countSignal),
             }, callSignal)
@@ -185,8 +213,8 @@ async function run(ctx: Context, config: ReturnType<typeof Config>, command: str
             await publish(recorder.directory, 'context.json', JSON.stringify(input, null, 2))
             await publish(recorder.directory, 'context-audit.json', JSON.stringify(built.audit, null, 2))
             await publish(recorder.directory, 'prompt-final.json', JSON.stringify(wire, null, 2))
-            const ticket = await reserveDispatch(root, auto.bucket, { experiment, purpose: input.purpose === 'format_recovery' ? 'shared_initial_output_recovery' : 'shared_initial', request_sha256: requestHash }, callSignal, auto.maxDispatches)
-            await publish(recorder.directory, 'dispatch.json', JSON.stringify({ ticket, request_sha256: requestHash, parent_request_sha256: recoveryParent?.request_sha256 ?? null }))
+            const ticket = await reserveDispatch(root, auto.bucket, { experiment, purpose: input.purpose === 'format_recovery' ? 'shared_initial_output_recovery' : 'shared_initial', request_sha256: requestHash }, callSignal, auto.maxDispatches, auto.campaignDispatchLimit)
+            await publish(recorder.directory, 'dispatch.json', JSON.stringify({ ticket, request_sha256: requestHash, parent_request_sha256: recoveryState.parent?.request_sha256 ?? null }))
             return built
           })
           dispatches += response.dispatched ? 1 : 0
@@ -194,24 +222,25 @@ async function run(ctx: Context, config: ReturnType<typeof Config>, command: str
           await publish(recorder.directory, 'model.json', JSON.stringify(response, null, 2))
           await publish(recorder.directory, 'response.txt', response.content)
           await publish(recorder.directory, 'transport.json', JSON.stringify(observation, null, 2))
-          const attempt: Record<string, unknown> = { model_run: recorder.directory, request_sha256: requestHash, observation,
+          const attempt: Record<string, unknown> = { model_run: recorder.directory, request_sha256: requestHash, observation, recovery: input.generation_recovery ?? null,
             response_complete: !response.error && !response.truncated, candidate_extracted: false, candidate_valid: false }
           generationAttempts.push(attempt)
-          if (recoveryParent && requestHash && !outputRecoveryRecords.some(item => item.parent_request_sha256 === recoveryParent!.request_sha256)) outputRecoveryRecords.push({
+          const recoveryParent = recoveryState.parent
+          if (recoveryParent && requestHash && !outputRecoveryRecords.some(item => item.parent_request_sha256 === recoveryParent.request_sha256)) outputRecoveryRecords.push({
             phase: 'initial_generation', parent_model_run: recoveryParent.model_run, parent_request_sha256: recoveryParent.request_sha256,
             recovery_model_run: recorder.directory, recovery_request_sha256: requestHash })
           if (response.error) {
+            attempt.candidate_rejection = { stage: 'response', code: response.truncated ? 'OUTPUT_TRUNCATED' : response.error.category }
             if (retryableTransport(response, observation) && retriesForRequest < config.maxTransportRetries) {
               const backoffMs = config.transportBackoffMs[retriesForRequest]!
               transportRetries++; retriesForRequest++; expectedRequestHash = requestHash
               transportRetryRecords.push({ phase: 'initial_generation', failed_model_run: recorder.directory, request_sha256: requestHash, retry_number: retriesForRequest, backoff_ms: backoffMs, observation })
               await sleep(backoffMs, undefined, { signal }); continue
             }
-            if (response.truncated && outputRecoveryAttempts < config.maxOutputRecoveryAttempts && requestHash) {
-              outputRecoveryAttempts++; recoveryParent = { request_sha256: requestHash, model_run: recorder.directory }
-              input = { ...input, purpose: 'format_recovery', format_response: response.content, source_log_truncated: true }
-              expectedRequestHash = null; retriesForRequest = 0; continue
-            }
+            const partial = (observation as ModelObservation | null)?.model_output_observed === true
+            if ((response.truncated || response.error.category === 'empty_output' ||
+              partial && ['connection', 'timeout', 'parse'].includes(response.error.category)) &&
+              await recoverCandidate(response, { stage: 'response', code: response.truncated ? 'OUTPUT_TRUNCATED' : response.error.category, detail: null })) continue
             result.status = response.truncated ? 'OUTPUT_TRUNCATED' : response.error.category === 'timeout' ? 'TIMEOUT' : response.error.category === 'connection' || response.error.category === 'service' ? 'TRANSPORT' : 'MODEL_RESPONSE_ERROR'
             if (retryableTransport(response, observation) && !outputRecoveryAttempts && !signal.aborted && requestHash) {
               result.status = 'INFRA_PAUSED'; result.resume_request_sha256 = requestHash
@@ -219,13 +248,24 @@ async function run(ctx: Context, config: ReturnType<typeof Config>, command: str
             result.transport_observation = observation
             result.error = response.error; return
           }
-          const extracted = extractSource(response.content, response.truncated, config.maxResponseBytes, task.interface)
-          attempt.candidate_extracted = true
-          checkAutoSource(extracted.source, task.interface)
+          let extracted: ReturnType<typeof extractSource>
+          try {
+            extracted = extractSource(response.content, response.truncated, requestModel.maxResponseBytes, task.interface)
+            attempt.candidate_extracted = true
+            attempt.source_sha256 = extracted.source_sha256
+            checkAutoSource(extracted.source, task.interface)
+          } catch (error) {
+            const rejection = { stage: attempt.candidate_extracted ? 'rtl_policy' : 'extraction_or_interface',
+              code: error instanceof OutputError ? error.category : error instanceof Error && /^[A-Z_]+$/.test(error.message) ? error.message : 'HOST_FAILURE',
+              detail: error instanceof RtlDirectiveError ? `line=${error.line}; directive=${error.directive}` : error instanceof OutputError ? error.message : null }
+            attempt.candidate_rejection = rejection; result.candidate_rejection = rejection
+            if (rejection.code !== 'HOST_FAILURE' && await recoverCandidate(response, rejection)) continue
+            throw error
+          }
           await publish(target, 'initial.sv', extracted.source)
           attempt.candidate_valid = true
           result = { ...result, status: 'GENERATED_UNVERIFIED', source_sha256: extracted.source_sha256, logical_initial_requests: 1,
-            initial_provider_dispatches: dispatches, model_requests: requests.length, feedback_exposed: false, tools_exposed: false, skills_exposed: false }
+            initial_provider_dispatches: dispatches, model_requests: requests.length, candidate_rejection: null, feedback_exposed: false, tools_exposed: false, skills_exposed: false }
           return
         } finally { await recorder.close() }
       }
@@ -244,6 +284,7 @@ async function run(ctx: Context, config: ReturnType<typeof Config>, command: str
       result.initial_generation_charged_again = false
     } else { source = negativeControl(task); result.control_seed = 'reviewed_negative_copy_not_baseline'; result.shared_initial = false }
     let revision = randomUUID(), pending = false, repairs = 0, history: Message[] = [], ledger: RepairLedgerEntry[] = []
+    let previousToolResult: ContextInput['previous_tool_result']
     let facts: Awaited<ReturnType<typeof readDiagnostics>> | null = null
     async function saveRevision() {
       const directory = join(target, 'revisions', revision); await mkdir(directory)
@@ -258,6 +299,11 @@ async function run(ctx: Context, config: ReturnType<typeof Config>, command: str
       const outcome = await runner!.verify(snapshot, signal, argv => argv); runs.push(outcome.artifacts)
       facts = await readDiagnostics(outcome.artifacts, 'live_verification')
       if (facts.record.final_source_sha256 !== sha256(source)) throw new Error('VERIFICATION_BINDING_INVALID')
+      if (facts.record.final_verified) {
+        const acceptance = await acceptNetlist(ctx.subprocess, eda, config, task!, outcome.artifacts, join(target, `acceptance-${runs.length}`), signal)
+        acceptances.push({ ...acceptance, run: outcome.artifacts })
+        await appendToolTrace(target, { event: 'netlist_acceptance', revision_id: revision, source_sha256: sha256(source), ...acceptances.at(-1) })
+      }
       pending = false
       await publish(target, `feedback-${runs.length}.json`, JSON.stringify(facts.receipt, null, 2))
       await appendToolTrace(target, { event: 'verification', verification_trigger: trigger, revision_id: revision, source_sha256: sha256(source), ...verificationEvidence(facts) })
@@ -269,18 +315,22 @@ async function run(ctx: Context, config: ReturnType<typeof Config>, command: str
     let currentRun = runs.at(-1)!
     let best = { revision, source, observed, run: currentRun, score: revisionScore(observed.receipt, observed.record.final_verified) }
     const rejectedRevisions: NonNullable<ContextInput['repair_control']>['rejected'] = []
+    const rejectedSources = new Set<string>()
     const revisionDecisions: Record<string, unknown>[] = []
     result.revision_decisions = revisionDecisions
     result.context_compactions = 0
     const repairModel = { ...model, maxTokens: config.repairMaxTokens, maxResponseBytes: config.repairMaxResponseBytes }
-    result.initial_status = observed.record.final_status; result.baseline_run = command === 'compare' ? runs[0] : null
-    const baselineFailed = !observed.record.final_verified
+    const acceptedStatus = (run: string, facts: Awaited<ReturnType<typeof readDiagnostics>>) => facts.record.final_verified
+      ? acceptances.find(value => value.run === run)?.status ?? 'NETLIST_EVIDENCE_MISSING' : facts.record.final_status
+    result.initial_status = acceptedStatus(currentRun, observed); result.baseline_run = command === 'compare' ? runs[0] : null
+    const baselineFailed = result.initial_status !== 'PASS'
     let repairEligible = false, repairRequested = false
     if (command === 'repair-control' && !observed.receipt.stages.some(s => s.functional_failure)) throw new Error('NEGATIVE_CONTROL_NOT_OBSERVED')
     let status = 'MODEL_REQUEST_BUDGET_EXHAUSTED'
-    const agentRequestLimit = p09.maxRequests - (command === 'compare' ? 1 : 0)
+    const agentRequestLimit = config.maxAgentRequests
     while (requests.length < agentRequestLimit && actions.length < auto.maxToolSteps) {
       if (!pending) {
+        if (observed.record.final_verified && acceptedStatus(currentRun, observed) !== 'PASS') { status = acceptedStatus(currentRun, observed); break }
         const decision = decideRepair(observed.receipt, { calibrated: true, bound: true, attempts: repairs, maxAttempts: config.maxRepairRounds, top: 'TopModule' })
         repairDecisions.push({ ...decision, revision_id: revision, source_sha256: sha256(source), verification_key: observed.record.verification_key })
         if (decision.rule === 'VERIFIED' && observed.record.final_verified) { status = 'VERIFIED'; break }
@@ -294,6 +344,7 @@ async function run(ctx: Context, config: ReturnType<typeof Config>, command: str
         current: { revision_id: revision, source_sha256: sha256(source), source },
         binding: pending ? null : { revision_id: revision, source_sha256: sha256(source), verification_key: observed.record.verification_key! },
         feedback: pending ? null : observed.receipt, ledger, purpose: 'repair', tool_mode: true, pending_verification: pending,
+        ...(previousToolResult ? { previous_tool_result: previousToolResult } : {}),
         repair_control: { mode: 'normal', compacted: false, best_revision_id: best.revision, best_source_sha256: sha256(best.source), rejected: rejectedRevisions } }
       await assertFreeze()
       logicalAgentRequests++
@@ -302,7 +353,7 @@ async function run(ctx: Context, config: ReturnType<typeof Config>, command: str
       let retriesForRequest = 0, recoveriesForRequest = 0, contextRecoveries = 0
       let recoveryParent: { request_sha256: string; model_run: string } | null = null
       while (true) {
-        if (requests.length >= agentRequestLimit) { status = 'MODEL_REQUEST_BUDGET_EXHAUSTED'; break }
+        if (requests.length >= agentRequestLimit) { status = 'MODEL_REQUEST_BUDGET_EXHAUSTED'; response = undefined; break }
         const requestModel = requestInput.repair_control?.mode === 'forced_action' ? { ...repairModel, maxTokens: config.forcedActionMaxTokens } : repairModel
         response = await callAction({ root: target, experiment, sequence: requests.length + 1, input: requestInput, history: requestHistory, auto,
           p09: { ...p09, limits: { ...p09.limits, output: requestModel.maxTokens } }, model: requestModel, compactThreshold: config.compactThreshold,
@@ -371,8 +422,8 @@ async function run(ctx: Context, config: ReturnType<typeof Config>, command: str
         if (action.name === 'edit_dut') {
           if (pending || action.expected_revision_id !== revision || repairs >= config.maxRepairRounds) throw new Error('REVISION_OR_BUDGET_REJECTED')
           checkAutoSource(action.source, task.interface)
-          if (action.source === source) throw new Error('REPEATED_CANDIDATE')
-          if (rejectedRevisions.some(item => item.source_sha256 === sha256(action.source))) throw new Error('REJECTED_REVISION')
+          if (action.source.trim() === source.trim()) throw new Error('REPEATED_CANDIDATE')
+          if (rejectedSources.has(action.source.trim())) throw new Error('REJECTED_REVISION')
           const previousSourceSha256 = sha256(source)
           if (!ledger.some(entry => entry.revision_id === revision)) ledger = [...ledger, ledgerEntry(input)]
           source = action.source; revision = randomUUID(); repairs++; pending = true; await saveRevision()
@@ -399,21 +450,28 @@ async function run(ctx: Context, config: ReturnType<typeof Config>, command: str
           ]
           attempt.valid = attempt.missing_steps.length === 0
           observation = { revision_id: revision, status: observed.record.final_status, stages: observed.receipt.stages.map(s => ({ stage: s.stage, status: s.status, verdict: s.verdict })) }
-          const score = revisionScore(observed.receipt, observed.record.final_verified), decision = compareRevision(best.score, score)
+          if (observed.record.final_verified && acceptedStatus(currentRun, observed) !== 'PASS') {
+            status = acceptedStatus(currentRun, observed); finished = true; observation.status = status
+          }
+          const score = finished ? null : revisionScore(observed.receipt, observed.record.final_verified)
+          const decision = finished ? 'NETLIST_REJECTED' : compareRevision(best.score, score)
           const candidate = { revision_id: revision, source_sha256: sha256(source), score, verification_run: currentRun }
           ledger.push(ledgerEntry({ ...input, current: { revision_id: revision, source_sha256: sha256(source), source },
             binding: { revision_id: revision, source_sha256: sha256(source), verification_key: observed.record.verification_key! }, feedback: observed.receipt }))
           if (decision === 'IMPROVED') best = { revision, source, observed, run: currentRun, score }
-          else {
-            if (decision !== 'INCOMPARABLE') rejectedRevisions.push({ revision_id: revision, source_sha256: sha256(source), reason: decision,
-              checks: score?.checks ?? null, mismatches: score?.mismatches ?? null })
+          else if (!finished) {
+            if (decision !== 'INCOMPARABLE') {
+              rejectedSources.add(source.trim())
+              rejectedRevisions.push({ revision_id: revision, source_sha256: sha256(source), reason: decision,
+                checks: score?.checks ?? null, mismatches: score?.mismatches ?? null })
+            }
             // Keep the failed attempt and receipt immutable; restore the incumbent's complete binding.
             revision = best.revision; source = best.source; observed = best.observed; currentRun = best.run
             observation.restored_revision = { revision_id: revision, source_sha256: sha256(source), verification_run: currentRun, score: best.score }
             if (decision === 'INCOMPARABLE') { status = 'INCOMPARABLE_VERIFICATION'; finished = true }
           }
           const revisionDecision = { decision, candidate, best_revision_id: best.revision, best_source_sha256: sha256(best.source), best_score: best.score,
-            rolled_back: decision !== 'IMPROVED' }
+            rolled_back: decision !== 'IMPROVED' && decision !== 'NETLIST_REJECTED' }
           revisionDecisions.push(revisionDecision); observation.revision_decision = revisionDecision
           await appendToolTrace(target, { event: 'revision_decision', ...revisionDecision })
         } else if (action.name === 'read_current_rtl') observation = { ...input.current, pending_verification: pending }
@@ -421,7 +479,8 @@ async function run(ctx: Context, config: ReturnType<typeof Config>, command: str
         else { status = 'FINISHED_UNVERIFIED'; finished = true; observation = { status } }
       } catch (error) {
         if (call.name === 'verify_rtl' && (error as Error).message !== 'VERIFICATION_REQUEST_REJECTED') hostFailure = error
-        rejected = true; observation = { error: error instanceof Error && /^[A-Z_]+$/.test(error.message) ? error.message : 'INVALID_ACTION' }
+        rejected = true; observation = { error: error instanceof OutputError ? error.category : error instanceof Error && /^[A-Z_]+$/.test(error.message) ? error.message : 'INVALID_ACTION',
+          ...(error instanceof RtlDirectiveError ? { line: error.line, directive: error.directive } : error instanceof OutputError ? { detail: error.message } : {}) }
       }
       actions.push({ tool_call_id: call.id, tool: call.name, accepted: !rejected, observation, model_run: requests.at(-1), revision })
       await publish(target, `action-${actions.length}.json`, JSON.stringify(actions.at(-1), null, 2))
@@ -433,9 +492,13 @@ async function run(ctx: Context, config: ReturnType<typeof Config>, command: str
         tool_result: observation, verification: toolVerification })
       if (hostFailure) throw hostFailure
       if (finished) break
-      history = [response.message, createToolResultMessage({ callId: call.id, content: [{ type: 'text', text: JSON.stringify(observation) }], isError: rejected })]
-      if (!pending && observed.record.final_verified) { status = 'VERIFIED'; break }
+      // Thinking-disabled assistant messages cannot be replayed as a thinking-mode tool turn.
+      previousToolResult = { tool: call.name, accepted: !rejected, observation }
+      history = requestInput.repair_control?.mode === 'forced_action' ? []
+        : [response.message, createToolResultMessage({ callId: call.id, content: [{ type: 'text', text: JSON.stringify(observation) }], isError: rejected })]
+      if (!pending && observed.record.final_verified && acceptedStatus(currentRun, observed) === 'PASS') { status = 'VERIFIED'; break }
     }
+    if (status === 'MODEL_REQUEST_BUDGET_EXHAUSTED' && requests.length < agentRequestLimit && actions.length >= auto.maxToolSteps) status = 'TOOL_STEP_BUDGET_EXHAUSTED'
     if (pending) {
       revisionDecisions.push({ decision: 'UNVERIFIED_TERMINAL_RESTORE', candidate_revision_id: revision, best_revision_id: best.revision, rolled_back: true })
       revision = best.revision; source = best.source; observed = best.observed; currentRun = best.run; pending = false
@@ -443,6 +506,8 @@ async function run(ctx: Context, config: ReturnType<typeof Config>, command: str
     await publish(target, 'best-observed.sv', best.source)
     if (status === 'VERIFIED') {
       if (pending || !observed.record.final_verified || observed.record.final_source_sha256 !== sha256(source)) throw new Error('EXPORT_BINDING_INVALID')
+      await assertFreeze()
+      await assertAcceptance(acceptances.find(value => value.run === currentRun), { task: taskId, source: sha256(source), run: currentRun })
       await publish(target, 'final.sv', source)
       result.final_exported_sha256 = sha256(await readFile(join(target, 'final.sv')))
     }
@@ -453,7 +518,7 @@ async function run(ctx: Context, config: ReturnType<typeof Config>, command: str
       valid_repair_attempts: repairAttempts.filter(value => value.valid).length,
       recovered_by_agent: baselineFailed && status === 'VERIFIED', current_source_sha256: sha256(source),
       best_revision_id: best.revision, best_source_sha256: sha256(best.source), best_score: best.score, rejected_revisions: rejectedRevisions,
-      verified_source_sha256: !pending && observed.record.final_verified ? observed.record.final_source_sha256 : null,
+      verified_source_sha256: status === 'VERIFIED' ? observed.record.final_source_sha256 : null,
       verification_key: !pending ? observed.record.verification_key : null, final_verification_run: !pending ? currentRun : null }
     await assertFreeze()
   } catch (error) {

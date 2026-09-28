@@ -1,0 +1,1 @@
+module TopModule(input clk, output reg q=1'b1); always @(posedge clk) q<=~q; endmodule

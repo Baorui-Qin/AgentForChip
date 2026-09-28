@@ -1,0 +1,171 @@
+We need answer final only one complete DUT between [BEGIN] and [DONE]. Need implement FSM for timer pattern 1101 then shift_ena exactly 4 cycles, counting until done_counting, done until ack. Synchronous active high reset. Need infer state encoding. Let's design carefully.
+
+Spec from HDLBits likely FSM "Exams/review2015 fsm". States:
+IDLE/search sequence 1101. Need detect pattern. There are alternative implementations: state transition based on sequence, states A, B, C, D? Let's reconstruct.
+
+Timer starts when pattern 1101 detected. Then shift in 4 more bits to determine duration. During those 4 cycles assert shift_ena. Then counting assert counting. Wait done_counting. At that point assert done, wait ack. Then reset to search.
+
+Need exact behavior maybe from HDLBits. Let's recall original problem "Exams/review2015 fsm" has state machine only. It has states:
+- State 0: looking for 1? maybe A.
+- State 1: got 1
+- State 2: got 11
+- State 3: got 110
+- State 4-7: shift_ena for 4 cycles (or states with count)
+- State 8: counting
+- State 9: done
+
+Need handle detection of 1101. Since input serial bits. We need assert shift_ena exactly 4 clock cycles after pattern detected. Pattern is 1101, so when last 1 arrives (fourth bit 1), on next clock? In Moore FSM, output shift_ena during states after detection. Sequence detection: states:
+A: initial no prefix
+B: received 1
+C: received 11
+D: received 110
+When in D and data=1, next state E (start shift) where shift_ena=1 for first of four cycles. That means shift_ena asserted starting the cycle after the 1101 bit was sampled. Is that "exactly 4 clock cycles"? Yes likely.
+
+Then E,F,G,H shift_ena=1 (4 states), then counting state I, then done state J. Wait: What about shift_ena for exactly 4 cycles: after detecting in D at data=1, next state shift1. At that clock edge, state becomes shift1. During shift1 cycle output shift_ena=1. Four cycles shift1..shift4. Then counting.
+
+Need pattern detection overlapping? If data pattern like 1101101? Should detect first. Need handle overlap while searching. Standard sequence detector for 1101:
+State A: no matching prefix. If data=1 -> B, else A.
+State B: matched "1". If data=1 -> C (prefix "11"), else A? Wait if data=0, sequence "10" no suffix of "1101"? Suffix "0" no. So A.
+State C: matched "11". If data=0 -> D ("110"), if data=1 -> C? Because suffix of "111" is "11", so remain C. Yes.
+State D: matched "110". If data=1 -> detected -> shift1. If data=0 -> A? Sequence "1100": suffix "0" => A. Yes.
+
+But what if during shift/counting/done data irrelevant. done_counting, ack.
+
+Need synchronous reset: always @(posedge clk) if (reset) state <= A; else state <= next_state. Outputs combinational from state? shift_ena, counting, done. Reset active high synchronous.
+
+Need decide output during reset? not specified. Synchronous reset means after edge. Outputs based on state. At reset state A: outputs 0. Fine.
+
+Let's define localparam:
+S = 4'b0000? Let's use IDs:
+A=0, B=1, C=2, D=3, SHIFT1=4, SHIFT2=5, SHIFT3=6, SHIFT4=7, COUNT=8, DONE=9.
+
+Logic:
+always @(posedge clk) if (reset) state <= A; else case(state)...
+next combinational? Could combine sequential case directly with state<=. Use always @(posedge clk) case with next state assignments. That's simpler and matches.
+
+For outputs:
+assign shift_ena = (state==SHIFT1 || state==SHIFT2 || state==SHIFT3 || state==SHIFT4);
+assign counting = (state==COUNT);
+assign done = (state==DONE);
+
+Sequential transitions:
+case(state)
+A: if (data) state <= B; else state <= A;
+B: if (data) state <= C; else state <= A;
+C: if (data) state <= C; else state <= D; // because data=1 -> still C? Wait C means "11". If data=1, sequence "111" suffix "11", so state C. If data=0 -> "110" D. correct.
+D: if (data) state <= SHIFT1; else state <= A; // if data=0, "1100" suffix? Last two bits "00", last bit 0 none. Yes A.
+SHIFT1: state <= SHIFT2;
+SHIFT2: state <= SHIFT3;
+SHIFT3: state <= SHIFT4;
+SHIFT4: state <= COUNT;
+COUNT: if (done_counting) state <= DONE; else state <= COUNT;
+DONE: if (ack) state <= A; else state <= DONE;
+default: state <= A;
+endcase
+
+Question: In state C, if data=1, should remain C or maybe B? Let's verify pattern 1101, if we got 111 then we have "11" at end, so C. Yes.
+
+Potential issue: When in B and data=0, should maybe A? Sequence "10": suffix none. A.
+When in A and data=0, A.
+When in D and data=0, could there be suffix? "1100": no. A.
+
+Need output shift_ena exactly 4 clock cycles. If detection occurs in state D at clock edge, next state SHIFT1. shift_ena high during SHIFT1-SHIFT4. Then COUNT. That's 4 cycles. Then counting high in COUNT. Good.
+
+Let's consider if reset asserted while in some state, synchronous on next posedge sets A. Outputs maybe high during reset cycle before edge? Since reset synchronous, if reset is high, at edge state becomes A. But immediately after edge, state A, outputs 0. If reset is high and state non-A, output based on current state until edge? Actually synchronous reset doesn't affect outputs until clock edge. That's typical. The problem may expect reset in sensitivity list? They said synchronous reset, so always @(posedge clk) if(reset). Good.
+
+Need produce SystemVerilog with TopModule. Could use logic or reg. Ports all input/output one bit. Use ANSI style. Since constraints SystemVerilog. Return between [BEGIN] and [DONE]. Must be exactly one complete DUT. No explanation.
+
+Let's double-check original HDLBits problem. I recall this is "review2015_fsm" and maybe states are:
+parameter [3:0] A=4'd0, B=4'd1, C=4'd2, D=4'd3, E=4'd4, F=4'd5, G=4'd6, H=4'd7, I=4'd8, J=4'd9.
+Outputs:
+assign shift_ena = (state == E || state == F || state == G || state == H);
+assign counting = (state == I);
+assign done = (state == J);
+Transitions:
+A: next = data ? B : A;
+B: next = data ? C : A;
+C: next = data ? C : D;
+D: next = data ? E : A;
+E: next = F;
+F: next = G;
+G: next = H;
+H: next = I;
+I: next = done_counting ? J : I;
+J: next = ack ? A : J;
+Yes exactly.
+
+Maybe there is nuance: In B, if data=1 -> C; if data=0 -> A. In C, if data=1 -> C; if data=0 -> D. In D, if data=1 -> E; if data=0 -> A. That matches.
+
+Let's consider sequence 1101 detection could also be: A=0, B=1, C=2, D=3, E=4...
+I'll implement with logic [3:0] state, next_state? We can do single always with nonblocking. Need avoid latches. Use case default.
+
+Code:
+
+module TopModule (
+    input  logic clk,
+    input  logic reset,
+    input  logic data,
+    input  logic done_counting,
+    input  logic ack,
+    output logic shift_ena,
+    output logic counting,
+    output logic done
+);
+
+    typedef enum logic [3:0] {
+        A, B, C, D, E, F, G, H, I, J
+    } state_t;
+
+    state_t state, next_state;
+
+    always_ff @(posedge clk) begin
+        if (reset) state <= A;
+        else state <= next_state;
+    end
+
+    always_comb begin
+        next_state = state;
+        case (state)
+            A: next_state = data ? B : A;
+            B: next_state = data ? C : A;
+            C: next_state = data ? C : D;
+            D: next_state = data ? E : A;
+            E: next_state = F;
+            F: next_state = G;
+            G: next_state = H;
+            H: next_state = I;
+            I: next_state = done_counting ? J : I;
+            J: next_state = ack ? A : J;
+            default: next_state = A;
+        endcase
+    end
+
+    assign shift_ena = (state == E || state == F || state == G || state == H);
+    assign counting = (state == I);
+    assign done = (state == J);
+
+endmodule
+
+Check output "done" output name maybe conflicts with input? No input done_counting. done is output. In always_comb, if we use variable named done? No.
+
+Need ensure SystemVerilog synthesizable. typedef enum inside module ok. Could also use localparam. Using always_comb with next_state default. Good.
+
+Could we assign outputs from state directly? state is state_t, comparisons ok.
+
+Potential issue: "done" output is also keyword? No, done is not reserved. "counting" not reserved. "shift_ena". Fine.
+
+Let's consider if reset is synchronous active high. always_ff if reset state <= A. Good. No asynchronous reset. Outputs combinational from state. During reset high, if state is e.g. I, counting stays high until next clock edge. That's correct for synchronous reset.
+
+Let's ensure exactly one complete DUT between [BEGIN] and [DONE]. No markdown. Final answer just [BEGIN] module... [DONE]. Use code block? The instruction: Return exactly one complete DUT between [BEGIN] and [DONE], without explanation. So no markdown code fences maybe. Just [BEGIN] ... [DONE].
+
+Let's produce.
+
+Wait, there is a subtlety: "The serial data is available on the data input pin. When the pattern 1101 is received, the state machine must then assert output shift_ena for exactly 4 clock cycles." In my FSM, during state D, if data=1, at the clock edge, state becomes E. So shift_ena is asserted in cycle after the 1101 bit is sampled. Is that considered "when pattern received"? Usually yes. But maybe they expect shift_ena asserted in same cycle as the fourth bit? Moore FSM cannot unless state transition occurs before output? Actually if pattern is detected in state D with data=1, the current cycle is D, output shift_ena=0. On next cycle E, shift_ena=1. That means the fourth bit (1) is received during D cycle, and shift_ena starts next cycle. That's typical. Could there be an issue with "exactly 4 clock cycles" and shifting in 4 more bits. The shift_ena should be high for 4 cycles to capture the 4 bits after the 1101. If shift_ena starts in E, it captures data during E,F,G,H. That's four bits after pattern. Correct.
+
+What if the pattern is detected as data=1 in D, and the next data bit is the first duration bit. During E, shift_ena=1, so it is shifted. Yes.
+
+Let's consider overlapping 1101 and shift. If data is 1101101, pattern at bits 1-4. At cycle D (bit 4=1), next E. Then bits 5-8 are duration. If duration bits happen to be 1101, we ignore. Good.
+
+All good.
+
+Now final.

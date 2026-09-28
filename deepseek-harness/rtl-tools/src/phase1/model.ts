@@ -10,7 +10,7 @@ export type { ModelObservation } from './model-observation.ts'
 /** Provider-owned preparation also resolves the existing credential service. */
 export interface ModelRuntime { prepareCall(config: LlmCallConfig, signal?: AbortSignal): Promise<PreparedLlmCall> }
 /** Explicit development limits; no model id or sampling settings are inferred. */
-export interface ModelSettings { model: string; maxTokens: number; temperature: number; timeoutMs: number; maxResponseBytes: number; system?: string }
+export interface ModelSettings { model: string; maxTokens: number; temperature: number; timeoutMs: number; maxResponseBytes: number; system?: string; reasoningEffort?: LlmCallConfig['reasoningEffort'] }
 
 /** Optional host construction after configuration resolution, before a single dispatch. */
 export type BuildText = (prepared: PreparedLlmCall, signal: AbortSignal) => Promise<{ prompt: string; system: string; audit: ContextAudit }>
@@ -87,7 +87,8 @@ export async function callText(runtime: ModelRuntime, settings: ModelSettings, p
   try {
     await recorder.append({ type: 'model_started', link, value: { prompt, ...(settings.system === undefined ? {} : { system: settings.system }) } })
     signal.throwIfAborted()
-    const prepared = await runtime.prepareCall({ provider: 'deepseek-official', model: settings.model, maxTokens: settings.maxTokens, temperature: settings.temperature }, signal)
+    const prepared = await runtime.prepareCall({ provider: 'deepseek-official', model: settings.model, maxTokens: settings.maxTokens, temperature: settings.temperature,
+      ...(settings.reasoningEffort === undefined ? {} : { reasoningEffort: settings.reasoningEffort }) }, signal)
     signal.throwIfAborted()
     let system = settings.system
     if (build) {

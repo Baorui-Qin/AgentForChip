@@ -1,0 +1,862 @@
+Let me analyze the spec carefully.
+
+The task: a PS/2 mouse protocol byte parser. Wait, "task.id equals Prob154_fsm_ps2data". Let me read the spec.
+
+Discard bytes until we see one with in[3]=1. Assume it's byte 1 of a message. Signal done once all 3 bytes received. done in the cycle immediately after the third byte was successfully received.
+
+Wait but the example shows a more complex behavior. Let's look at the example waveform:
+
+```
+time   clk rst in  done out_bytes
+0      0   1    0  x    x
+5      1   1    0  0    x
+10     0   1    0  0    x
+15     1   0    2c 0    x     <- in=2c, in[3]=0? 2c = 0010_1100, bit3=1. So yes byte1 = 2c
+20     0   0    2c 0    x
+25     1   0    81 0    x     <- byte2 = 81
+30     0   0    81 0    x
+35     1   0    9  0    x     <- byte3 = 09
+40     0   0    9  0    x
+45     1   0    6b 1    2c8109   <- done=1, out_bytes = 2c 81 09
+50     0   0    6b 1    2c8109
+55     1   0    d  0    x     <- d = 0d = 0000_1101, bit3=1
+60     0   0    d  0    x
+65     1   0    8d 0    x     <- byte2
+70     0   0    8d 0    x
+75     1   0    6d 1    6b0d8d   <- done=1, out_bytes = 6b 0d 8d
+...
+```
+
+Wait, interesting. At time 45, done=1 and out_bytes=2c8109. But the third byte (09) was received at time 35. Hmm, so done is asserted at time 45, which is one cycle after byte3 (at 35). Wait...
+
+Let me recount. Actually the spec says "The FSM should signal done in the cycle immediately after the third byte of each message was successfully received."
+
+Hmm, but wait. Look more carefully. At time 35, in=09 (third byte). At time 45, done=1 and out_bytes = 2c 81 09. So done asserted in the cycle after byte3 is received. That matches.
+
+But wait, then at time 45, in=6b, and 6b = 0110_1011, bit3 = 1, so it's a new byte1. Then at time 55, in=0d, byte2. time 65, in=8d, byte3. time 75, done=1, out_bytes = 6b 0d 8d. 
+
+Hmm wait, that means byte2 at 55 = 0d, byte3 at 65 = 8d. And out_bytes = 6b0d8d = 6b, 0d, 8d. Yes.
+
+But hold on — the timing. done is at time 75, which is... byte3 was received at 65. done at 75, one cycle after. Hmm, but that seems like done appears 2 cycles after? Let me re-index.
+
+Actually, wait. Let's think about this as: at posedge, the input `in` is sampled. The waveform shows clk as 1 at 5ns, 0 at 10, 1 at 15, etc. So posedge occurs at 5, 15, 25, 35, 45, ... (times where clk=1 following 0). Actually the waveform lists clk value at each 5ns. clk=1 at 5,15,25,... representing the clock being high in those intervals [5,10), [15,20), etc. Posedge at time 5, 15, 25...
+
+Hmm, but `in` changes appear at the same rows where clk=1. Actually in the display, in value is constant over two rows (e.g., 0 at 0 and 5, then 2c at 15 and 20). So in is set at time 15... hmm this is a bit confusing.
+
+Let me think about it differently: this is a standard HDLBits problem. Let me recall the actual HDLBits problem "PS/2 packet parser and datapath". 
+
+Actually, HDLBits has "Fsm ps2data" problem. The description: "The PS/2 mouse protocol sends messages that are three bytes long. However, within a continuous byte stream, it's not obvious where messages start and end. The only indication is that the first byte of each three byte message always has bit[3]=1 (but bit[3] of the other two bytes may be 1 or 0 depending on data). ... We want a finite state machine that will search for message boundaries when given an input byte stream. The algorithm we'll use is to discard bytes until we see one with in[3]=1. We then assume that this is byte 1 of a message, and signal the receipt of a message once all 3 bytes have been received (done). The FSM should signal done in the cycle immediately after the third byte of each message was successfully received."
+
+Wait, actually the standard HDLBits problem says "signal the receipt of a message once all 3 bytes have been received", and "The FSM should signal done in the cycle immediately after the third byte of each message was successfully received."
+
+Hmm, actually the standard solution: state machine with 4 states. done is asserted when in state BYTE3, i.e., combinational output = (state == BYTE3). Let's think.
+
+Let me trace the standard solution. Standard HDLBits solution (from the site) — this is actually the datapath part "fsm_ps2data". The expected solution is:
+
+```
+module top_module(
+    input clk,
+    input [7:0] in,
+    input reset,
+    output [23:0] out_bytes,
+    output done);
+
+    reg [1:0] state, next_state;
+    reg [23:0] out_bytes_r;
+
+    localparam BYTE1 = 2'd0, BYTE2 = 2'd1, BYTE3 = 2'd2, DONE = 2'd3;
+
+    always @(*) begin
+        case (state)
+            BYTE1: next_state = in[3] ? BYTE2 : BYTE1;
+            BYTE2: next_state = BYTE3;
+            BYTE3: next_state = DONE;
+            DONE:  next_state = in[3] ? BYTE2 : BYTE1;
+            default: next_state = BYTE1;
+        endcase
+    end
+    ...
+```
+
+Hmm, let me recall more precisely. Actually the standard solution structure:
+
+The FSM: 
+- state DONE corresponds to the cycle where done is asserted and simultaneously it looks at the new byte (which could be byte1 of a new message or discarded).
+
+Wait, let's re-examine the waveform to understand the FSM timing.
+
+Let me re-map. Let's define cycles by posedge. Posedges at t=5,15,25,35,45,55,65,75,...
+
+Hmm, actually wait. Let me reconsider: the simulator samples at... Let me assume posedge at t = 5 + 10k? No.
+
+Let me reconsider the timing. The value of `in` changes at t=15 (from 0 to 2c). In a typical Verilog testbench, inputs are driven at negedge and the waveform display shows value at time points. Hmm.
+
+Let's just assume: clock posedge at times 5, 15, 25, ... Not quite right because the waveform shows clk=1 at time 5 only for one row then 0 at 10. That doesn't look like a clock with period 10. It looks like clk toggles every 5ns: high [5,10), low [10,15), high [15,20), etc. So period is 10ns, posedge at 5, 15, 25, 35, ...
+
+Hmm, but then clk=0 at time 0, and the first posedge at 5ns. At t=5, rst=1, so state resets. At t=15, rst=0.
+
+Now `in` values: 0 for t in [0,15)? The table shows in=0 at t=0 and t=5. Then in=2c at t=15 and t=20. So in changes at t=15. Hmm, that's exactly at the posedge. That would be a race. Typically the testbench drives inputs at negedge or after the posedge with a small delay. But the table just shows the value at those sample times.
+
+Actually, I think the convention: the table shows the value of the signals at the given time. `in` is stable at its new value right at t=15 (the posedge). Hmm.
+
+Alternatively, maybe the "time" column represents when the signals are set and the clock is shown at the sample. Let me reconsider: perhaps the clock has period 10ns, rising at 0? No, at t=0 clk=0.
+
+Let me try: posedge at t = 5,15,25,... and the value of `in` shown at time t is the value present during the interval starting at t. So at posedge t=15, in=2c is sampled.
+
+Hmm, but the input changing exactly at posedge is weird.
+
+Let me instead think of this in terms of the expected HDLBits solution and match the waveform.
+
+Let me denote the state machine from the standard solution:
+
+States: 
+- S0 (IDLE/BYTE1-ish)
+- Actually the standard solution has states: BYTE1, BYTE2, BYTE3, DONE. Wait, I recall the FSM diagram from HDLBits "Fsm ps2":
+
+The FSM for "ps2" (the first problem) has states and transitions:
+- State 0: waiting for byte with in[3]=1. 
+- After detecting in[3]=1, go to state for byte2.
+- etc.
+
+Let me look at the waveform differently. Let's figure out the input sequence and done times.
+
+in sequence (each byte lasts 2 table rows = 10ns):
+- 00 (t=0..10)
+- 00 (t=10? no)...
+
+Hmm the table:
+```
+0ns    0   1    0  x
+5ns    1   1    0  0
+10ns   0   1    0  0
+15ns   1   0    2c  0
+20ns   0   0    2c  0
+25ns   1   0    81  0
+30ns   0   0    81  0
+35ns   1   0    9  0
+40ns   0   0    9  0
+45ns   1   0    6b  1
+50ns   0   0    6b  1
+55ns   1   0    d  0
+60ns   0   0    d  0
+65ns   1   0    8d  0
+70ns   0   0    8d  0
+75ns   1   0    6d  1
+80ns   0   0    6d  1
+85ns   1   0    12  0
+90ns   0   0    12  0
+95ns   1   0    1  0
+100ns  0   0    1  0
+105ns  1   0    d  1
+110ns  0   0    d  1
+115ns  1   0    76  0
+120ns  0   0    76  0
+125ns  1   0    3d  0
+130ns  0   0    3d  0
+135ns  1   0   ed  1
+140ns  0   0   ed  1
+145ns  1   0   8c  0
+150ns  0   0   8c  0
+155ns  1   0   f9  0
+160ns  0   0   f9  0
+165ns  1   0   ce  1
+170ns  0   0   ce  1
+175ns  1   0   c5  0
+180ns  0   0   c5  0
+185ns  1   0   aa  0
+190ns  0   0   aa  0
+```
+
+So in changes at t=15,25,35,... (every 10ns). clk toggles every 5ns with posedge at t=5,15,25,35,...
+
+Wait, in changes at t=15 which is a posedge. Hmm, that's odd. Unless... the clock is: posedge at t=0? No.
+
+OK here's another interpretation: The simulator's clock: rising edges occur at times 5, 15, 25, ...? At t=5 clk goes 1, t=10 clk goes 0, at t=15 clk goes 1. So posedge at 5,15,25,...
+
+And in changes at t=15. But if in changes at the same time as posedge, the value sampled would be ambiguous. Perhaps in actually changed slightly before t=15 and the table rounds. Or the table lists in value at that row meaning it's about to be sampled.
+
+Hmm, alternatively maybe the semantics: the row at time t shows the state of signals just before the clock edge at t (if t is a rising edge). Hmm.
+
+Let me think about the DUT behavior we need and see if it matches.
+
+Given the spec: discard bytes until in[3]=1, then that's byte1, then byte2, byte3, then done in cycle immediately after byte3 received.
+
+Let's trace with the input stream: bytes applied at times 15,25,35,45,55,...
+
+Actually let's just say byte_n is presented on input during clock cycle n and sampled at posedge.
+
+Bytes: 
+- t=15: 2c (in[3]=1) -> byte1 of message 1
+- t=25: 81 -> byte2
+- t=35: 09 -> byte3
+- t=45: 6b -> done should be asserted at t=45? "done in the cycle immediately after the third byte of each message was successfully received". Third byte received at t=35 (sampled at posedge t=35). Cycle immediately after = t=45. And out_bytes = 2c8109. ✓ at t=45 done=1, out_bytes=2c8109. 
+
+- t=45: in=6b (in[3]=1) -> byte1 of message 2
+- t=55: 0d -> byte2
+- t=65: 8d -> byte3
+- t=75: done=1, out_bytes=6b0d8d ✓
+
+- t=75: in=6d (in[3]=1) -> byte1 of message 3
+- t=85: 12 -> byte2
+- t=95: 01 -> byte3 (01, in[3]=0, fine)
+- t=105: done=1, out_bytes=6d1201 ✓
+
+- t=105: in=0d (0d = 0000_1101, in[3]=1) -> byte1 message4
+- t=115: 76 -> byte2
+- t=125: 3d -> byte3
+- t=135: done=1, out=0d763d ✓ (table shows d763d, note leading zero → "0d763d", displayed as "d763d")
+
+- t=135: in=ed (1110_1101, bit3=1) -> byte1 msg5
+- t=145: 8c -> byte2
+- t=155: f9 -> byte3
+- t=165: done=1, out=ed8cf9 ✓
+
+- t=165: in=ce (1100_1110, bit3=1) -> byte1 msg6
+- t=175: c5 -> byte2
+- t=185: aa -> byte3
+- t=195: done would be 1.
+
+Great, consistent.
+
+Now the key question: what's the state machine timing? Let's design.
+
+We need: at posedge, when done=1, out_bytes = {b1,b2,b3}. done=1 during the cycle right after the third byte is received. And crucially, in that same cycle, the input might be a new byte1 (like t=45 in=6b, t=75 in=6d, t=105 in=0d, t=135 in=ed, t=165 in=ce). In all our examples, the byte at the "done" cycle happens to have in[3]=1 (it's the start of the next message). But could be in[3]=0 to discard.
+
+Wait, but there's a subtlety: The third byte received — could a third byte be, e.g., such that we need to also treat the byte at the done-cycle? Let's check the state machine: 
+
+Standard HDLBits solution uses a Moore FSM where done = (state==DONE). Let's define:
+
+States: 
+- BYTE1: waiting for first byte (in[3]=1).
+- BYTE2: got byte1, waiting for byte2.
+- BYTE3: got bytes 1&2, waiting for byte3.
+- DONE: just received byte3; assert done; look at current input to decide next.
+
+Hmm but the timing: byte3 is received at t=35. Then at t=45, done=1. So state transitions: at posedge t=35, we sample byte3, set out_bytes <= {b1,b2,in}, and next state = DONE. At t=45 in state DONE, done=1. Also at t=45, we examine in to determine next state.
+
+Wait but actually careful: the spec says done is signaled in the cycle immediately after the third byte was received. Let me verify with the state machine: at t=35 posedge, third byte sampled. At t=35..45 the state becomes DONE? Then during t=45..55 the done signal is high. Hmm, "cycle immediately after" — the cycle after t=35 is t=45. So done high during cycle t=45. ✓.
+
+But hold on, there's ambiguity: could done be high during cycle t=45..55 meaning it reflects state at t=45+? Let's just say done = (state==DONE) combinationally, and state is DONE during the cycle following reception of byte3.
+
+Alternatively the spec example: done at 45ns and 50ns (both rows, since each cycle is 10ns but the table samples at 5ns intervals). So done=1 for the whole duration [45,55) basically. And out_bytes valid there.
+
+OK so let's define the FSM:
+
+Actually wait, let me reconsider. Standard HDLBits solution for fsm_ps2data. Let me recall the exact state encoding and behavior, because the number of states and transitions matter for matching.
+
+Actually, I found it. The reference solution:
+
+```
+module top_module(
+    input clk,
+    input [7:0] in,
+    input reset,
+    output [23:0] out_bytes,
+    output done);
+
+    reg [1:0] state, next_state;
+    reg [23:0] out_bytes_reg;
+
+    parameter BYTE1 = 2'd0;
+    parameter BYTE2 = 2'd1;
+    parameter BYTE3 = 2'd2;
+    parameter DONE  = 2'd3;
+
+    always @(*) begin
+        case (state)
+            BYTE1: next_state = in[3] ? BYTE2 : BYTE1;
+            BYTE2: next_state = BYTE3;
+            BYTE3: next_state = DONE;
+            DONE:  next_state = in[3] ? BYTE2 : BYTE1;
+        endcase
+    end
+
+    always @(posedge clk) begin
+        if (reset) state <= BYTE1;
+        else state <= next_state;
+    end
+
+    always @(posedge clk) begin
+        if (reset) out_bytes_reg <= 24'd0;
+        else case (state)
+            BYTE1: out_bytes_reg[23:16] <= in;
+            BYTE2: out_bytes_reg[15:8]  <= in;
+            BYTE3: out_bytes_reg[7:0]   <= in;
+            DONE:  out_bytes_reg[23:16] <= in;   // maybe
+        endcase
+    end
+    ...
+```
+
+Hmm, this is getting complicated. Let me just design a correct one from scratch and be careful about exact timing.
+
+Let me carefully define the FSM based on the waveform.
+
+Cycle-by-cycle (each cycle = 10ns, posedge at 5,15,25,...). Let me index posedge times: e0=5 (rst), e1=15, e2=25, e3=35, e4=45, e5=55, ...
+
+At each posedge, we sample `in`. What's the value of `in` at each posedge? Based on "changes at t=15,25,35,...", the value at posedge e_k (k>=1) equals the byte listed at time 15+10*(k-1).
+
+Hmm, but if in changes exactly at posedge, then... Let's assume in is the value during the interval. I'll treat the input for posedge e1=15 as 0x2c.
+
+Actually wait, there's a subtlety. Let's look at the reset. At t=5 (posedge e0), rst=1. in=0. At t=15 (e1), rst=0, in=2c.
+
+Hmm, but the table shows in=0 at t=5 and t=10, in=2c at t=15 and 20. So `in` = 0 during [0,15) roughly, then 2c during [15,25). So at posedge e1=15, in is 2c... but it just changed at 15. Ugh, race again. Let me just assume the intended sampling: posedge at t=15 samples in=2c. Fine. Actually more likely: the testbench drives `in` at negedge clk (t=10, 20, 30...), and the table rounds... no, in changes at 15 not 10.
+
+Whatever. Let's assume in value during cycle [15,25) is 2c, and it's sampled at the posedge that starts that cycle.
+
+Hmm, actually, maybe the clock posedge is at t=10? Let's reconsider: clk=0 at t=0, clk=1 at t=5, clk=0 at t=10, clk=1 at t=15. So rising at 5, 15, 25. Hmm ok. But then in changes at 15 too.
+
+Alternatively, the clock in the table: the "time" is the timestamp and the values are what the simulator had. Maybe it's an HDLBits-style waveform where they manually list. I'll not overthink; the relationship for the reference is: done high in the cycle following byte3.
+
+Now let me define a robust FSM.
+
+Approach: 4-state Moore FSM with states IDLE(0), B1(1)... hmm actually let's think.
+
+Let me define states representing "what we're waiting for / what just happened":
+
+Let me use the following encoding and behavior:
+
+State WAIT1: initial state. On posedge, if in[3]==1, capture b1<=in, go to WAIT2. Else stay.
+
+Actually, let's be careful about the done timing. We want done=1 one cycle after third byte.
+
+Option A: 4 states: S0=WAIT1, S1=GOT1, S2=GOT2, S3=DONE.
+- Transition on posedge:
+  - S0: if in[3] -> S1 (capture b1<=in) else S0.
+  - S1: -> S2, capture b2<=in.
+  - S2: -> S3, capture b3<=in.
+  - S3: if in[3] -> S1 (capture b1<=in) else S0.
+- done = (state==S3) combinationally.
+
+Check timing: 
+- e1 (t=15): in=2c, state=S0 -> next S1, b1<=2c.
+- e2 (t=25): in=81, state=S1 -> next S2, b2<=81.
+- e3 (t=35): in=09, state=S2 -> next S3, b3<=09.
+- [35,45): state=S3, done=1! But we want done at t=45, not t=35.
+
+Hmm. So done would be high during cycle [35,45), i.e., shown at t=35 and 40. But the table shows done=0 at t=35,40 and done=1 at t=45,50. So Option A gives done one cycle too early.
+
+Hmm. So we need done in the cycle after S3, i.e., 5 states? Or done registered.
+
+Let's reconsider: "The FSM should signal done in the cycle immediately after the third byte of each message was successfully received."
+
+Third byte received at posedge e3=35. The cycle immediately after: The cycle that begins at e3? Or the cycle after e3's cycle?
+
+In these HDLBits problems, "cycle immediately after the third byte was received" typically means: done is asserted in the clock cycle following the one in which byte3 appears. I.e., byte3 appears during cycle N (sampled at posedge N), done is high during cycle N+1.
+
+In the waveform, byte3=09 appears at t=35 (and 40). done=1 at t=45 (and 50). So done is in the next cycle. ✓.
+
+So we need an extra state, or register done.
+
+Let's use states: WAIT1, BYTE2, BYTE3, DONE, and... hmm. Let's reconsider using combinational done = (state==BYTE3) with a different state meaning.
+
+Alternative: define states where BYTE3 state means "we've received bytes 1 and 2 and are waiting for byte3, and the output for the done will be produced". Hmm.
+
+Let me think again. Let's define the FSM such that at posedge, when in state X, we sample input. Let me instead define:
+
+- State 0 (WAIT1): looking for byte1. On posedge: if in[3], go to state 1, capture b1.
+- State 1 (WAIT2): waiting for byte2. On posedge: go to state 2, capture b2.
+- State 2 (WAIT3): waiting for byte3. On posedge: go to state 3, capture b3.
+- State 3 (DONE): done=1 asserted. On posedge: examine in; if in[3], go to state 1 capturing b1; else go to state 0.
+
+This is Option A. done=(state==3). Timeline:
+- t=15 (e1): state 0, in=2c -> state1, b1=2c
+- t=25 (e2): state1 -> state2, b2=81
+- t=35 (e3): state2 -> state3, b3=09
+- t=35..45: state3, done=1.
+
+But expected done at 45..55. Off by one cycle.
+
+So the reference must assert done one cycle later. That means the third byte is received in state 3, and done is in state... hmm no.
+
+Wait, maybe I mis-assigned posedge times. Let's reconsider: maybe `in` is sampled at posedge e_k and the value listed at t=15 belongs to the cycle ending at 15, i.e., in[15] is the value during [10,15)?? Let's try: in=2c listed at 15 and 20; if it's during [15,25), sampled at posedge 15 or 25?
+
+Hmm, if the clock posedge is at t=10, 20, 30...? No, clk is 1 at 5, 0 at 10, 1 at 15, 0 at 20.
+
+Hmm wait, maybe the clock is: high during [0,5), low [5,10)... no, clk=0 at t=0.
+
+Let me reconsider: maybe times when clk=1: 5,15,25. And the "in" value changes at 15,25,..., i.e., at the rising edge. In real testbenches inputs change just after the rising edge (non-blocking style) or at negedge. Given the table samples at 5ns granularity, "in changes at 15" might mean it changed at exactly 15 (edge). Hmm.
+
+Let me instead hypothesize that the reference does the following and check.
+
+Alternative: Maybe the reference captures and outputs differently. Let's think about what would produce done at t=45 given byte3 at t=35.
+
+If the FSM's "third byte" state is entered at t=45... that would mean bytes 1,2,3 sampled at 25,35,45? But byte3=09 at 35.
+
+Hmm. Let me reconsider whether byte1 is at 15.
+
+Actually, maybe the parser treats the byte at t=15 as... let's see, rst=0 at t=15. Before that rst=1. So the first non-reset byte is 2c at 15.
+
+Hmm what if the sampling is at posedge and the value of `in` at posedge 15 is actually 0 (the old value), because in changes after the edge. Then:
+- e1=15: in=0 (in[3]=0), state stays WAIT1.
+- e2=25: in=2c, in[3]=1 -> state WAIT2, b1=2c.
+- e3=35: in=81 -> state WAIT3, b2=81.
+- e4=45: in=09 -> state DONE, b3=09. done=1 during [45,55).
+- out_bytes = {2c,81,09} = 2c8109 ✓✓✓ 
+
+Oh! That matches! done=1 at t=45, out_bytes=2c8109. 
+
+And then e4=45: state DONE, in=09. done=1. Then e5=55: in=6b, state DONE -> if in[3], go to WAIT2 capturing b1=6b. So b1=6b. Then e6=65: in=0d -> b2=0d, state WAIT3. e7=75: in=8d -> b3=8d, state DONE, done=1 during [75,85). out_bytes = 6b0d8d ✓✓.
+
+Wait check: at t=75, in=6d. Hmm wait let me redo. Let me re-list with this sampling assumption: `in` at posedge e_k equals the value listed at time e_k (i.e., during the interval starting at e_k?). Ugh, I need to be consistent.
+
+Let me define: `in` value listed at t=15 is the value that will be sampled at posedge t=15? Or the value after the edge?
+
+Given the match above, it seems in the table, the value at time t=15 (2c) is what's present during [15,25), and the sampling at posedge 15 uses... hmm no. Let me redo carefully.
+
+Above I assumed posedge e1=15 samples in=0 (the pre-15 value), e2=25 samples in=2c (value during [15,25)). That means in changes at 15 and is sampled at the NEXT posedge (25). Which means in is set up at the posedge and sampled at the following posedge. That's like the input being changed at the posedge and read at the next posedge. Weird but consistent with a testbench that changes in at the same time as clk rises and the DUT samples the previous value... no.
+
+Hmm, actually this is the classic situation: if the testbench drives inputs with blocking assignment at posedge, and the DUT samples in the same always block... no.
+
+Alternatively: the true sampling is at posedge, and inputs change at the SAME time as the posedge (i.e., they're driven at the posedge). The DUT samples the value that was stable before, i.e., the old value. So effectively `in` is sampled one cycle late relative to its listed change time. That matches "in change at 15, sampled at 25."
+
+But actually, more standard: in a Verilog simulation, if the testbench drives `in` at the posedge using nonblocking or after a #delay, the DUT at that same posedge sees the OLD value. So the DUT samples: at e1=15, in=old=0; at e2=25, in=2c; etc. Hmm but that requires in to change exactly at 15 and 25 etc.
+
+Hmm, honestly, let me instead just consider: the reference solution to this known HDLBits problem. Let me recall the canonical solution.
+
+Actually, I realize the waveform given is likely generated from the reference solution with a specific testbench. The key relationship: byte1 detected, then two more bytes, then done one cycle after third.
+
+Given the confusion, let's just figure out what FSM produces the waveform, using the assumption that the sampling instances are at t=15,25,35,... and the sampled values are in=[2c,81,09,6b,0d,8d,6d,12,01,0d,76,3d,ed,8c,f9,ce,c5,aa].
+
+Hmm wait, but with that assumption, byte1=2c at t=15, and done should be at t=45 as computed with Option A? Let me redo Option A with this assumption:
+
+- e1=15: in=2c, state S0 -> S1, b1=2c. (during [15,25) state=S1)
+- e2=25: in=81, state S1 -> S2, b2=81.
+- e3=35: in=09, state S2 -> S3, b3=09.
+- [35,45): state=S3, done=1. But expected done at [45,55).
+
+Off by one. So with this assumption, Option A is wrong.
+
+With the other assumption (in sampled as old value, i.e., effectively shifted by one cycle): 
+- e1=15: in=0 -> S0
+- e2=25: in=2c -> S1, b1=2c
+- e3=35: in=81 -> S2, b2=81
+- e4=45: in=09 -> S3, b3=09; done=1 during [45,55). ✓
+
+Hmm, so under this assumption Option A matches. But that assumption is weird.
+
+Alternatively, the reference FSM is different: it has an extra state such that done is asserted one cycle later, and in is sampled "normally" (value listed at posedge time).
+
+Which is it? Let me examine more of the waveform to disambiguate.
+
+Under assumption 1 (in sampled at posedge with value listed at that time), Option A gives:
+- e4=45: in=6b, state=S3 (from e3=35), done=1, out=2c8109 ✓ (out_bytes captured at e3: b3=09, b1=2c,b2=81). Wait, in Option A, out_bytes <= {b1,b2,b3} happens when entering S3, i.e., at e3=35. So during [35,45) out_bytes=2c8109 and done=1. At e4=45, in=6b (in[3]=1) -> S1, b1=6b. done=0 during [45,55).
+
+So assumption-1 Option A: done=1 at [35,45), out valid then. Expected done at [45,55). So it's shifted by one cycle. The waveform would show done=1 at t=35,40 instead of 45,50.
+
+Under assumption 2 (in sampled as previous value), Option A: at e4=45, in=09 -> S3, done=1 [45,55), out=2c8109 ✓. At e5=55, in=6b -> S1, b1=6b. e6=65: in=0d -> S2. e7=75: in=8d -> S3, done=1 [75,85), out=6b0d8d ✓. 
+
+Both are internally consistent; they differ by which "in" value is sampled at each posedge. The question is which one the testbench does. Since I can't be sure, maybe there's a standard interpretation.
+
+Hmm, actually, wait. Let me reconsider. Maybe I'm misreading the clock. What if the clock period is 5ns? clk=0 at 0, 1 at 5, 0 at 10... no, that's period 10.
+
+What if the rising edges are at t=10, 20, 30? clk=0 at 10. No.
+
+Hmm, what if clk is high during [0,5)? clk=0 at 0. No.
+
+OK so posedge at 5,15,25,35,45,...
+
+Now let me reconsider: In many HDLBits waveform examples, the inputs change at the same time as the clock's rising edge and the sample shown is the value BEFORE the edge. Actually no — in HDLBits, the `in` is typically driven at the negedge or held, and changes appear mid-cycle.
+
+Hmm, here in changes at 15,25,... exactly at posedge times. That's suspicious. In HDLBits waveforms, input changes are usually shown at the transition points. Actually, HDLBits testbenches use:
+```
+always @(posedge clk) ...
+initial begin
+    clk = 0;
+    ...
+end
+```
+and inputs are assigned at negedge or at specific times. Hmm.
+
+Let me think about HDLBits' actual convention. In HDLBits, the waveforms shown in the problem statements are generated from a reference solution and a testbench. The testbench typically does something like:
+
+```
+always #5 clk = ~clk;  // period 10
+initial begin
+    reset = 1;
+    ...
+end
+```
+
+Hmm.
+
+Let me approach differently: find the canonical HDLBits solution for "Fsm ps2data" and see which timing it produces, assuming the same testbench. Since the problem statement's example waveform should match the canonical solution, and the canonical solution is known, I can derive the behavior.
+
+Let me recall the HDLBits Fsm ps2 (first version) example waveform and solution. 
+
+HDLBits "Fsm ps2" problem statement: "The PS/2 mouse protocol sends messages that are three bytes long. However, within a continuous byte stream, it's not obvious where messages start and end. The only indication is that the first byte of each three byte message always has bit[3]=1... We want a finite state machine that will search for message boundaries... The FSM should signal the receipt of a message once all 3 bytes have been received (done)."
+
+And the Fsm ps2data adds the datapath.
+
+The canonical solution for fsm_ps2data (I'm fairly confident):
+
+```
+module top_module(
+    input clk,
+    input [7:0] in,
+    input reset,
+    output [23:0] out_bytes,
+    output done);
+
+    reg [1:0] state, next_state;
+    reg [23:0] out_bytes_next;
+
+    parameter BYTE1 = 0, BYTE2 = 1, BYTE3 = 2, DONE = 3;
+
+    always @(*) begin
+        next_state = BYTE1;
+        case (state)
+            BYTE1: next_state = in[3] ? BYTE2 : BYTE1;
+            BYTE2: next_state = BYTE3;
+            BYTE3: next_state = DONE;
+            DONE:  next_state = in[3] ? BYTE2 : BYTE1;
+        endcase
+    end
+    ...
+```
+
+Hmm, but here the states are BYTE1 meaning "received byte1, waiting for byte2"? Let me look at the state semantics:
+
+In the HDLBits Fsm ps2 diagram (from the site), the states are labeled based on what has been received... Actually the FSM diagram for "fsm_ps2" shows: state "BYTE1" -> if in[3] then "BYTE2"? Hmm.
+
+Let me think about it as: The state indicates which byte we are CURRENTLY looking for / received.
+
+Hmm, I recall the diagram: 
+- There's a start-ish state, and arrows labeled with conditions.
+
+Actually, let me just reason about the requirement again and think about how a natural Moore FSM produces done one cycle after byte3.
+
+Natural design: 
+- S0: waiting for byte1.
+- S1: received byte1, waiting for byte2.
+- S2: received byte1&2, waiting for byte3.
+- S3: received byte1&2&3 -> done.
+
+Entering S3 happens at the posedge that samples byte3. So done (state==S3) is high the cycle AFTER the cycle in which byte3 was presented... 
+
+Wait, let's be careful about "the cycle in which byte3 was received". If byte3 is present on `in` during cycle N (i.e., between posedge N and posedge N+1), then it is sampled at posedge N+1, and state becomes S3 during cycle N+1. done high during cycle N+1 = "cycle immediately after the cycle in which byte3 appeared"? Hmm.
+
+Hmm, I think there's an ambiguity: "the cycle immediately after the third byte was successfully received". Received at posedge N (when sampled). Cycle immediately after = cycle N+1... but state S3 is entered AT posedge N (becomes effective right after posedge N), so state= S3 during cycle N to N+1. Ugh.
+
+OK let's just use the waveform to nail it down. In the waveform, byte3=09 appears at t=35. done=1 at t=45. So done appears 10ns (one clock period) after byte3 appears. So if byte3 "is present during cycle [35,45)" then done is present during cycle [45,55).
+
+Under the state machine S0..S3: byte3 present during [35,45), sampled at posedge 45, state becomes S3 during [45,55), done=1 then. So done = registered, asserted when state==S3, but state S3 is entered at posedge 45. Hmm, that requires the transition to S3 to happen at posedge 45, i.e., byte3 is sampled at posedge 45.
+
+Alternatively, if byte3 is sampled at posedge 35, then state S3 during [35,45), done during [35,45), which is not matching.
+
+So the answer: the input byte must be sampled at the posedge that occurs one cycle after it's presented? That doesn't make sense either.
+
+Hmm, I think the resolution: the waveform's "in" values at time t represent the value in the cycle ending at the posedge? Let me just define: the value of `in` displayed at t means in is that value at time t. The posedge at t samples the value just before t (setup). Since in changes at exactly t, the sampled value at posedge t is the value listed at t-5? Let's test.
+
+in listed: at t=10, in=0; at t=15, in=2c. If posedge at 15 samples in just before 15, that's in=0 (from [10,15) if it changed at 15... no, value at t=10 and t=15 differ). Hmm confusing.
+
+Actually maybe in changes at t=10 (negedge) and the table shows: t=10 in=0 (just changed?), t=15 in=2c. So in changes at 0, 15, 25,... hmm.
+
+I think the cleanest: The table shows in changing at 15, 25, 35,... and these are the posedge times. This is typical of an HDLBits-style testbench where inputs are assigned with blocking assignments inside `initial` at times that coincide with posedges, but there might be a `#1` or the values are driven such that the DUT sees them at the NEXT edge.
+
+Hmm, let me look at the first rows again:
+```
+0ns    0   1    0  x
+5ns    1   1    0  0
+```
+At t=0, clk=0, rst=1, done=x. At t=5, clk=1, rst=1, done=0. So done becomes 0 at t=5 (after reset at posedge 5). Note out_bytes=x at both (reset value unknown/x until... hmm out_bytes shows x at t=5 too but done=0).
+
+At t=10, clk=0. done=0. At t=15, clk=1, rst=0. So the reset is released at t=10 or 15.
+
+Hmm, rst=1 at t=5, rst=0 at t=15. So rst deasserts at t=15 (or between 10 and 15). At posedge 15, rst is... if it changed at 15, race. Probably the testbench sets rst=0 at negedge t=10, so at posedge 15 rst=0. But the table shows rst=1 at t=10 and 0 at 15? Let's see: t=0 rst=1, t=5 rst=1, t=10 rst=1, t=15 rst=0. So rst changes at 15.
+
+OK so both rst and in change at t=15. So the testbench drives inputs at posedge times (or the table lists "value at this time" as the value at the sampling instant right at the edge where new values appear). 
+
+Given the pattern, I believe the testbench drives inputs AT the posedge, and the DUT samples the value at the posedge — but since they're driven simultaneously, the value that wins is ambiguous. In practice, HDLBits testbenches for these FSM problems typically use:
+
+```
+initial begin
+    clk = 0;
+    reset = 1;
+    ...
+    #10 reset = 0;
+    ...
+end
+always #5 clk = ~clk;
+```
+
+Hmm, with clk starting at 0, #5 clk=1, #10 clk=0, #15 clk=1. And inputs changed with #15 etc. But out of an initial block with blocking assignments, if `#15 in = 8'h2c;` runs at t=15, and clk also rises at t=15 (via the always #5), then there's a race. Verilog would order them by the event queue... unpredictable.
+
+This is getting too deep. Let me step back and think about what the ACTUAL reference implementation is and replicate it exactly. Because the test compares DUT outputs to reference outputs cycle by cycle. If I implement the same FSM, it'll match regardless of the testbench's race semantics (as long as my FSM is identical).
+
+So the key: replicate the canonical HDLBits solution exactly.
+
+Let me recall the canonical solution for HDLBits `fsm_ps2data`. Let me search memory...
+
+The HDLBits problem "Fsm ps2" (115 or so) and "Fsm ps2data" (116). 
+
+The FSM for ps2 (from the site's diagram): states: 
+- **Byte1** – waiting/detecting
+- Hmm.
+
+Actually, I found it. The HDLBits solution by "HDLBits" (the reference) is not public, but many solutions exist. A very common accepted solution:
+
+```verilog
+module top_module(
+    input clk,
+    input [7:0] in,
+    input reset,
+    output [23:0] out_bytes,
+    output done);
+    
+    reg [1:0] state, next_state;
+    reg [23:0] data;
+    
+    always @(posedge clk) begin
+        if (reset) state <= 2'b00;
+        else state <= next_state;
+    end
+    
+    always @(*) begin
+        case (state)
+            2'b00: next_state = in[3] ? 2'b01 : 2'b00;
+            2'b01: next_state = 2'b10;
+            2'b10: next_state = 2'b11;
+            2'b11: next_state = in[3] ? 2'b01 : 2'b00;
+        endcase
+    end
+    
+    always @(posedge clk) begin
+        case (state)
+            2'b00: data[23:16] <= in;
+            2'b01: data[15:8] <= in;
+            2'b10: data[7:0] <= in;
+            2'b11: data[23:16] <= in;
+        endcase
+    end
+    
+    assign done = (state == 2'b11);
+    assign out_bytes = data;
+endmodule
+```
+
+Hmm, with this, when in state 2'b00 (waiting), at posedge we store in into data[23:16]. Then state becomes 01. Wait, but we store in[23:16] while in state 00, meaning the byte1. Then in state 01 (byte2), store in[15:8]. Then state 10 (byte3), store in[7:0]. Then state 11: done=1, out_bytes = {b1,b2,b3}. And in state 11, store in into data[23:16] for the next message's byte1 (since state 11 checks in[3]).
+
+Hmm, but wait: in state 11, the current in could be byte1 of next message if in[3]=1, else it's a discarded byte. By storing in into data[23:16] unconditionally in state 11, if the byte is discarded (in[3]=0), then data[23:16] would hold garbage, but then state goes to 00 and in state 00 it stores the new in into data[23:16] anyway. So it's fine — the discard overwrites.
+
+Hmm, actually careful: state 11 -> if in[3]=1, next_state=01 and we should store in as byte1. In state 01, we store in into data[15:8]. So we'd need in stored as byte1 in state 11.
+
+Wait, there's an inconsistency. Let me redo: The state during cycle N is the state entered at posedge N. The byte present during cycle N is in. 
+
+Timeline for canonical:
+- posedge 1: reset released, state=S0.
+- During cycle with state S0, in=2c (byte1). At next posedge, next_state=S1, and in S0 we stored data[23:16]<=in=2c. 
+
+Hmm wait, but at the posedge that transitions, we also do the data store based on the CURRENT state S0. So data[23:16] = 2c. Then state becomes S1.
+
+- During cycle state=S1, in=81. At posedge: next_state=S2, data[15:8]<=81.
+- During cycle state=S2, in=09. At posedge: next_state=S3, data[7:0]<=09.
+- During cycle state=S3: done=1, out_bytes={2c,81,09}. And in=6b (next byte1). At posedge: next_state = in[3]?S1:S0 = S1, and data[23:16]<=6b (because state S3 stores into data[23:16]).
+
+Wait, but then data[23:16]=6b is stored at the posedge when we're still in state S3. Then in state S1, we store data[15:8]<=in. So byte1=6b correctly captured. 
+
+- During cycle state=S1, in=0d: at posedge, data[15:8]<=0d, next_state=S2.
+- state=S2, in=8d: at posedge, data[7:0]<=8d, next_state=S3.
+- state=S3: done=1, out=6b0d8d. ✓
+
+So the timing: done is high during the cycle when state=S3, which is the cycle BEFORE the posedge where byte1 of the next message is present.
+
+Now, in the waveform: byte1 of message1 (2c) is present at t=15. Then done at t=45. Let's map: cycle state S0 has in=2c. If in=2c is present during [15,25), then cycle S0 = [15,25), S1=[25,35) with in=81, S2=[35,45) with in=09, S3=[45,55) with in=6b, done=1. out=2c8109. ✓✓✓ And in=[6b] during S3 = [45,55). Then S1=[55,65) with in=0d. etc.
+
+So this matches the waveform perfectly IF in values are aligned as: in during cycle [15,25)=2c, [25,35)=81, [35,45)=09, [45,55)=6b, [55,65)=0d, [65,75)=8d, [75,85)=6d, ...
+
+And the table lists in=2c at t=15 and t=20 (i.e., [15,25)), in=81 at t=25,30 ([25,35)), in=09 at 35,40, in=6b at 45,50. ✓ 
+
+And done=1 at t=45,50 = [45,55). ✓ 
+
+So the canonical solution with the state meaning "the byte present during this cycle is being stored as part of the current state's role" — done at S3 which is the cycle where in is the potential byte1 of next message.
+
+Wait, that's a bit odd: in state S3, done is high and the byte1 of the next message (if in[3]=1) is present. But the spec says "signal the receipt of a message once all 3 bytes have been received (done). The FSM should signal done in the cycle immediately after the third byte." Third byte=09 present during [35,45). Cycle immediately after = [45,55). done high there. ✓.
+
+Great. So the canonical solution: 4 states, done=(state==S3), state transitions:
+- S0: in[3] ? S1 : S0
+- S1: S2
+- S2: S3
+- S3: in[3] ? S1 : S0
+
+And data storage:
+- S0: data[23:16] <= in
+- S1: data[15:8] <= in
+- S2: data[7:0] <= in
+- S3: data[23:16] <= in
+
+Wait, but hold on: in S0, we store in into data[23:16] unconditionally. In S0, if in[3]=0, we discard and stay in S0 — storing garbage into data[23:16] is fine since it'll be overwritten when we actually get byte1. If in[3]=1, we store byte1 into data[23:16] and go to S1. ✓.
+
+Now, my current DUT is different! Let me look at it:
+
+```verilog
+typedef enum {IDLE, BYTE1, BYTE2, BYTE3} state_t;
+always_ff @(posedge clk) begin
+    if (reset) ...
+    else begin
+        done <= (state == BYTE3);
+        case (state)
+            IDLE: if (in[3]) begin state <= BYTE1; b1 <= in; end
+            BYTE1: state <= BYTE2; b2 <= in;
+            BYTE2: state <= BYTE3; b3 <= in;
+            BYTE3: out_bytes <= {b1,b2,b3}; if (in[3]) begin state<=BYTE1; b1<=in; end else state<=IDLE;
+        endcase
+    end
+end
+```
+
+Here done is REGISTERED, so done <= (state==BYTE3) means done is high one cycle after state==BYTE3, i.e., two cycles after... let's trace:
+
+- Cycle [15,25): state=IDLE, in=2c -> at posedge 25: state<=BYTE1, b1<=2c, done<=0.
+- Cycle [25,35): state=BYTE1, in=81 -> at posedge 35: state<=BYTE2, b2<=81, done<=0.
+- Cycle [35,45): state=BYTE2, in=09 -> at posedge 45: state<=BYTE3, b3<=09, done<=0.
+- Cycle [45,55): state=BYTE3, in=6b -> at posedge 55: out_bytes<={2c,81,09}, done<=1, state<=BYTE1, b1<=6b.
+- Cycle [55,65): state=BYTE1, done=1, out_bytes=2c8109.
+
+So done at [55,65) instead of [45,55). Off by one cycle. That explains the mismatches (1897 of 3117... hmm, that's a lot, more than half).
+
+Hmm, 1897/3117 ≈ 61% mismatches. That seems like a lot for just a one-cycle shift. But if out_bytes is also wrong at times, and done wrong... Actually with a 1-cycle shift on done and out_bytes, you'd expect maybe 2 signals × many cycles. Yeah could be ~60%.
+
+Hmm, wait. Actually there might be something else. Let me reconsider: the "variant C" cue. The task says variant_id "C". Possibly the testbench for variant C is slightly different. And "best_revision" is my current code with 1897 mismatches.
+
+Hmm, but let me reconsider. Actually maybe the shift isn't the only issue. Let me carefully reconsider whether done should be combinational (state==S3) and out_bytes registered such that it's valid during done.
+
+In canonical: out_bytes is a register updated at posedge. During state S3 (the done cycle), out_bytes holds {b1,b2,b3} from the previous update (at the posedge entering S3). Let's verify: at the posedge entering S3, we're in state S2 and we do data[7:0]<=in (byte3). So during S3, data = {b1,b2,b3}. ✓ out_bytes = data valid during done. ✓
+
+Great.
+
+Now my design: it uses b1,b2,b3 separate and computes {b1,b2,b3} at the posedge entering BYTE3. Wait, in my design, BYTE3 is entered at posedge 45 (state<=BYTE3 happening at posedge 45)... no wait.
+
+Let me redo my design's state naming. My states: IDLE (waiting for byte1), BYTE1 (received byte1, waiting for byte2), BYTE2 (received bytes1-2, waiting byte3), BYTE3 (received bytes1-3, done).
+
+Hmm, so my BYTE3 = canonical's S3. In my design, out_bytes is updated at the posedge when state==BYTE3, i.e., entering... wait no. Let me re-trace:
+
+- Cycle [15,25): state=IDLE. posedge 25: state<=BYTE1, b1<=2c.
+- Cycle [25,35): state=BYTE1. posedge 35: state<=BYTE2, b2<=81.
+- Cycle [35,45): state=BYTE2. posedge 45: state<=BYTE3, b3<=09.
+- Cycle [45,55): state=BYTE3. This is the done cycle (canonically). But my done is registered: done <= (state==BYTE3) is evaluated in the always_ff at posedge, using the current state. At posedge 45, state is still BYTE2 (old value), so done <= 0. Hmm, at posedge 55, state=BYTE3 (during [45,55)), so done<=1 at posedge 55. So done high during [55,65). One cycle late. ✓ as I said.
+
+Also out_bytes: in my design, out_bytes <= {b1,b2,b3} happens when state==BYTE3 at the posedge. At posedge 55, state=BYTE3, so out_bytes <= {2c,81,09} at posedge 55, valid during [55,65). Also one cycle late (should be valid during [45,55)).
+
+So my design is just one cycle late on both done and out_bytes. Fix: make done combinational = (state==BYTE3), and update out_bytes at the posedge entering BYTE3 (i.e., when state==BYTE2).
+
+Let me rewrite to match canonical exactly:
+
+```verilog
+module TopModule (
+    input  logic        clk,
+    input  logic        reset,
+    input  logic [7:0]  in,
+    output logic [23:0] out_bytes,
+    output logic        done
+);
+    logic [1:0] state, next_state;
+    logic [23:0] data;
+
+    localparam logic [1:0] BYTE1 = 2'd0, BYTE2 = 2'd1, BYTE3 = 2'd2, DONE = 2'd3;
+
+    always_ff @(posedge clk) begin
+        if (reset) state <= BYTE1;
+        else state <= next_state;
+    end
+
+    always_comb begin
+        case (state)
+            BYTE1: next_state = in[3] ? BYTE2 : BYTE1;
+            BYTE2: next_state = BYTE3;
+            BYTE3: next_state = DONE;
+            DONE:  next_state = in[3] ? BYTE2 : BYTE1;
+            default: next_state = BYTE1;
+        endcase
+    end
+
+    always_ff @(posedge clk) begin
+        if (reset) data <= 24'b0;
+        else case (state)
+            BYTE1: data[23:16] <= in;
+            BYTE2: data[15:8]  <= in;
+            BYTE3: data[7:0]   <= in;
+            DONE:  data[23:16] <= in;
+            default: data <= data;
+        endcase
+    end
+
+    assign done = (state == DONE);
+    assign out_bytes = data;
+endmodule
+```
+
+Here state semantics: BYTE1 means "waiting for/detecting byte1" (the state where we look at in[3]). Hmm, wait, let me re-map to the canonical I derived:
+
+Canonical: S0 = waiting for byte1 (stores in into data[23:16]). S1 = byte2 (stores data[15:8]). S2 = byte3 (stores data[7:0]). S3 = done (stores data[23:16] for next).
+
+In my naming above, BYTE1 corresponds to S0, BYTE2 to S1, BYTE3 to S2, DONE to S3.
+
+Transitions: BYTE1: in[3] ? BYTE2 : BYTE1. i.e., S0 -> in[3]?S1:S0 ✓.
+BYTE2 -> BYTE3 (S1->S2) ✓
+BYTE3 -> DONE (S2->S3) ✓
+DONE -> in[3]?BYTE2:BYTE1 (S3 -> in[3]?S1:S0) ✓
+
+Storage: BYTE1: data[23:16]<=in (S0) ✓. BYTE2: data[15:8]<=in (S1) ✓. BYTE3: data[7:0]<=in (S2) ✓. DONE: data[23:16]<=in (S3) ✓.
+
+done = (state==DONE) ✓.
+
+Let me verify the trace with the waveform:
+
+- Reset at posedge 5: state=BYTE1, data=0.
+- Cycle [15,25): state=BYTE1(S0), in=2c. posedge 25: next_state=BYTE2, data[23:16]<=2c.
+  Wait, careful: at posedge 25, the always_ff for data uses state=BYTE1 (current), so data[23:16]<=in=2c. ✓. And state<=next_state=BYTE2.
+- Cycle [25,35): state=BYTE2(S1), in=81. posedge 35: data[15:8]<=81, state<=BYTE3.
+- Cycle [35,45): state=BYTE3(S2), in=09. posedge 45: data[7:0]<=09, state<=DONE.
+- Cycle [45,55): state=DONE, done=1, out_bytes=data=2c8109 ✓. in=6b. posedge 55: data[23:16]<=6b, state<= (in[3]?BYTE2:BYTE1)=BYTE2.
+- Cycle [55,65): state=BYTE2, in=0d, done=0. posedge 65: data[15:8]<=0d, state<=BYTE3.
+- Cycle [65,75): state=BYTE3, in=8d. posedge 75: data[7:0]<=8d, state<=DONE.
+- Cycle [75,85): state=DONE, done=1, out=6b0d8d ✓. in=6d. posedge 85: data[23:16]<=6d, state<=BYTE2.
+- Cycle [85,95): state=BYTE2, in=12. posedge 95: data[15:8]<=12, state<=BYTE3.
+- Cycle [95,105): state=BYTE3, in=01. posedge 105: data[7:0]<=01, state<=DONE.
+- Cycle [105,115): DONE, done=1, out=6d1201 ✓. in=0d. posedge 115: data[23:16]<=0d, state<=BYTE2.
+- Cycle [115,125): BYTE2, in=76. posedge 125: data[15:8]<=76, state<=BYTE3.
+- Cycle [125,135): BYTE3, in=3d. posedge 135: data[7:0]<=3d, state<=DONE.
+- Cycle [135,145): DONE, done=1, out=0d763d ✓. in=ed. posedge 145: data[23:16]<=ed, state<=BYTE2.
+- Cycle [145,155): BYTE2, in=8c. posedge 155: data[15:8]<=8c, state<=BYTE3.
+- Cycle [155,165): BYTE3, in=f9. posedge 165: data[7:0]<=f9, state<=DONE.
+- Cycle [165,175): DONE, done=1, out=ed8cf9 ✓. in=ce. posedge 175: data[23:16]<=ce, state<=BYTE2.
+- Cycle [175,185): BYTE2, in=c5. posedge 185: data[15:8]<=c5, state<=BYTE3.
+- Cycle [185,195): BYTE3, in=aa. posedge 195: data[7:0]<=aa, state<=DONE.
+- Cycle [195,205): DONE, done=1, out=cec5aa.
+
+All matches the expected waveform pattern.
+
+Now, one concern: what about the reset state's data value? At reset, data=0 and out_bytes=0. The spec says out_bytes don't-care when done is not asserted. The reference solution likely resets data to 0 or leaves it x. If the testbench compares out_bytes only when done=1, it doesn't matter. But if it compares always... Hmm. The task says "You may output anything at other times (i.e., don't-care)." So the checker presumably ignores out_bytes when done=0. Good. But it might still compare... Let me consider: the reference might not reset data (so it stays x), and the checker masks. To be safe, resetting to 0 is fine.
+
+Hmm, but actually there's a subtle risk: if the testbench compares out_bytes at all times (including done=0), then matching the reference exactly matters. But since reference likely has x or 0... The spec explicitly says don't-care, so the scoreboard must mask. OK.
+
+Now the other issue: "variant C". My current revision is variant C and failed with 1897 mismatches. The rejected revision 1237... also had 1897 mismatches (NO_IMPROVEMENT). So both had the same mismatch count — suggesting maybe the shift wasn't the issue, or both had the same fundamental bug pattern.
+
+Hmm, wait: 1897 mismatches out of 3117 checks. If both my versions had identical mismatch counts, they might be functionally identical or nearly so.
+
+Let me reconsider: maybe the fault is different. Let me reconsider the possibility that the testbench for this variant expects a different alignment. Hmm.
+
+Actually, let me reconsider whether my analysis of the "one cycle late" is right given 1897/3117 = 60.9%. With 4 signals possibly checked... Actually checks=3117 might be per-sample per-signal? If each sample checks both done and out_bytes, then 3117 checks isn't a multiple... 3117 is odd. Hmm, 3117 = 3 × 1039 = 3 × 1039. 1039 is prime? 1039/7=148.4, /11=94.5, /13=79.9, /17=61.1, /19=54.7, /23=45.2, /29=35.8, /31=33.5, sqrt~32.2. /37 >32. So 1039 prime. So 3117 = 3*1039.
+
+Hmm, maybe each check is a comparison of the full vector (done+out_bytes) per cycle, and there are 1039 different random tests? No...
+
+Actually the sample_id and variant... Maybe 3117 = number of checks across 1039 test cases × 3 comparisons? Unclear.
+
+Let me not overthink. Let me just fix the design to match the canonical solution and verify.
+
+Actually, hold on. Let me reconsider the mismatch count. If my design is one cycle late on done and out_bytes, then for the many cycles, done mismatches whenever the reference has done=1 but mine has 0 or vice versa. Over a long random stream, done is 1 about 1/3 of the time? Actually done is 1 for 1 out of every 3 cycles (roughly). If mine is shifted by one cycle, then done mismatches at the start and end of every done pulse (2 edges per 3-cycle period) → about 2/3 of the time? Hmm, no: mine's done pulse is shifted by 1, so during a 3-cycle period, reference done=1 for cycle c, mine done=1 for cycle c+1 → mismatch at cycle c (ref=1,mine=0) and c+1 (ref=0,mine=1) → 2 mismatches out of 3 cycles for done. Plus out_bytes mismatches similarly when done is involved... but out_bytes is only compared when done=1 presumably, and if done is wrong, the comparison might be skipped or the out_bytes is wrong.
+
+Anyway, ~60% mismatch is consistent with a one-cycle shift on both signals. Good.
+
+Actually, wait. Let me reconsider. If out_bytes is compared only when ref done=1 or when either done=1... it's a bit unclear. But 60% is plausible.
+
+Hmm, but also the rejected revision 1237 had exactly 1897 mismatches too. If the rejected revision was a different attempt that also had the same off-by-one, that's consistent. Or maybe both revisions were identical in behavior.
+
+Actually the rejected revision's source hash differs, so it's different code but same mismatch count. Could be a different code with same behavior. Whatever.
+
+Let me now also double check: are there other issues, like the "in[3]" check happening in the right state? In canonical, the in[3] check for restarting happens in DONE state (looking at the byte present during the done cycle) and in BYTE1/S0 state.
+
+But wait — there's an important subtlety about the DONE state and the next message. In the waveform, after done at [45,55), the byte1 of the next message is present at [45,55) (in=6b). The FSM in state DONE checks in[3] and goes to BYTE2 (S1) storing data[23:16]<=in in the DONE state. So byte1 is captured during the DONE cycle. ✓.
+
+But what if the byte during the DONE cycle has in[3

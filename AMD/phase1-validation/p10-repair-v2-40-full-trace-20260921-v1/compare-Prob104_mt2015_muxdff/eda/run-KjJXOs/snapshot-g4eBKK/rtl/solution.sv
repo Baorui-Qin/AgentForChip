@@ -1,0 +1,18 @@
+
+module TopModule (
+    input  logic clk,
+    input  logic L,
+    input  logic q_in,
+    input  logic r_in,
+    output logic Q
+);
+
+    logic d;
+
+    assign d = L ? r_in : q_in;
+
+    always_ff @(posedge clk) begin
+        Q <= d;
+    end
+
+endmodule

@@ -1,0 +1,115 @@
+We need answer only DUT between [BEGIN] and [DONE]. Need implement dual-edge triggered flip-flop equivalent in SystemVerilog for FPGA synthesis. Need think carefully.
+
+Spec: TopModule clk, d, q. Dual-edge triggered FF triggers on both edges. Can't use always @(posedge clk or negedge clk). Build circuit functionally behaves like dual-edge triggered FF.
+
+Common solution: Use two flip-flops, one posedge, one negedge, then mux based on clock level. There is a known Verilog solution:
+
+reg q_pos, q_neg;
+always @(posedge clk) q_pos <= d;
+always @(negedge clk) q_neg <= d;
+assign q = clk ? q_pos : q_neg;
+
+Let's verify functionality. On posedge, clk becomes 1, q_pos captures d, q_neg holds previous negedge capture. Output q = clk ? q_pos : q_neg. After posedge, clk=1 so q=q_pos = d sampled at posedge. On negedge, clk becomes 0, q_neg captures d, output q = q_neg = d sampled at negedge. Between edges, clk stable: if clk=1, q=q_pos (holds posedge value). If clk=0, q=q_neg (holds negedge value). Works as dual-edge FF. However, there may be a hazard/glitch due to q_pos and q_neg updating around edge, but functionally correct in simulation. In real FPGA, this is proper.
+
+Alternative solution uses XOR: q = q_pos ^ q_neg ^ clk? Let's recall: For dual edge, use two FFs and XOR with clock maybe. Actually well-known "dual-edge FF using two single-edge FFs and a multiplexer" as above. Some use XOR: q = clk ? q_pos : q_neg. Yes.
+
+Need ensure output declared as wire or logic. TopModule ports as specified. SystemVerilog. Could use always_ff? The instruction says SystemVerilog. But always @(posedge clk) is legal, negedge legal. Need not use illegal sensitivity. Should we use nonblocking assignments. Yes.
+
+Potential issue: In simulation, q_pos and q_neg may be uninitialized (X) until edges occur. That's acceptable; real FF starts X. But maybe test expects q after edges. If d known at time 0, then posedge? Typically clock starts 0. On first posedge q_pos captures d, q = d. On first negedge q_neg captures d, q = d. So fine.
+
+Should we add initial? No.
+
+Need return exactly [BEGIN] ... [DONE] with code. No explanation. We can include module.
+
+Let's consider if "all input and output ports are one bit unless otherwise specified" – q output. Use output logic q? Then assign q = ...? We can declare output q and wire? In SystemVerilog, output logic q and assign? Actually if we assign to q with continuous assign, q should be net type (wire) or we can use always_comb? Simpler: output q; wire q_pos, q_neg; assign q = clk ? q_pos : q_neg; reg q_pos, q_neg; But in SystemVerilog, reg is allowed but logic preferred. However, we need ensure proper types. Module:
+
+module TopModule(
+    input  logic clk,
+    input  logic d,
+    output logic q
+);
+
+logic q_pos, q_neg;
+
+always_ff @(posedge clk) q_pos <= d;
+always_ff @(negedge clk) q_neg <= d;
+
+assign q = clk ? q_pos : q_neg;
+
+endmodule
+
+This should be fine. But wait: always_ff with negedge clk is legal. The spec prohibited always @(posedge clk or negedge clk) but separate always_ff blocks are fine.
+
+Alternatively, some synthesis tools may not allow always_ff with negedge? They do. And xczu3eg supports negedge FF? Yes.
+
+Potential issue: output logic q assigned via continuous assign? In SystemVerilog, a variable (logic) can be driven by continuous assignment? Actually, a logic variable can be driven by a single continuous assignment, but it's a variable, and continuous assignment to a variable is allowed in SystemVerilog? Let's recall: In Verilog, output reg cannot be driven by assign. In SystemVerilog, logic is a 4-state type that can be driven by either continuous assignment or procedural assignment, but not both. So assign q = ... is fine if q is logic. Yes, SystemVerilog allows continuous assignment to a variable. But some tools may warn. To be safe, declare output q; wire q_pos, q_neg; reg q_pos, q_neg; then assign q. But SystemVerilog prefers logic. I can declare output wire q? The interface doesn't specify type, just output q. In SystemVerilog, output q defaults to wire if not specified? Actually in SystemVerilog, if you use `output q`, it's a net of default type? I think port kind default is `wire` for `output` if not specified? Wait, SystemVerilog allows `output logic q` or `output q`. If you just say `output q`, it is a net of type `wire` by default? In Verilog-2001, output defaults to wire. In SystemVerilog, if you omit the data type, it defaults to `logic`? Let's recall: SystemVerilog: "If the port kind is omitted, it defaults to inout. If the data type is omitted, it defaults to logic if the port kind is input, and to wire if output or inout"? I'm not 100% sure. Actually, SystemVerilog: "The default port kind is inout for input/output? For input, default type is net? Let's check memory: In SystemVerilog, if you declare `input clk`, it's a net (wire) by default? Or logic? I think it defaults to `logic` for input and `wire` for output? Wait, the standard says: For input and inout ports, the default type is `wire` (net). For output ports, the default type is `wire` as well? Actually, in SystemVerilog, if you use `output logic q`, it's a variable. If you just say `output q`, it's a net of default net type (wire). So assign q = ... is fine. But to be explicit, I'll use `output logic q` and use `assign q = ...`. That is legal in SystemVerilog: continuous assignment to a variable is allowed, but only one driver. However, some older tools might complain. Alternatively, use `output wire q` and internal logic for q_pos/q_neg. That's safe.
+
+Let's write:
+
+module TopModule(
+    input  logic clk,
+    input  logic d,
+    output wire  q
+);
+
+logic q_pos, q_neg;
+
+always_ff @(posedge clk) begin
+    q_pos <= d;
+end
+
+always_ff @(negedge clk) begin
+    q_neg <= d;
+end
+
+assign q = clk ? q_pos : q_neg;
+
+endmodule
+
+This is clean. Always_ff is SystemVerilog. The constraints say SystemVerilog. Good.
+
+Check functional behavior: At posedge, clk changes 0->1. q_pos updates to d. q_neg holds previous. q = clk ? q_pos : q_neg = q_pos = d. At negedge, clk 1->0. q_neg updates to d. q_pos holds. q = clk ? q_pos : q_neg = q_neg = d. Between edges, clk stable, q holds appropriate value. So behaves as dual-edge FF.
+
+One subtlety: What about simultaneous d changes near clock edge? Setup/hold times. The circuit has two FFs with different clock edges, so d must be stable around both edges for correct behavior. That's inherent to dual-edge FF. The spec just says functionally behaves like dual-edge triggered flip-flop. So fine.
+
+Could there be a glitch at the output when clk transitions? At posedge, clk goes 0->1, q initially = q_neg (old), then clk becomes 1, q becomes q_pos. But q_pos updates slightly after clk edge (nonblocking). In simulation, if q_pos updates at same time as clk, the mux select is clk. Actually, the continuous assign q = clk ? q_pos : q_neg. When clk changes, q may momentarily be q_neg then q_pos? Let's analyze: At posedge, clk changes from 0 to 1. Before edge, clk=0, q = q_neg. At the same simulation time, clk becomes 1, q_pos updates to d. The order of evaluation: In Verilog, nonblocking assignments update in NBA region, continuous assignments evaluate in active region? The mux select is clk. When clk changes, the continuous assign will re-evaluate. q_pos might not have updated yet (NBA region). So for a delta cycle, q could be old q_pos? Actually, before posedge, clk=0, q = q_neg. When clk changes to 1, the continuous assign triggers, reads q_pos (which is still old value because q_pos updates in NBA region later). So q might momentarily become old q_pos, then after NBA, q_pos updates to d, and q updates to new q_pos. This causes a delta-cycle glitch in simulation, but in real hardware, the mux select changes after the FF output updates? Actually, in hardware, the posedge FF clock is the same clk. When clk rises, the FF output q_pos changes after some delay. The mux select also changes. Depending on delays, there could be a hazard. But standard solution is accepted for this problem. The problem likely expects exactly this.
+
+Another known solution uses XOR: q = q_pos ^ q_neg ^ clk. Let's check if that avoids glitch? Actually, q = clk ? q_pos : q_neg can be rewritten as q = clk ? q_pos : q_neg = (clk & q_pos) | (~clk & q_neg). That's mux. The XOR version: q = q_pos ^ q_neg ^ clk? Let's test. If clk=1, q = q_pos ^ q_neg ^ 1 = ~(q_pos ^ q_neg). Not equal to q_pos unless q_neg = 0. So not general. I recall a dual-edge FF using XOR: q = q_pos ^ q_neg ^ clk, but with q_neg capturing d on negedge and q_pos capturing d on posedge? Let's derive: We want q = d at both edges. Suppose q_pos captures d on posedge, q_neg captures d on negedge. At posedge, clk=1, q should be q_pos. At negedge, clk=0, q should be q_neg. So q = clk ? q_pos : q_neg. That's the mux. XOR version might be for something else. So mux is correct.
+
+We should output exactly one complete DUT between [BEGIN] and [DONE]. No explanation. So final:
+
+[BEGIN]
+module TopModule(
+    input  logic clk,
+    input  logic d,
+    output wire  q
+);
+
+    logic q_pos, q_neg;
+
+    always_ff @(posedge clk) begin
+        q_pos <= d;
+    end
+
+    always_ff @(negedge clk) begin
+        q_neg <= d;
+    end
+
+    assign q = clk ? q_pos : q_neg;
+
+endmodule
+[DONE]
+
+Check if any constraints: 5 ns synthesis clock, simulator seed 1. No reference dependencies. Single self-contained. Good.
+
+One potential issue: Some synthesizers may not support always_ff with negedge? They do. But to be safe, could use always @(posedge clk) and always @(negedge clk) which is standard Verilog. SystemVerilog allows always_ff. The problem says SystemVerilog. So always_ff is fine.
+
+But wait: The problem says "using an always @(posedge clk or negedge clk) is not accepted as a legal sensitivity list." That implies we can use separate always blocks with single edge. So fine.
+
+Let's double-check the interface: TopModule with input clk, input d, output q. All one bit. My module matches.
+
+Should I use `output logic q` and `assign q`? I used `output wire q`. That's fine. The port direction is output, width 1. Type wire is fine.
+
+Is there any requirement that q should be a flip-flop output? It's a combinational mux after two FFs. That's the standard.
+
+Thus final.

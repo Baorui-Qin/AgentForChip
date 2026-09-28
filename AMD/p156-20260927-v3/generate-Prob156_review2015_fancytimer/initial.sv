@@ -1,0 +1,87 @@
+
+module TopModule (
+    input  clk,
+    input  reset,
+    input  data,
+    output [3:0] count,
+    output counting,
+    output done,
+    input  ack
+);
+
+    localparam SEARCH = 2'd0;
+    localparam READ   = 2'd1;
+    localparam COUNT  = 2'd2;
+    localparam DONE   = 2'd3;
+
+    reg [1:0] state;
+    reg [3:0] shift_reg;
+    reg [3:0] delay_shift;
+    reg [3:0] delay_cnt;
+    reg [9:0] cycle_cnt;
+    reg [1:0] bit_count;
+
+    assign counting = (state == COUNT);
+    assign done     = (state == DONE);
+    assign count    = (state == COUNT) ? delay_cnt : 4'b0000;
+
+    always @(posedge clk) begin
+        if (reset) begin
+            state       <= SEARCH;
+            shift_reg   <= 4'b0000;
+            delay_shift <= 4'b0000;
+            delay_cnt   <= 4'b0000;
+            cycle_cnt   <= 10'd0;
+            bit_count   <= 2'd0;
+        end else begin
+            case (state)
+                SEARCH: begin
+                    shift_reg <= {shift_reg[2:0], data};
+                    if ({shift_reg[2:0], data} == 4'b1101) begin
+                        state       <= READ;
+                        bit_count   <= 2'd0;
+                        delay_shift <= 4'b0000;
+                    end
+                end
+
+                READ: begin
+                    if (bit_count == 2'd3) begin
+                        delay_cnt <= {delay_shift[2:0], data};
+                        state     <= COUNT;
+                        cycle_cnt <= 10'd0;
+                    end else begin
+                        delay_shift <= {delay_shift[2:0], data};
+                        bit_count   <= bit_count + 1'b1;
+                    end
+                end
+
+                COUNT: begin
+                    if (cycle_cnt == 10'd999) begin
+                        cycle_cnt <= 10'd0;
+                        if (delay_cnt == 4'd0) begin
+                            state <= DONE;
+                        end else begin
+                            delay_cnt <= delay_cnt - 1'b1;
+                        end
+                    end else begin
+                        cycle_cnt <= cycle_cnt + 1'b1;
+                    end
+                end
+
+                DONE: begin
+                    if (ack) begin
+                        state       <= SEARCH;
+                        shift_reg   <= 4'b0000;
+                        delay_shift <= 4'b0000;
+                        delay_cnt   <= 4'b0000;
+                        cycle_cnt   <= 10'd0;
+                        bit_count   <= 2'd0;
+                    end
+                end
+
+                default: state <= SEARCH;
+            endcase
+        end
+    end
+
+endmodule

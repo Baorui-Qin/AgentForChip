@@ -1,0 +1,931 @@
+Let me analyze this problem carefully.
+
+The task: Implement an FSM for serial receiver. RS-232 style: idle line at 1. Start bit = 0, then 8 data bits, then stop bit = 1.
+
+The reference FSM (this is a known problem from HDLBits "Fsm serial" - Prob137). Let me recall the standard solution.
+
+Actually the standard HDLBits problem "Fsm serial" has a state machine. Let me think about the expected timing of `done`.
+
+The known reference solution for HDLBits Fsm serial:
+
+```
+module top_module(
+    input clk,
+    input in,
+    input reset,
+    output done
+); 
+    parameter IDLE=0, START=1, DATA=2, STOP=3, ERROR=4, DONE_ST=5;
+    ...
+```
+
+Hmm, let me think about the actual mismatch. First mismatch at time 110, done_ref=1, done_dut=0.
+
+Let me think about the state machine behavior expected. The typical solution:
+
+States: IDLE, START, DATA (with counter 0..7), STOP, DONE(state), WAIT.
+
+Actually let me recall the standard HDLBits solution. The problem "Fsm serial" - the reference expects `done` to be high for one cycle when stop bit correctly received.
+
+Hmm. The issue is likely the timing of the done signal and the state transitions. Let me think.
+
+Common subtlety: In the standard solution:
+
+- IDLE: if in==0 (start bit), go to DATA, bit_cnt=0? Actually wait.
+
+Let me think about the bit sequence. Idle=1. Start bit=0 at some cycle. Then data bits d0..d7, then stop bit=1.
+
+A common implementation:
+```
+always @(posedge clk) begin
+  if (reset) state <= IDLE;
+  else case(state)
+    IDLE: if (!in) state <= DATA; // start bit detected, but also need to consume? 
+    ...
+```
+
+Actually there's a subtlety: when we see the start bit (in==0) in IDLE, we transition. That cycle the in is the start bit. Then next cycle is d0. We need to count 8 data bits.
+
+Let me look at the standard reference solution from HDLBits:
+
+```
+module top_module(
+    input clk,
+    input in,
+    input reset,    // Synchronous reset
+    output done
+); 
+
+    reg [3:0] state, next_state;
+    reg [3:0] cnt;
+    ...
+```
+
+Hmm, actually there's a known reference. Let me think about the first mismatch more concretely.
+
+The waveform: at time 105, clk=1, in=0, reset=0, done_ref=1, done_dut=0. At time 115, clk=1, in=0, done_ref=0, done_dut=0.
+
+So done_ref went high at time 105 (a posedge? timescale 1ps, so clock period maybe... the clock seems to have transitions). Actually at time 105 clk=1 and at time 110 clk=0 and at 115 clk=1. So clock period is 10 (from 105 to 115). So clock edges at 105, 115, ... positive edges at 105, 115. At time 105, in=0, done_ref=1. This is the value after the posedge at 105 (end-of-timestamp value).
+
+Hmm, times are in ps? "Simulation finished at 4526 ps". 905 samples. If clock period is 10ps... that's weird, more likely 10ns but shown as 1ps timescale. Whatever. 905 samples / ... The clock toggles every 5 units. Actually from 105 to 110 to 115, that's 5 units per half period, period 10 units.
+
+First failure at time 110, first mismatch at 110. But waveform shows mismatch at 105 too (tb_mismatch=1 at 105). Hmm the "first_time":110 in the hint, but waveform sample at 105 shows tb_mismatch=1. Anyway.
+
+Actually let's focus: done_ref=1 at time 105 with in=0. Hmm, if done is asserted while in=0? That's odd because done should be when stop bit (in=1) verified.
+
+Hmm wait, maybe at time 105 it's the cycle after the stop bit. Let me think about timing.
+
+Actually, let's reconsider. Maybe the reference asserts done on the cycle when the stop bit is sampled. Let me think.
+
+Let me reconstruct: The reference design. Let me find HDLBits Fsm serial solution.
+
+I recall the HDLBits "Fsm serial" problem. Standard solution involves states and the done output. There's a known answer:
+
+```verilog
+module top_module(
+    input clk,
+    input in,
+    input reset,    // Synchronous reset
+    output done
+); 
+    parameter IDLE=0, DATA=1, STOP=2, DONE_S=3, WAIT=4;
+```
+
+Hmm.
+
+Actually, this is from HDLBits "Fsm serial" which has a companion "Fsm serialdata" and "Fsm serialdp". The base FSM:
+
+From HDLBits, the state diagram (this is a well-known one):
+
+States: IDLE, START (detect start bit), then 8 data bits counted, then STOP, and DONE.
+
+Actually let me recall from the HDLBits website. The problem "Fsm serial" provides a state diagram image. Let me recall: The FSM has states. From the diagram:
+
+- IDLE: in=1 -> stay IDLE; in=0 -> "start" transition to a counting state.
+- It counts 8 data bits.
+- Then STOP state: if in==1, go to DONE; else go to WAIT.
+
+Hmm actually the HDLBits implemented version. Let me recall the actual reference implementation from HDLBits "Fsm serial" (there's an "Fsm serialdata" follow-up). I think the reference uses a bit counter.
+
+The standard solution I've seen:
+
+```
+module top_module(
+    input clk,
+    input in,
+    input reset,
+    output done
+);
+    reg [3:0] state;
+    reg [3:0] count;
+    localparam IDLE=0, START=1, DATA=2, STOP=3, DONE_S=4, WAIT=5;
+
+    always @(posedge clk) begin
+        if (reset) begin
+            state <= IDLE;
+            count <= 0;
+        end else begin
+            case (state)
+                IDLE: if (!in) begin state <= DATA; count <= 0; end
+                DATA: begin
+                    count <= count + 1;
+                    if (count == 7) state <= STOP;
+                end
+                STOP: begin
+                    if (in) state <= DONE_S;
+                    else state <= WAIT;
+                end
+                DONE_S: begin
+                    state <= in ? IDLE : DATA; // ??? 
+                end
+                WAIT: if (in) state <= IDLE;
+            endcase
+        end
+    end
+    assign done = (state == DONE_S);
+```
+
+Hmm. The key question is the exact cycle-by-cycle alignment.
+
+Let me think about the standard behavior expected. `done` should be high for exactly one cycle per correctly received byte.
+
+Let me simulate mentally the bit stream: idle 1,1, then start 0, then d0..d7, then stop 1.
+
+The reference: 
+- Cycle t0: in=1, IDLE.
+- Cycle t1: in=0 (start bit). FSM in IDLE sees in=0. Transition to DATA (or a "start" registered). count reset.
+  
+Actually there's the question: does the FSM sample the start bit and then immediately start counting, or is there a separate cycle?
+
+Consider that the receiver samples mid-bit ideally, but here it's just clocked on each bit.
+
+Let me count needed cycles: idle -> detect start at t1 -> data bits d0 at t2 ... d7 at t9 -> stop bit at t10 -> done at t11?
+
+Hmm. If FSM in IDLE at t1 sees in=0, moves to DATA. At t2, DATA state, samples in=d0, count. At t3 samples d1,... at t9 samples d7 (8th bit). Then at t10, STOP state samples stop bit. If stop=1, done. done could be asserted during t10 (combinational from STOP state? no) or at t11 as a registered state.
+
+The standard HDLBits solution asserts done in the DONE state. Let me think: there's a state DONE. After STOP confirms in==1, transition to DONE state where done=1. Then from DONE, if in==1 go to IDLE, else go to... hmm.
+
+Hmm actually, wait. Let me reconsider — maybe the reference counts such that done is asserted one cycle after stop bit.
+
+Let me instead compare to what the reference output looks like: done_ref=1 at time 105 while in=0. Hmm if done is high and the current input `in` is 0, that suggests done is high during a "DONE" state, and at that time in=0 means the stop bit ended and now... no.
+
+Actually maybe at time 105, in=0 because... let me think. Actually maybe the input sequence: The waveform sample might be mid-bit.
+
+Alternatively, perhaps the reference asserts done when the stop bit is present, i.e., state STOP with in==1 -> done=1 combinationally. But then done_ref would be 1 when in=1.
+
+Hmm, at time 105, in=0 and done_ref=1. Contradiction. Unless the input at the sampled time is not the stop bit.
+
+Let me think differently: maybe done is asserted in IDLE? No.
+
+Let me reconsider: maybe the tb uses a random bit stream, and the first mismatch is at a spot where a byte was just received.
+
+Let me think about the exact reference from HDLBits. I'll try to recall the "Fsm serial" solution posted widely.
+
+Actually there's a well-known solution with states: IDLE, START, RX (with counter), STOP, DONE, WAIT. Let me search memory...
+
+I found it: HDLBits Fsm serial reference solution (by many):
+
+```verilog
+module top_module(
+    input clk,
+    input in,
+    input reset,
+    output done
+);
+    reg [3:0] state, next;
+    reg [3:0] cnt;
+    parameter IDLE=0, START=1, DATA=2, STOP=3, DONE=4, WAIT=5;
+    ...
+```
+
+Honestly I should reason about timing rather than recall.
+
+Alternative approach: maybe the issue is that done should be high for exactly one cycle, but in the current DUT, DONE state transitions based on `in`. Let's trace the current DUT:
+
+Current DUT:
+- IDLE: next = in ? IDLE : START; bit_cnt reset to 0.
+- START: next = DATA; bit_cnt reset to 0.
+- DATA: next = (bit_cnt==7)? STOP : DATA; bit_cnt increments.
+- STOP: next = in ? DONE : WAIT.
+- DONE: next = in ? IDLE : START.
+- WAIT: next = in ? IDLE : WAIT.
+- done = (state==DONE).
+
+Let's trace bit stream: idle (1 at t0), start (0 at t1), d0..d7 (t2..t9), stop (1 at t10), then next byte...
+
+t0: state=IDLE, in=1. next=IDLE. bit_cnt=0.
+t1: state=IDLE, in=0. next=START. (bit_cnt gets 0)
+t2: state=START, in=d0. next=DATA. bit_cnt=0.
+t3: state=DATA, in=d1, bit_cnt=0 -> increments to1, next=DATA.
+...
+t3..t10: DATA state for 8 cycles sampling d1..d8? Wait.
+
+Let me recount. At t2 START samples in=d0 (start bit was at t1, d0 at t2). Hmm the code in START just goes to DATA, not consuming a data bit. At t3 state=DATA samples in=d1, bit_cnt 0->1. At t4 samples d2, cnt1->2. t5 d3 cnt2->3. t6 d4 cnt3->4. t7 d5 cnt4->5. t8 d6 cnt5->6. t9 d7 cnt6->7. Now bit_cnt==7 -> at t10 next=STOP. At t10 state=DATA samples d8?? Wait there is no d8; the stop bit is 1.
+
+Hmm, we have 8 data bits d0..d7 at t2..t9. At t3..t9 that's 7 cycles of data (d1..d7) plus t2 is d0 in START. So the FSM consumes d0 in START (without counting), then counts d1..d7 = 7 bits, then at t10 (which is the stop bit) it's still DATA and increments count to... let's see: at t9, cnt=6->7. At t10, state=DATA, in=stop(1), executes DATA branch: since cnt==7, next=STOP, and cnt increments to 8. So it consumed the stop bit as a data bit! Bug.
+
+So there's an off-by-one: START consumes d0 without counting. That means only 7 data bits counted in DATA. So the stop bit gets treated as the 8th data bit. That's the bug.
+
+Wait, but actually the intent of the START state: in IDLE when in=0 detected, the start bit is at t1. Then t2 is d0. The FSM transitions IDLE->START at t1 (registered, so state=START at t2). At t2, state=START, in=d0. The START state should transition to DATA. At t3, state=DATA, in=d1, and it should count. Hmm, but that means d0 is consumed by START. So counting d1..d7 is only 7 data bits. To count 8, you'd need to count d0 too, i.e., START should also increment, or DATA counting should span d0..d7.
+
+Actually the intended design: The start bit is detected in IDLE at t1, and the FSM goes to DATA starting at t2 counting d0..d7. So START state is unnecessary—it wastes a cycle. The IDLE -> DATA transition directly, and DATA counts 8 bits d0..d7.
+
+Alternatively, maybe the start bit detection is different: IDLE sees in=0 at cycle where in=start; next state should begin counting data on the following cycles.
+
+So the bug: extra START state consumes one cycle incorrectly. Let's see the timing at t10 with the bug: state=DATA, in=1 (stop), cnt goes 7->8, next=STOP. At t11: state=STOP, in=1 (now idle after stop). STOP: next = in?DONE:WAIT = DONE. Wait but in at t11 = next bit which might be start of next byte (0) or idle (1). Hmm.
+
+Actually with the standard stream sent by testbench, after the stop bit there might be more bytes. Anyway, the current design's done occurs one bit late or misaligned.
+
+Hmm, but the mismatch: done_ref=1 at t=105 with in=0, done_dut=0. And at 115 done_ref=0, done_dut=0.
+
+So at the reference, done was high while in=0 (which could be a start bit of the next byte). That means done is asserted on the cycle where the current input in is 0, i.e., done is high in the state right after stop bit confirmed, and that cycle's input is the first bit after stop (which is 0 = next start bit).
+
+So the reference: stop bit at cycle N (in=1), then done at cycle N+1. At cycle N+1, in = next bit. If bytes are back-to-back, in could be 0 (start of next byte). So done is asserted one cycle after stop.
+
+In the reference, DONE state is asserted after STOP, and at that time input is whatever follows the stop bit.
+
+Now let's figure out exactly the reference counting. Let's define: start bit at cycle s (in=0). d0..d7 at s+1..s+8. stop at s+9. done at s+10.
+
+With the current design: Let's see where done is. We had t1=start. At t1 IDLE->START. t2=START (d0), ->DATA. t3..: DATA counting. Let's compute: DATA at t3,t4,...,? It counts 8 times: t3 (cnt0->1), t4(1->2), t5(2->3), t6(3->4), t7(4->5), t8(5->6), t9(6->7), t10(7-> check next=STOP, cnt->8). So at t10, next=STOP. t11 state=STOP samples input at t11.
+
+t10 input is stop bit? Let's see: start t1, d0 t2,...,d7 t9, stop t10. So at t10, input is stop. DATA at t10 consumed stop as data. t11: input=next bit after stop (idle or next start). STOP state at t11: next = in?DONE:WAIT. t12: state = DONE if in==1. done=1 at t12. Reference done at t11 (s+10 = 1+10 = 11). So current DUT done is one cycle late. Also done might be wrong value depending.
+
+So fix: remove the extra cycle. Essentially the FSM should count 8 data cycles properly and assert done right after the stop bit such that done occurs at s+10 (one cycle after stop bit at s+9).
+
+Wait let me re-derive reference: start s, d0 s+1, ..., d7 s+8, stop s+9, done s+10. So done occurs exactly one cycle after the stop bit cycle.
+
+Hmm, but that means during done cycle, state is DONE and in = bit at s+10. If stream is idle after stop, in=1 at s+10. But observed in=0 at done. So the stream has back-to-back bytes: at s+10 (which is the start bit of the next byte) in=0. Plausible if testbench packs bytes.
+
+OK so we need to design FSM achieving: done high at s+10, and then continue correctly.
+
+Let me design a correct FSM:
+
+States: IDLE, DATA (with counter), STOP, DONE, WAIT.
+
+Behavior:
+- IDLE: if in==1, stay IDLE. If in==0 (start bit at this cycle), set count=0, go to DATA. Note: the current cycle is the start bit; the next cycle is d0.
+- DATA: sample data bits. count goes 0..7. On each DATA cycle, if count==7, next state STOP, else count++. Wait: we need 8 DATA cycles for d0..d7. At s+1 (d0) state should be DATA with count=0 -> next count=1, state DATA. ... at s+8 (d7) state DATA count=7 -> next STOP. Then at s+9 (stop) state STOP.
+- STOP: if in==1 -> DONE (done asserted at s+10), else -> WAIT. Also from STOP, if in==0... it means stop bit was 0, so error, wait for a 1 then go idle.
+- DONE: done=1 (one cycle). Next: if in==1 -> IDLE, else -> DATA? Hmm. From DONE at s+10, the input is at s+10. If in==1, that's idle -> IDLE. If in==0, that's a start bit of the next byte -> should start receiving data. But careful: in DONE state, if we go to DATA, we need count=0 and treat current in as start bit, then next cycle d0.
+
+Hmm, this is where it gets tricky about "wait until it finds a stop bit". Let me reconsider the standard reference.
+
+Actually, let me reconsider. Regarding IDLE detecting start: when in==0 at cycle s (start bit), we go to DATA at s+1. Good.
+
+For DONE: at s+10, in is the bit following stop. If in==0, it's a new start bit; we should go to DATA with count=0 so that s+11=d0. So DONE: next = in ? IDLE : DATA with count reset. If in==1 (idle), go IDLE, and at IDLE if next in==0 it's start.
+
+Hmm wait, but there's subtlety: if DONE goes to DATA directly when in==0, that's consistent with IDLE's behavior of treating in==0 as start. Actually simpler: DONE next = (in==0) ? DATA : IDLE, with count reset when entering DATA. And IDLE: next = (in==0)? DATA : IDLE.
+
+Actually we could merge: from DONE, if in==0 go to DATA (start), else IDLE. From IDLE if in==0 go DATA else IDLE. So DONE behaves like IDLE except done output. Fine.
+
+- WAIT: wait until in==1 (stop bit / idle), then go IDLE? The spec: "If the stop bit does not appear when expected, the FSM must wait until it finds a stop bit before attempting to receive the next byte." So WAIT: if in==1 -> IDLE, else stay WAIT.
+
+But careful: when in WAIT we find a 1, that 1 is the stop bit / line idle. Then we go IDLE, and then detect next start. Actually going to IDLE is fine because from IDLE if in==0 next cycle it's a start.
+
+Hmm, but subtle: from WAIT, if in==1 go IDLE. Then next cycle IDLE samples; if 0, start. Good.
+
+Let me now verify with back-to-back bytes to see if counting aligns.
+
+Let me define the test stream. Standard testbench for this problem likely sends a sequence. But let's just make our FSM match the reference timing: done at s+10 where stop at s+9.
+
+Let me now write the FSM as a two-always or one always with next-state. Let me use reg for state and a counter.
+
+Let me define states encoded, and use a combinational next-state + sequential.
+
+Let me carefully write:
+
+```
+localparam IDLE=3'd0, DATA=3'd1, STOP=3'd2, DONE=3'd3, WAIT=3'd4;
+reg [2:0] state;
+reg [2:0] cnt;
+
+always @(posedge clk) begin
+  if (reset) begin
+     state <= IDLE;
+     cnt <= 0;
+  end else begin
+     case (state)
+       IDLE: begin
+          if (!in) begin state <= DATA; cnt <= 0; end
+       end
+       DATA: begin
+          if (cnt == 3'd7) state <= STOP;
+          else cnt <= cnt + 1;
+       end
+       STOP: begin
+          if (in) state <= DONE;
+          else state <= WAIT;
+       end
+       DONE: begin
+          state <= in ? IDLE : DATA;
+          cnt <= 0; // when going to DATA, count reset
+       end
+       WAIT: begin
+          if (in) state <= IDLE;
+       end
+     endcase
+  end
+end
+assign done = (state == DONE);
+```
+
+Wait, in DONE: state <= in ? IDLE : DATA; and cnt <= 0. But if we go to IDLE, cnt irrelevant. If we go to DATA, cnt=0 needed. But careful: in DONE we set cnt<=0 unconditionally, fine.
+
+But wait, there's an issue: in DATA, when cnt==7 we go to STOP but we don't increment cnt. Fine since we reset cnt when entering DATA.
+
+Now trace: start at s, IDLE at s sees in=0 -> at s+1 state=DATA cnt=0.
+s+1: DATA, in=d0, cnt=0 -> cnt=1, state stays DATA.
+s+2: d1, cnt1->2.
+s+3: d2, cnt2->3.
+s+4: d3, cnt3->4.
+s+5: d4, cnt4->5.
+s+6: d5, cnt5->6.
+s+7: d6, cnt6->7.
+s+8: d7, cnt7 -> state=STOP (cnt not incremented).
+s+9: STOP, in=stop(=1) -> state=DONE.
+s+10: DONE, done=1. in = bit after stop.
+Then s+11: depends.
+
+So done high at s+10. Matches reference done at s+10. 
+
+Now the current DUT: start at t1 -> done at t12 (s+11). Actually let me recompute: current DUT done=1 at t12 = s+11. Reference at s+10. So current is 1 late, plus also the value of done could differ by cycle. Anyway mismatch count 64 out of 905.
+
+Hmm but wait, also there's an important subtlety: In current DUT, IDLE sees in=0 -> START -> DATA. That's 2 cycles before counting starts. My design: IDLE sees in=0 -> DATA directly, count starts next cycle. So one cycle difference. Right.
+
+Now, one more consideration: the exact reference might assert done during STOP state when in=1 rather than a separate DONE state. But we determined done at s+10 with in=0 (bit after stop). Because if done were asserted combinationally in STOP with in=1, then done would be high at s+9 with in=1, not s+10 with in=0. Since observed done_ref=1 while in=0, done is at s+10. Unless... hmm, actually could done be asserted in STOP with in=1 but the sampled in at that moment is 0? No.
+
+Hmm wait, let me reconsider. What if the testbench's input at time 105 is actually the stop bit region but sampled as 0 due to mid-transition? Unlikely.
+
+Let me also reconsider: is it possible the reference asserts done for one cycle and it coincides with in==0 because bytes are sent back-to-back with start bit immediately? Possibly the testbench sends a specific pattern. Either way our design should match the canonical reference.
+
+Let me double check with the known HDLBits reference. Actually, I want to make sure about the DONE-state transition when in==0. Let me think about the reference's "wait for stop bit" requirement more.
+
+Standard HDLBits "Fsm serial" reference solution (I'm fairly confident) is:
+
+```
+module top_module(
+    input clk,
+    input in,
+    input reset,
+    output done
+);
+    reg [3:0] state, next_state;
+    reg [3:0] bit_counter;
+    localparam IDLE=0, DATA=1, STOP=2, DONE=3, WAIT=4;
+    ...
+```
+
+Hmm. Let me just trust the timing derivation.
+
+Actually, let me reconsider whether the reference includes a separate START handling. The observed timing (done at s+10) requires IDLE->DATA directly counting 8 bits. Let me also double check the possibility that reference has START state but counts 8 in DATA (d0..d7 are at s+1..s+8 and DATA spans s+1..s+8 which requires IDLE->DATA at s). Yes, no START state, or START folded.
+
+Alright, another subtle point: When DONE and in==1, go to IDLE. When DONE and in==0, go to DATA. This is like IDLE behavior. But actually there's a subtle question: if in DONE with in==0, is that a legit start bit? In the reference, I believe yes—the next byte can immediately follow the stop bit. Actually hmm, if stop bit is at s+9 and DONE at s+10, then s+10 is the start bit of the next byte (0). So yes, DONE must be able to transition into DATA. Good.
+
+But wait, would the reference instead go DONE -> IDLE -> then IDLE sees 0 -> DATA, losing a cycle? That would misalign subsequent bytes. In that case the reference might not handle back-to-back, but the testbench presumably follows the reference. Hmm. Risky.
+
+Let me think again about what the actual HDLBits reference does. Let me recall the state diagram for "Fsm serial":
+
+The diagram (from HDLBits) I believe has states:
+- IDLE (in=1 -> IDLE, in=0 -> START? or directly)
+- Actually the HDLBits Fsm serial diagram shows: IDLE, "count 8 data bits", STOP, DONE, WAIT...
+
+Hold on, I think the HDLBits problem's FSM diagram actually shows states named with the transitions. Let me recall the companion solution code widely posted:
+
+```verilog
+module top_module(
+    input clk,
+    input in,
+    input reset,
+    output done
+); 
+    parameter IDLE=0, START=1, DATA=2, STOP=3, DONE_S=4, WAIT=5;
+    reg [2:0] state, next_state;
+    reg [3:0] count;
+    
+    always @(*) begin
+        case(state)
+            IDLE: next_state = in ? IDLE : START;
+            START: next_state = DATA;
+            DATA: next_state = (count==7) ? STOP : DATA;
+            STOP: next_state = in ? DONE_S : WAIT;
+            DONE_S: next_state = in ? IDLE : START;
+            WAIT: next_state = in ? IDLE : WAIT;
+        endcase
+    end
+    ...
+```
+
+Wait, that's exactly the current DUT! Hmm, and the current DUT failed with 64 mismatches. Hmm. But maybe the current DUT has a bug in the counter logic compared to the correct version.
+
+Let me look at the current DUT counter logic vs the "correct" version.
+
+Current:
+```
+always @(posedge clk) begin
+    if (reset) begin state<=IDLE; bit_cnt<=0; end
+    else begin
+        state <= next_state;
+        if (state == IDLE) bit_cnt <= 0;
+        else if (state == START) bit_cnt <= 0;
+        else if (state == DATA) bit_cnt <= bit_cnt + 1;
+    end
+end
+```
+
+Hmm, in the "correct" version, the counter would count during DATA and reset appropriately. Let me check the timing with the START state.
+
+Sequence with START state: s = start bit cycle, IDLE sees in=0 at s -> next=START, so at s+1 state=START. At s+1, in=d0. START -> next=DATA. So at s+2 state=DATA, cnt=0. At s+2, in=d1, cnt 0->1. s+3 d2 cnt1->2... s+8 d7? Let's count: DATA cycles s+2..? count increments each: s+2->1, s+3->2, s+4->3, s+5->4, s+6->5, s+7->6, s+8->7, s+9 cnt==7 -> next=STOP. So at s+10 state=STOP. But wait what's at s+9? d8? There's only d0..d7 (s+1..s+8) and stop at s+9. At s+9, input=stop(1), state=DATA (cnt==7) -> next STOP. At s+10, input = bit after stop, state=STOP. STOP: next = in?DONE:WAIT. At s+11 state=DONE, done=1. So done at s+11. So this design gives done at s+11, one cycle later than reference's s+10.
+
+Hmm so this "widely posted" solution would also be off by one?? That suggests my reference timing assumption (done at s+10) may be wrong, OR the posted solution actually resets/does something differently.
+
+Hmm. Let me reconsider. Maybe the START state is entered from IDLE at the same cycle and DATA counting includes the start bit? No.
+
+Actually, wait. Let me reconsider the meaning. Maybe in the reference, the start bit detection is: IDLE stays IDLE while in==1; when in==0, transition to DATA and immediately begin counting (so the start bit cycle is the transition cycle, data starts next). And there's no START state. Then DATA counts 8 cycles (d0..d7), then STOP at stop bit. Done at s+10.
+
+Alternatively, maybe the reference's "START" state is entered and then it goes to DATA, but the counter counts 8 bits where the first DATA cycle corresponds to d0 (at s+1). Wait that gives done at s+10 if there's no separate START... 
+
+I think the discrepancy is whether there's a START state. Let me just go with the timing derived from observation: done at s+10.
+
+But hold on, let me double-check by re-examining the observed waveform. done_ref=1 at t=105, in=0. done_dut=0, done_ref=0 at t=115. So done_ref pulses for exactly one cycle (t=105), then 0 at 115. Actually we don't have samples between 105 and 110 and 115. The clock period is 10 (edges at 105,115,...). So done_ref=1 for the cycle 105-115? and 0 at 115. Hmm, at 110 (clk=0) done_ref=1 still. So done_ref high at 105 and 110 (half-periods), low at 115. So done_ref is high for one clock cycle from 105 to 115. Yes, one cycle wide.
+
+Now if done is one cycle wide and occurs at s+10 where s is start bit.
+
+Given first mismatch at time 110 (but waveform shows mismatch at 105 too, maybe the reported first_time is conservative). Anyway.
+
+OK so the fix relative to current DUT is to remove one cycle of delay. But wait—the current DUT with START state gives done at s+11 for a byte starting at s. Unless the testbench defines timing differently. Let me verify: is it possible the reference also has done at s+11 and the difference is elsewhere? The mismatch at t=105 where done_ref=1 and done_dut=0 suggests the DUT is late by one cycle (or early). At t=115 done_ref=0 done_dut=0 (both 0). Hmm, if DUT were late by one cycle, then at t=105 done_ref=1 done_dut=0, and at t=115 done_ref=0 done_dut=1 (the DUT would still be high). But at 115 done_dut=0. So maybe DUT's done is not simply a shifted version. Hmm.
+
+Wait, actually at t=115, done_dut=0. If the DUT is one cycle late, its done pulse would occur at 115-125, i.e., done_dut=1 at 115. But it's 0. So this is not a simple one-cycle shift at this point. Hmm, so maybe the DUT's done never aligns, or the byte boundary differs.
+
+Let me reconsider. Perhaps at t=105 we're at the end of a byte and the reference asserts done, but the DUT is in WAIT or something. Hard to know without more data.
+
+Let me reconsider the whole thing. Maybe the distinction: the reference asserts done in the STOP state when in==1 combinationally? Then done would be high while in=1. But observed in=0. Unless the stop bit is 0? No, done requires stop=1.
+
+Hmm, wait. Let me reconsider what "in" is at time 105. Maybe the testbench just presents a constant random stream, and at time 105 the "in" bit being sampled at that cycle is 0. done_ref is a registered output that was computed from the previous cycle's input. So during DONE state, done=1 regardless of current in. The current in=0 just tells us what follows the stop. So it doesn't constrain done to in.
+
+Right! done is a registered/state output; its value at cycle X depends on state at X, which was determined by inputs at earlier cycles. So in=0 at t=105 is fine (it's the bit after the stop). We inferred done at s+10. But actually we need to be careful: at t=105, state=DONE (ref). The input at t=105 is the bit after the stop bit. So the stop bit was at t=104? No wait. Let me redo.
+
+If done is high during cycle from 105 to 115, the state DONE was entered at the posedge at 105. The posedge at 105 samples inputs just before 105. STOP state was during cycle 95-105, sampling input around 105 (before 105). Hmm, let me clarify clock cycles. Clock: posedge at 105 (clk goes 0->1 at 105), posedge at 115, etc. State updates at these edges.
+
+At posedge 105, state <= DONE means at cycle 105-115 state=DONE, done=1. The STOP state was at 95-105. During STOP, the input sampled at posedge 105 was the input just before 105 (say value at t=104). If stop bit is at 104 region... hmm. The input `in` at 105-110 is 0, at 110-115 is 0. So input is 0 during the DONE cycle. That's the bit after stop.
+
+So stop bit was sampled just before posedge 105, i.e., during cycle 95-105 input was 1 (stop). Then during 105-115 input is 0 (next start). OK consistent: after stop immediately a start bit (0).
+
+Hmm, so the stream has stop=1 at 95-105 region... whatever.
+
+Now the key: reference asserts done exactly one cycle after stop bit sampled (stop sampled at posedge 105 -> DONE state at 105-115). Wait let me redo: If STOP state is entered at posedge 95 (cycle 95-105), then during STOP the input sampled at posedge 105 is the stop bit; if in==1, next state DONE at posedge 105 -> state DONE during 105-115. So stop bit sampled at posedge 105 equals 1, and DONE state appears immediately, done high 105-115. And the input during 105-115 is the next bit (0). 
+
+So the stop bit duration was 95-105, meaning the bit before (d7) was 85-95, etc. Start bit s such that... stop at s+9. stop bit occupies [s+9, s+10). So s+9 = 95 => s=86. done at [s+10,...] hmm but done is 105-115 = [s+10? no]. Let me not worry; cycle-counting in absolute numbers is confusing. The relative relation: done asserted in the cycle immediately following the stop bit cycle? Let me define cycles by their start times: cycle k = [T+k*10, T+(k+1)*10).
+- Stop bit is the input during cycle k_stop (sampled at its end).
+- DONE state occurs during cycle k_stop+1 (because at posedge at end of k_stop, state<=DONE).
+
+Hmm wait, that means done appears immediately in the cycle after the stop bit was present. Let me recompute with my design.
+
+Design: start bit present during cycle s (input in=0). At posedge end of s, state <= DATA. DATA state during s+1 (input d0), count 0->1. ... DATA during s+8 (input d7), count==7 -> state<=STOP at end. STOP during s+9 (input stop=1) -> at end, state<=DONE. DONE during s+10, done=1.
+
+So done is during cycle s+10, which is one cycle after stop bit cycle (s+9). Yes matches.
+
+Now the "widely posted" solution with START state: start bit during cycle s, at end state<=START. START during s+1 (input d0), at end state<=DATA. DATA during s+2 (input d1) cnt0->1 ... let's see DATA during s+2..s+9 counting: s+2 cnt0->1, s+3 cnt1->2, s+4 cnt2->3, s+5 cnt3->4, s+6 cnt4->5, s+7 cnt5->6, s+8 cnt6->7, s+9 cnt7 -> state<=STOP. STOP during s+10 (input = bit after stop). Hmm that means the stop bit is at s+9 which is d7? No wait.
+
+Let me recount inputs: start at cycle s (in=0). d0 at s+1, d1 s+2, ..., d7 s+8, stop s+9. So during DATA in this design: s+2 (in=d1), we're counting d1. s+9 (in=d7+1? no s+9 in=stop=1). Hmm this design's DATA spans s+2..s+9, sampling d1..d7 and stop. That's miscounting (consumes stop as data). Then STOP at s+10. Then DONE at s+11 if in at s+10 ... wait STOP during s+10 samples in (which is bit after stop), if 1 -> DONE at s+11. So done at s+11. Off by one from reference s+10.
+
+So indeed the START state version gives done at s+11, but reference wants s+10. Unless the reference's start detection differs.
+
+Hmm, but actually, maybe I have the input alignment wrong. What if the start bit is not at cycle s but the FSM should treat the 0 it sees at cycle s as the start and d0 at s+1... yes that's what I did.
+
+Alternatively maybe the reference has IDLE->START but the START state is where the start bit is confirmed and data begins counting at the same cycle as START? Let me think of a reference that gives done at s+10 while having a START state:
+
+IDLE at s (in=0) -> START at s+1. START at s+1 should begin data counting (treat s+1 as d0), so START could increment counter as if it's first data bit: at s+1, in=d0, count 0->1, state->DATA. DATA at s+2 (d1) count1->2 ... s+8 (d7) count7? Let's see: s+2 cnt1->2, s+3 2->3, s+4 3->4, s+5 4->5, s+6 5->6, s+7 6->7, s+8 cnt7 -> state<=STOP. STOP during s+9 (stop bit) -> DONE at s+10. That works if START also counts as data bit 0! I.e., the counter increments in START too, or the counting is designed so that d0 is counted in START.
+
+Hmm, so the reference could have START state that counts d0. But then why call it START? Because it's the cycle after detecting start. Effectively DATA counting includes it.
+
+OK regardless, the fix is clear: we need done at s+10. The simplest robust design: IDLE detects start (in==0) at cycle s and goes to DATA; DATA counts 8 data bits (s+1..s+8); STOP at s+9; DONE at s+10.
+
+But wait, I must double check the "in==0 detection in IDLE" — what if the FSM is in IDLE and in becomes 0 due to a spurious glitch... whatever.
+
+Let me also handle: The reference presumably from HDLBits. Let me try to recall the exact HDLBits Fsm serial state diagram once more. I'm now fairly convinced the diagram is:
+
+From HDLBits "Fsm serial": The state diagram has these states (I've seen the image): "IDLE", "1" (start?), ... hmm.
+
+Actually the HDLBits "Fsm serial" is exactly this problem (Problem 137 in this dataset). The HDLBits reference solution as I recall:
+
+```verilog
+module top_module(
+    input clk,
+    input in,
+    input reset,
+    output done
+); 
+    parameter IDLE=0, START=1, DATA=2, STOP=3, DONE_S=4, WAIT=5;
+    reg [3:0] state, cnt;
+    ...
+    always @(posedge clk) begin
+        if(reset) state <= IDLE;
+        else state <= next;
+    end
+    ...
+```
+
+I really can't recall exactly. Let's rely on the derived timing.
+
+Hmm, actually, wait. Let me reconsider: The mismatch count is 64 out of 905. The simulation runs 905 samples over ~4526 "ps"?? "Simulation finished at 4526 ps" — but timescale 1ps and clock period 10... 4526/10 = 452 cycles. 905 samples ≈ 2 per cycle (posedge and negedge). So ~452 cycles. 64 mismatches out of 905 samples. If done were only off by one cycle each byte and there are e.g. ~8 bytes, that'd be ~8-16 samples. 64 is more. Hmm, 64 mismatches ≈ 32 cycles worth (2 samples/cycle). Hmm.
+
+Actually maybe many bytes and many mismatches due to misalignment where the DUT's done occurs at wrong times and also wrong values.
+
+Hmm, wait, but also consider: maybe the reference asserts done differently. Let me reconsider whether done might be asserted during STOP cycle combinationally with in==1, i.e., done = (state==STOP && in). Then done appears in the same cycle as stop bit, i.e., at s+9, and it'd be high while in=1. But observed done_ref=1 while in=0... but the input during DONE cycle we said is 0. If done were combinationally (STOP && in), the cycle where done is high is the stop bit cycle where in=1. Observed in=0 though. So no.
+
+Unless there are two possibilities and the observed in=0 at 105 means... hmm.
+
+Actually hold on, maybe the tb drives inputs and samples outputs with some delay, and the "in" value at t=105 might correspond to the stop bit but the testbench has already moved on. Ugh.
+
+Let me think about it more robustly: I'll go with the timing that matches the canonical HDLBits reference. Let me try to actually recall the HDLBits reference more concretely by thinking about their provided state diagram.
+
+I recall the HDLBits "Fsm serial" state diagram looks like:
+- State "IDLE" with self-loop on in=1, and transition on in=0 to state "START"? Or the diagram labels: There's a state that counts 1..8.
+
+Hmm, alternatively the diagram might be:
+
+States: IDLE, DATA (with counter), STOP, DONE, WAIT. Transitions:
+- IDLE --in==1--> IDLE
+- IDLE --in==0--> DATA (this is the start bit; begin counting)
+- DATA: after 8 bits --> STOP
+- STOP --in==1--> DONE
+- STOP --in==0--> WAIT
+- DONE --in==1--> IDLE
+- DONE --in==0--> DATA
+- WAIT --in==1--> IDLE
+- WAIT --in==0--> WAIT
+
+Wait, DONE --> DATA on in==0? Hmm. Or DONE --in==1--> IDLE, DONE --in==0--> IDLE? Then back-to-back would add a cycle. But if DONE transitions to DATA on in==0, then a new byte starts correctly.
+
+Hmm, but there's a subtlety: is a byte allowed immediately after the stop bit with no idle gap? In UART, typically there can be. The FSM must handle it.
+
+Given the observed in=0 during DONE, the next byte likely starts immediately, so DONE must handle in==0 as start.
+
+Actually wait, if the DONE cycle's input is 0 and that's the start bit of the next byte, then the reference must transition to COUNTING data for the next byte. Which my design does (DONE -> DATA on in==0).
+
+Let me now reconsider the possibility that the reference asserts done for the cycle and then handles next.
+
+I'll design to match: done at s+10, and DONE->DATA on in==0, DONE->IDLE on in==1.
+
+But hmm, let me reconsider whether the reference might actually be: done at the stop-bit cycle (s+9) asserted as a registered output computed in the STOP state... no.
+
+Let me take yet another approach: maybe I should look at the actual relationship using the given sample more carefully, including a second mismatch if available. Only three samples given: t=105 (in=0, done_ref=1, done_dut=0), t=110 (in=0, done_ref=1, done_dut=0), t=115 (in=0, done_ref=0, done_dut=0).
+
+So DUT done is 0 at all three; ref done high for one cycle. This is consistent with DUT being entirely misaligned such that at that particular byte it missed. Hard to pin exact offset.
+
+The first mismatch at time 110 per hint (maybe t=105 comparison is done at posedge 105 which is when DUT updates? The tb_mismatch=1 at 105 in the waveform). Eh.
+
+Given uncertainty, let me just implement the canonical FSM with the timing derived (done at s+10) which is the natural "one cycle after stop" and likely matches HDLBits.
+
+Hmm, but wait: I derived done at s+10 for my design. And the current DUT gives s+11. The hint says first mismatch at 110 — but with 905 samples and only 64 mismatches, and the fact that the previous attempt (revision 71e94d16, which presumably was a slightly different design) also got 64 mismatches and was rolled back (NO_IMPROVEMENT). Interesting: both got exactly 64 mismatches. The rejected revision had source_sha 54f7d6... Let me see if I can find what it was. Not available, but it's the "previous_tool_result" candidate which was rejected. Its score equal. Hmm.
+
+Let me reconsider: maybe the real issue is something else entirely, like done should be high for exactly one cycle but the current design holds it? No, done=(state==DONE), and DONE is one cycle.
+
+Wait, actually maybe the issue is the DONE->(in?IDLE:START) transition causing issues: In current DUT, DONE: next = in ? IDLE : START. And START goes to DATA. So DONE with in==0 goes to START then DATA — an extra cycle delay before counting, meaning subsequent bytes are misaligned progressively. Also the START state consumes the first data bit. Hmm.
+
+Actually let me reconsider the current DUT's overall behavior: it seems the FSM is designed for: start bit detected in IDLE, then START state (1 cycle), then DATA counts 8 bits. But because START consumes d0 and then DATA counts 8 bits d1..d7+stop, it's wrong.
+
+Hmm wait, let me recount current DUT more carefully, because maybe I misassigned.
+
+Current DUT sequence for a byte:
+- Cycle s: state=IDLE, in=0 (start). next_state=START. At posedge, state<=START. bit_cnt<=0 (because state==IDLE).
+- Cycle s+1: state=START, in=d0. next_state=DATA. At posedge state<=DATA, bit_cnt<=0 (state==START sets 0).
+- Cycle s+2: state=DATA, in=d1, bit_cnt=0. next=(0==7? no)=DATA. posedge: bit_cnt<=1.
+- s+3: DATA, in=d2, cnt1 -> cnt<=2.
+- s+4: d3, cnt2->3.
+- s+5: d4, cnt3->4.
+- s+6: d5, cnt4->5.
+- s+7: d6, cnt5->6.
+- s+8: d7, cnt6->7? wait cnt was 5 then 6 then 7: let me recount. At s+2 cnt=0, s+3 cnt=1, s+4 cnt=2, s+5 cnt=3, s+6 cnt=4, s+7 cnt=5, s+8 cnt=6, s+9 cnt=7. Hmm I need to be careful: cnt updates at posedge after the cycle.
+
+Let me tabulate (state at cycle, cnt at cycle start, in at cycle):
+- s: IDLE, cnt=x, in=0(start)
+- s+1: START, cnt=0, in=d0
+- s+2: DATA, cnt=0, in=d1
+- s+3: DATA, cnt=1, in=d2
+- s+4: DATA, cnt=2, in=d3
+- s+5: DATA, cnt=3, in=d4
+- s+6: DATA, cnt=4, in=d5
+- s+7: DATA, cnt=5, in=d6
+- s+8: DATA, cnt=6, in=d7
+- s+9: DATA, cnt=7, in=stop(1) -> next=STOP
+- s+10: STOP, cnt=8, in=bit after stop
+- s+11: DONE (if in at s+10 ==1), done=1.
+
+So DATA spans s+2..s+9, 8 cycles, sampling d1..d7 and stop. Indeed stop misread. done at s+11.
+
+Reference done at s+10. So indeed off by one. My new design gives s+10.
+
+But the concern: will removing the START state align everything? Let me also double check with a "WAIT" scenario.
+
+If stop bit is 0 at s+9: reference: STOP state at s+9 samples in=0 -> WAIT at s+10. WAIT stays until in==1, then IDLE. My design same.
+
+Now let's also consider: after DONE with in==0 -> DATA (treating as start). Hmm but actually in the reference maybe after done the FSM goes to IDLE and the next bit... Let me consider the testbench's bit stream. The testbench likely generates a sequence of bits (random with constraints) and drives a reference model. The reference model is the HDLBits solution. So we must match it.
+
+Given my timing analysis matches the "no START state" interpretation, and the observed done_ref pulse is one cycle after would-be stop, I'll go with it.
+
+But actually, wait. I want to reconsider whether the reference might have done at s+10 via a different structure with a START state that also counts. Either way my design produces done at s+10, which should match. The only difference could be in subsequent byte handling / WAIT behavior.
+
+Let me now think about potential edge cases that the testbench checks:
+
+1. Reset behavior: synchronous, active high. On reset, state=IDLE, done=0. Good.
+
+2. done high exactly 1 cycle when byte correctly received.
+
+3. If stop bit wrong (in==0 at expected stop position), go to WAIT and don't assert done; wait for a 1, then IDLE, then can detect new start.
+
+4. Back-to-back bytes.
+
+Let me reconsider the DONE state handling: In my design, DONE -> (in? IDLE : DATA). But what if the reference goes DONE -> IDLE regardless, and then IDLE on next cycle sees in==0 and goes to DATA? That would add a cycle delay. Which is right? Consider a stream of consecutive bytes with no gap: after stop bit at s+9, immediately start at s+10 (in=0). Reference done at s+10. Then next byte's stop would be at (s+10)+9 = s+19, done at s+20. If reference DONE->DATA directly on in==0, then next done at s+20. If DONE->IDLE then IDLE->DATA, next start detection delayed by one cycle, then done at s+21, and the byte would be misaligned (the second byte's bits counted starting one cycle late, so it'd read wrong bits and likely error). Since the reference presumably works on back-to-back bytes, DONE->DATA on in==0 seems right... but actually if bytes are back-to-back, the reference FSM must handle it.
+
+Hmm, but actually maybe the testbench doesn't use back-to-back bytes; maybe there's always at least one idle bit between. Then DONE->IDLE vs DONE->DATA doesn't matter much except when in==0 immediately.
+
+Hmm, but the observed DONE cycle has in=0, implying the next byte starts immediately. So back-to-back.
+
+Hmm wait, actually not necessarily: in=0 at DONE could also be a stray 0 during idle (like line noise) — but the reference would then treat it as start. If the reference transitions DONE->IDLE on in==1 and DONE->??? on in==0.
+
+Let me think about the spec text: "It needs to identify the start bit, wait for all 8 data bits, then verify that the stop bit was correct. If the stop bit does not appear when expected, the FSM must wait until it finds a stop bit before attempting to receive the next byte."
+
+This suggests after successfully verifying stop, the FSM is ready to receive the next byte, treating the current line (which could be a start bit immediately).
+
+I think the cleanest FSM matching the HDLBits reference:
+
+Let me try to recall the actual HDLBits solution code. I have some memory of it:
+
+```verilog
+module top_module(
+    input clk,
+    input in,
+    input reset,
+    output done
+); 
+    reg [3:0] state;
+    reg [3:0] cnt;
+    localparam IDLE = 4'd0, DATA = 4'd1, STOP = 4'd2, DONE_S = 4'd3, WAIT = 4'd4;
+    
+    always @(posedge clk) begin
+        if (reset) begin
+            state <= IDLE;
+            cnt <= 0;
+        end
+        else begin
+            case (state)
+                IDLE: if (!in) begin state <= DATA; cnt <= 0; end
+                DATA: begin
+                    if (cnt == 7) state <= STOP;
+                    else cnt <= cnt + 1;
+                end
+                STOP: begin
+                    if (in) state <= DONE_S;
+                    else state <= WAIT;
+                    cnt <= 0;
+                end
+                DONE_S: begin
+                    state <= in ? IDLE : DATA;   // or IDLE
+                    cnt <= 0;
+                end
+                WAIT: if (in) state <= IDLE;
+            endcase
+        end
+    end
+    assign done = (state == DONE_S);
+endmodule
+```
+
+That's basically my design. Let me go with it.
+
+Hmm, but wait. There's a subtlety with the DATA counter: when cnt==7 we go to STOP. But we also need cnt for the next byte reset. We reset cnt when entering DATA (from IDLE or DONE). Let me make sure cnt<=0 whenever entering DATA.
+
+In my design:
+- IDLE: if(!in) {state<=DATA; cnt<=0;}
+- DATA: if(cnt==7) state<=STOP; else cnt<=cnt+1;
+- STOP: if(in) state<=DONE; else state<=WAIT; (cnt irrelevant)
+- DONE: state<= in?IDLE:DATA; cnt<=0;
+- WAIT: if(in) state<=IDLE;
+
+Yes.
+
+Now let me reconsider whether after WAIT finding a 1, we should go to IDLE or directly detect that the 1 was a stop bit. Going to IDLE is fine.
+
+But hmm, one more: in WAIT, if in==1, we go IDLE. In IDLE next cycle if in==0 start. Good.
+
+Also consider: after a failed stop (WAIT), the FSM waits for a 1. That 1 is effectively the stop bit of the "current" failed frame, treated as idle. Then IDLE. Fine.
+
+Now, let me also reconsider: could the reference's DONE transition be `state <= IDLE` always (not going straight to DATA)? Then back-to-back bytes with in=0 at done: DONE->IDLE, next cycle IDLE sees the same in? No—the input at IDLE next cycle is the next bit, not the same. Hmm, DONE at s+10 (in=start of next byte at s+10). If DONE->IDLE at s+11, then at s+11, in = d0 of next byte (since start was at s+10). IDLE sees d0; if d0==0 it'd treat as start wrongly. So that would break. Hence DONE->DATA on in==0 is necessary for back-to-back. Good, my design handles it.
+
+Hmm, but actually wait: if DONE->DATA on in==0 at s+10, then at s+11 state=DATA cnt=0 sampling d0. Good, aligned.
+
+Now what about DONE->IDLE on in==1: at s+10 in=1 (idle). DONE->IDLE at s+11. At s+11, if in becomes 0 (start), IDLE detects start -> DATA at s+12. Good.
+
+Now let me write the final code.
+
+Let me also double check the reset: "active-high synchronous reset". On reset high at posedge, state<=IDLE, done=0. Also cnt<=0.
+
+Let me write clean SystemVerilog:
+
+```systemverilog
+module TopModule (
+    input  logic clk,
+    input  logic reset,
+    input  logic in,
+    output logic done
+);
+
+    localparam logic [2:0] IDLE = 3'd0,
+                           DATA = 3'd1,
+                           STOP = 3'd2,
+                           DONE = 3'd3,
+                           WAIT = 3'd4;
+
+    logic [2:0] state, next_state;
+    logic [2:0] cnt;
+
+    always_ff @(posedge clk) begin
+        if (reset) begin
+            state <= IDLE;
+            cnt   <= 3'd0;
+        end else begin
+            state <= next_state;
+            case (next_state)
+                DATA: begin
+                    if (state == DATA) cnt <= cnt + 3'd1;
+                    else               cnt <= 3'd0;
+                end
+                default: cnt <= 3'd0;
+            endcase
+        end
+    end
+```
+
+Hmm, this is getting complicated. Let me use a simpler sequential block that handles both state and counter, following the design above:
+
+```systemverilog
+    always @(posedge clk) begin
+        if (reset) begin
+            state <= IDLE;
+            cnt   <= 3'd0;
+        end else begin
+            case (state)
+                IDLE: begin
+                    if (!in) begin
+                        state <= DATA;
+                        cnt   <= 3'd0;
+                    end
+                end
+                DATA: begin
+                    if (cnt == 3'd7) state <= STOP;
+                    else             cnt   <= cnt + 3'd1;
+                end
+                STOP: begin
+                    if (in) state <= DONE;
+                    else    state <= WAIT;
+                end
+                DONE: begin
+                    if (in) state <= IDLE;
+                    else begin
+                        state <= DATA;
+                        cnt   <= 3'd0;
+                    end
+                end
+                WAIT: begin
+                    if (in) state <= IDLE;
+                end
+                default: state <= IDLE;
+            endcase
+        end
+    end
+
+    assign done = (state == DONE);
+```
+
+This is a single always block (no combinational next_state). Uses blocking? No, uses non-blocking for registers. Good. This handles everything.
+
+Wait, counter width: 0..7 needs 3 bits. Good.
+
+Let me double-check the DATA counting: entering DATA with cnt=0. Cycle DATA(c0): if cnt==7? no -> cnt=1. DATA(c1)->cnt=2... DATA(c6)->cnt=7. DATA(c7): cnt==7 -> state<=STOP, cnt stays 7 (no else). Next DATA? no, STOP. Good, 8 DATA cycles c0..c7 sampling 8 data bits. 
+
+Now let me reconsider: is it possible the reference counts the start bit as part of an 8-bit count differently such that done timing is s+10 but DATA cycle mapping differs? No, the mapping is determined: d0..d7 in DATA cycles, stop in STOP cycle, done in DONE.
+
+Alright.
+
+Now, there's still risk the reference does DONE differently or uses extra state. But let me also consider: what if the reference's done is asserted during the STOP-success cycle itself (s+9) rather than s+10? We argued no based on in=0 at done. But let's double-check by reconsidering input timing. Actually, hmm, we don't know the exact bit boundaries relative to clock; the stream could have bits aligned such that in=0 at DONE because the next start bit. Fine.
+
+Let me just implement and verify.
+
+Actually, hold on. Let me reconsider the possibility that the reference includes a "correct stop bit" detection where done is registered based on STOP&&in==1, and the DONE state is where done=1 for one cycle. That's what I have.
+
+Let me also consider if the reference might set done in the same cycle as the stop bit, i.e., done = (state==STOP && in). Then done would be high during the stop bit cycle (s+9) while in=1. Observed in=0 though. So no.
+
+OK let me also think about the total number of mismatches expected with my fix: should go to ~0.
+
+Let me write the code.
+
+Actually, let me reconsider one more time whether DONE should go to DATA on in==0 or whether it should go to IDLE and then... Let me think about what "attempting to receive the next byte" means and the observed DONE with in=0. If the reference went DONE->IDLE on in==0 as well (i.e., DONE always -> IDLE), then the start bit at s+10 would be missed (IDLE at s+11 sees d0). If d0==0, it'd falsely start, misaligning. So the reference can't do that if it must handle back-to-back. Unless the testbench always has idle bits between bytes and the in=0 at DONE is actually... hmm.
+
+Wait, could the in=0 at DONE time actually be part of the "next byte" start but the reference does handle it? We can't be 100% sure. But the most standard UART FSM handles back-to-back. I'll go with DONE->DATA on in==0.
+
+Hmm, actually now I realize: maybe the reference is structured as IDLE -> (in==0) -> "start detection" where the current cycle is consumed as start, then 8 data, stop, done, and then DONE -> (in==1? IDLE : ???). Let me look at the observed fact again: done_ref high while in=0. If back-to-back, then reference must go to data. Good, consistent.
+
+Let me just go.
+
+One more consideration: The problem says "Include a active-high synchronous reset." Done.
+
+Let me also make sure output `done` is 1-bit. Yes.
+
+Let me write it and verify.
+
+Let me produce the source.
+
+Actually, let me reconsider using `logic` vs `reg`. The interface says SystemVerilog. Using logic is fine. But to be safe with older tools and the "exactly one self-contained TopModule DUT", I'll use logic/always_ff or plain reg/always. Let me use plain reg and always @(posedge clk) to be safe and avoid potential issues with always_ff and multiple assignments. Actually always_ff is fine. I'll use always @(posedge clk) with reg.
+
+Let me write:
+
+```systemverilog
+module TopModule (
+    input  clk,
+    input  reset,
+    input  in,
+    output done
+);
+
+    localparam [2:0] IDLE = 3'd0,
+                     DATA = 3'd1,
+                     STOP = 3'd2,
+                     DONE = 3'd3,
+                     WAIT = 3'd4;
+
+    reg [2:0] state;
+    reg [2:0] cnt;
+
+    always @(posedge clk) begin
+        if (reset) begin
+            state <= IDLE;
+            cnt   <= 3'd0;
+        end
+        else begin
+            case (state)
+                IDLE: begin
+                    if (!in) begin
+                        state <= DATA;
+                        cnt   <= 3'd0;
+                    end
+                end
+                DATA: begin
+                    if (cnt == 3'd7)
+                        state <= STOP;
+                    else
+                        cnt <= cnt + 3'd1;
+                end
+                STOP: begin
+                    if (in)
+                        state <= DONE;
+                    else
+                        state <= WAIT;
+                end
+                DONE: begin
+                    if (in)
+                        state <= IDLE;
+                    else begin
+                        state <= DATA;
+                        cnt   <= 3'd0;
+                    end
+                end
+                WAIT: begin
+                    if (in)
+                        state <= IDLE;
+                end
+                default: state <= IDLE;
+            endcase
+        end
+    end
+
+    assign done = (state == DONE);
+
+endmodule
+```
+
+That's my candidate. Let me verify.
+
+Wait, I should double-check the first mismatch scenario more: at t=105, ref done=1, dut done=0. With my design, when would done be high? At s+10 cycles. Whether that aligns depends on the testbench. I'll trust.
+
+Hmm, but let me reconsider the possibility that the reference has done at s+9 (same cycle as stop)? Let me examine: current DUT produced done at s+11 (two cycles later than s+9). Reference at t=105, DUT at 0, and at t=115 both 0. If the reference is at s+9 = 105 and DUT would be at s+11 = 115. But at 115 done_dut=0! So DUT is not simply shifted. Hmm, this breaks the simple shift theory.
+
+Wait, that's important. If the DUT were just a delayed version of the reference (delay by 1 or 2 cycles), then when ref done=1 at 105, DUT done would be 1 at 105+delay. At 115 (delay=1) we'd expect done_dut=1. But observed done_dut=0 at 115. So either the DUT's done doesn't align at all (because of the misparse causing WAIT), or the delay is not integer, or the reference and DUT diverge such that DUT asserts done at a different byte.
+
+Given the DUT misparses (reads stop bit as data), it might end up in WAIT and never assert done for that byte, or assert done at wrong byte boundaries. So the divergence isn't a simple shift. That explains non-shift.
+
+Therefore, my design must match the reference's byte-boundary parsing. If my parsing is correct (8 data bits d0..d7), then done aligns.
+
+Now the crucial question remains whether reference does DONE->DATA on in==0 (back-to-back) and whether done at s+10. Let me see if there's more info: "Simulation finished at 4526 ps" and 905 samples. Hmm.
+
+Let me consider: maybe the testbench uses a fixed bit pattern generator (like a PRNG) and the reference is an FSM. The DUT must match exactly. The 64 mismatches out of 905 samples with the wrong (off-by-one) design. If done were just shifted by one cycle, mismatches would be 2 samples per done pulse. To get 64 mismatches, there'd need to be 32 done pulses misaligned, or the divergence compounds.
+
+Hmm, 64 could be 32 cycles × 2 samples (posedge+negedge sampling). Actually "905 samples" and "mismatched samples 64". If they sample at both edges, then a single-cycle wrong pulse = 2 mismatches. 64/2 = 32 wrong cycles.
+
+If there are ~20 bytes and each is off such that... eh. Or if done never matches (done_ref pulses but done_dut always 0 except different times), then mismatches = number of done pulses of ref that are 0 in dut + number of dut pulses where ref is 0. Could be ~32.
+
+Anyway, let me just implement the canonical correct FSM.
+
+Actually, hmm, let me reconsider whether the DUT with the START-state bug would ever assert done at all. In the misparse, the stop bit (1) is counted as the 8th data bit, then STOP state samples the bit after stop. If the stream is such that after the stop bit there's a 0 (next start), then STOP sees in=0 -> WAIT. So done never asserts! Then done_dut stays 0 mostly, while done_ref pulses per byte. That matches the observation (done_dut=0 at 105 and 115). And 64 mismatches = 2 samples × 32 done_ref pulses, if there are 32 bytes with correct stop bits. 
+
+That strongly supports: DUT's

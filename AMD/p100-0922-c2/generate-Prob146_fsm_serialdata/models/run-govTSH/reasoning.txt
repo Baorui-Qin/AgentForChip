@@ -1,0 +1,352 @@
+We need implement RTL for serial data receiver FSM. Need output out_byte 8 bits, done. Input clk, in, reset. Synchronous active-high reset. Serial protocol: idle line 1. Start bit 0, 8 data LSB first, stop bit 1. If stop bit doesn't appear, wait until stop bit before next byte. Assert done each time finds stop bit. out_byte valid when done=1.
+
+Need design FSM. Let's define states: IDLE, DATA (8 bits), STOP. Maybe wait state? Let's think.
+
+In IDLE, line is 1. When input goes 0, that's start bit detected. On next clock, move to DATA state and start collecting bits. Need count 8 data bits. The start bit is the 0 we just saw. We need sample data bits on subsequent clocks. At each clock, if in DATA, shift in current `in` as next data bit (LSB first). Count bits. After 8 bits, move to STOP. At STOP state, sample `in`; if 1, stop bit correct -> assert done, output byte, and return to IDLE (or remain IDLE). If 0, stop bit incorrect -> wait until finds a stop bit. "If the stop bit does not appear when expected, the FSM must wait until it finds a stop bit before attempting to receive the next byte." So if in STOP and `in`==0, we need to wait until `in`==1, then go to IDLE. Actually "wait until it finds a stop bit" means wait for a 1. But careful: if it doesn't appear, line may have gone low, could be a new start bit? The spec says wait until it finds a stop bit before attempting to receive next byte. So we need a WAIT state where we wait for `in`==1. Once `in`==1, we can go to IDLE. But if we are in WAIT and see 1, that is the stop bit, so we can assert done? Actually "It should assert done each time it finds a stop bit." So if stop bit is missing, and later we find a 1, that 1 is considered a stop bit? Hmm. In UART, if framing error, you wait for line to go idle (1) then look for next start. But does that 1 count as a stop bit and assert done? The spec: "It should assert done each time it finds a stop bit." The FSM verifies that the stop bit was correct. If it wasn't correct at expected time, we are waiting for a stop bit. When we find a 1, that is a stop bit, so we might assert done? But we don't have a valid data byte (the previous data was likely corrupted). The spec: "If the stop bit does not appear when expected, the FSM must wait until it finds a stop bit before attempting to receive the next byte." It doesn't say assert done. "It should assert done each time it finds a stop bit." Usually done asserted only when a complete byte with correct stop bit is received. If stop bit missing, the byte is invalid, so done shouldn't be asserted. But "each time it finds a stop bit" could be interpreted as whenever it sees the stop bit in the STOP state. Let's check typical problem (HDLBits problem fsm_serialdata). I recall a problem from HDLBits: "Serial data receiver" or similar. Let me recall.
+
+There is an HDLBits problem named "Fsm serialdata" or similar. Let's search memory. HDLBits has a problem "Serial data receiver" maybe. The description: "In many (older) serial communications protocols, each data byte is sent along with a start bit and a stop bit... Design a finite state machine that will identify when bytes have been correctly received... If the stop bit does not appear when expected, the FSM must wait until it finds a stop bit before attempting to receive the next byte. It should assert done each time it finds a stop bit." Wait, the exact HDLBits problem: "fsm_serialdata". I think I've seen the solution. Let's recall the FSM.
+
+States: IDLE, DATA, STOP, WAIT. Actually the common solution uses states: IDLE, START? No, start bit is just waiting for 0. Data bits shift in. After 8 data bits, check stop bit. If stop bit is 1, done=1, go to IDLE. If stop bit is 0, go to WAIT state. In WAIT, wait until in==1, then go to IDLE. In WAIT, do we assert done? I think not. Because done indicates correctly received byte. The phrase "It should assert done each time it finds a stop bit" might mean when the stop bit is expected and found (i.e., correct). But if it's just waiting for a stop bit, finding it doesn't mean the byte was correctly received. Let's check HDLBits problem statement: "The module will also output the correctly-received data byte. out_byte needs to be valid when done is 1, and is don't-care otherwise. If the stop bit does not appear when expected, the FSM must wait until it finds a stop bit before attempting to receive the next byte. Include a active-high synchronous reset. Note that the serial protocol sends the least significant bit first. It should assert done each time it finds a stop bit." Actually, I recall HDLBits solution uses a state machine with states: IDLE, DATA, STOP, WAIT. And done is asserted when in STOP and in==1, then go to IDLE. In WAIT, when in==1, go to IDLE, but done is not asserted. Let me confirm.
+
+I remember a typical solution for this exact problem. Let's reconstruct. The problem is from HDLBits: "Fsm serialdata" (https://hdlbits.01xz.net/wiki/Fsm_serialdata). I recall the solution code. It often has:
+
+```
+module top_module(
+    input clk,
+    input in,
+    input reset,
+    output [7:0] out_byte,
+    output done
+);
+    reg [3:0] state, next_state;
+    reg [7:0] data;
+    reg [3:0] cnt;
+    
+    localparam IDLE=0, DATA=1, STOP=2, WAIT=3;
+    // ...
+```
+
+Actually, let's think about timing. The input `in` is sampled on clk edge. When in IDLE and `in`==0, that's start bit. On next clock, we are in DATA state. In DATA state, we shift in `in` on each clock. We need to collect 8 bits. We can use a counter. After 8 bits, we go to STOP. In STOP state, we check `in`. If `in`==1, done=1, go to IDLE. If `in`==0, go to WAIT. In WAIT, we wait until `in`==1, then go to IDLE.
+
+But careful: In IDLE, if `in`==0, we transition to DATA. The first data bit is sampled on the next clock edge. That means the start bit is the 0 we just saw. The next clock edge samples the first data bit. That's correct: start bit is 1 bit time, so after detecting start bit, the next bit is D0. So in DATA state, we shift in `in` and increment count. After 8 shifts, we have D0..D7. Then we go to STOP. In STOP state, we check `in`. If it's 1, that's the stop bit. So the stop bit is sampled on the clock edge after the 8th data bit. That matches: 1 start + 8 data + 1 stop = 10 bits.
+
+So the FSM states:
+- IDLE: if in==0, next = DATA (start bit detected). done=0.
+- DATA: shift in `in` into shift register (LSB first). Increment count. When count==7? Let's define count as number of bits received. Initially count=0. On entering DATA, count=0. On each clock in DATA, we shift in `in` (this is the first data bit), then count<=count+1. When count==7? Actually if we shift on each clock, after 8 clocks we have 8 bits. So if we start count=0, after first data bit count becomes 1, ... after 8th data bit count becomes 8. When count==7 on the clock before the 8th bit? Let's design carefully.
+
+Alternative: Use a counter that counts 0 to 7. On each DATA clock, we capture `in` into data[count], then count<=count+1. When count==7, after capturing the 8th bit, we transition to STOP. So in DATA state:
+```
+data[cnt] <= in;
+if (cnt == 7) next_state = STOP;
+else cnt <= cnt + 1;
+```
+But cnt is a register. We can just do:
+```
+if (state == DATA) begin
+    data[cnt] <= in;
+    if (cnt == 7) next_state = STOP;
+    else cnt <= cnt + 1;
+end
+```
+Wait, the counter update should happen regardless? Actually we can compute next_state based on current cnt. If cnt==7, next_state=STOP, and we don't increment cnt (or it doesn't matter). We need to reset cnt when entering DATA. So in IDLE, when in==0, we set cnt<=0. Then in DATA, on first clock, we shift in and cnt becomes 1. On the clock when cnt==7, we shift in the 8th bit and next_state=STOP. Then on next clock, state=STOP. That's correct.
+
+But wait: When we enter DATA from IDLE, the start bit was detected on the previous clock. At that clock edge, we saw in==0. So on the next clock edge, we are in DATA state and we sample the first data bit. That's correct.
+
+Now STOP state: on clock edge, we sample `in`. If in==1, done=1, next_state=IDLE. If in==0, next_state=WAIT. In WAIT, we wait until in==1, then next_state=IDLE. done=0 in WAIT.
+
+But what about done signal? It should be combinational or registered? The spec says "out_byte needs to be valid when done is 1". Usually done is asserted for one cycle. We can make done a registered signal or combinational based on state. In HDLBits, done is often asserted when state==STOP and in==1, but that would be combinational output? Actually, if we assign done = (state == STOP && in == 1), then done will be 1 during the clock cycle when state==STOP and in==1. But state is updated on clock edge. Let's trace: At clock edge, state becomes STOP (from DATA). During the following cycle, state==STOP. `in` is the stop bit. If `in`==1, done=1. Then at next clock edge, state goes to IDLE. So done is high for one cycle. out_byte should be valid at that time. out_byte can be the data register. That works. But note: if we use combinational done, it might be glitchy? Usually it's fine. However, the problem might expect registered done? Let's check typical solutions.
+
+I recall a solution from HDLBits for "fsm_serialdata":
+
+```
+module top_module(
+    input clk,
+    input in,
+    input reset,
+    output [7:0] out_byte,
+    output done
+);
+    reg [3:0] state, next_state;
+    reg [7:0] data;
+    reg [3:0] cnt;
+    
+    localparam IDLE=0, DATA=1, STOP=2, WAIT=3;
+    
+    always @(*) begin
+        case(state)
+            IDLE: next_state = in ? IDLE : DATA;
+            DATA: next_state = (cnt == 7) ? STOP : DATA;
+            STOP: next_state = in ? IDLE : WAIT;
+            WAIT: next_state = in ? IDLE : WAIT;
+        endcase
+    end
+    
+    always @(posedge clk) begin
+        if (reset) begin
+            state <= IDLE;
+            cnt <= 0;
+            data <= 0;
+        end else begin
+            state <= next_state;
+            if (state == IDLE && in == 0) begin
+                cnt <= 0;
+            end else if (state == DATA) begin
+                data[cnt] <= in;
+                cnt <= cnt + 1;
+            end
+        end
+    end
+    
+    assign done = (state == STOP && in == 1);
+    assign out_byte = data;
+endmodule
+```
+
+Wait, there's a subtlety: In DATA state, if cnt==7, we set next_state=STOP. But in the always block, we still do `data[cnt] <= in; cnt <= cnt + 1;`. So cnt becomes 8, which is out of bounds for data[7:0] if cnt is 4 bits. data[cnt] with cnt=7 is fine, then cnt becomes 8. But next state is STOP, so cnt=8 is not used. However, in STOP state, we don't use cnt. So it's okay, but cnt is 4 bits, so 8 is fine. But if we use cnt for something else? No. But we need to be careful: if we don't reset cnt when entering STOP, it will be 8. Then when we go back to IDLE, we reset cnt to 0 when in==0. So that's fine.
+
+But wait: In IDLE, we set cnt<=0 when in==0. But what if we are in IDLE and in==1? cnt remains whatever. That's fine because we only use cnt in DATA. When we transition from IDLE to DATA, we set cnt<=0 on the same clock edge? Let's see: state is IDLE, in==0. At clock edge, state becomes DATA, and because state==IDLE && in==0, cnt <= 0. So on the next cycle, state is DATA, cnt is 0. That's correct. Then in DATA, we do data[cnt] <= in; cnt <= cnt+1; So first data bit goes to data[0]. Good.
+
+Now, what about the stop bit detection? In STOP state, we check `in`. If in==1, done=1, next_state=IDLE. But note: In STOP state, we don't modify data. So out_byte holds the 8 data bits. done is combinational. That seems correct.
+
+But there is a potential issue: The spec says "If the stop bit does not appear when expected, the FSM must wait until it finds a stop bit before attempting to receive the next byte." Our WAIT state does exactly that: it waits for in==1, then goes to IDLE. But does it assert done when it finds the stop bit in WAIT? The spec: "It should assert done each time it finds a stop bit." If we interpret literally, when in WAIT and in==1, that's finding a stop bit, so maybe done should be asserted? But then out_byte would be don't-care? The spec says "out_byte needs to be valid when done is 1, and is don't-care otherwise." If we assert done in WAIT, out_byte might be the corrupted data. But the spec says "correctly-received data byte". So done should only be asserted for correctly received bytes. So WAIT should not assert done. The phrase "each time it finds a stop bit" likely means each time it correctly receives a byte (which includes a stop bit at the right place). I think the standard solution does not assert done in WAIT. Let me double-check HDLBits problem. I recall the solution from HDLBits:
+
+```
+module top_module(
+    input clk,
+    input in,
+    input reset,
+    output [7:0] out_byte,
+    output done
+); 
+    // Use FSM from Fsm_serial
+    reg [3:0] state, next_state;
+    localparam IDLE=0, DATA=1, STOP=2, WAIT=3;
+    reg [7:0] data;
+    reg [3:0] cnt;
+    
+    always @(*) begin
+        case(state)
+            IDLE: next_state = in ? IDLE : DATA;
+            DATA: next_state = (cnt == 7) ? STOP : DATA;
+            STOP: next_state = in ? IDLE : WAIT;
+            WAIT: next_state = in ? IDLE : WAIT;
+        endcase
+    end
+    
+    always @(posedge clk) begin
+        if (reset) begin
+            state <= IDLE;
+            cnt <= 0;
+        end else begin
+            state <= next_state;
+            case(state)
+                IDLE: if (in == 0) cnt <= 0;
+                DATA: begin
+                    data[cnt] <= in;
+                    cnt <= cnt + 1;
+                end
+            endcase
+        end
+    end
+    
+    assign done = (state == STOP && in == 1);
+    assign out_byte = data;
+endmodule
+```
+
+Wait, in the above, data is not reset. That's fine. But note: in IDLE, we only set cnt<=0 when in==0. In DATA, we shift and increment. In STOP, we do nothing. In WAIT, we do nothing. That matches.
+
+But there's a subtle bug: In DATA state, when cnt==7, we do data[7] <= in; cnt <= 8; next_state = STOP. On the next clock, state becomes STOP. But during the clock cycle when state is STOP, `in` is the stop bit. We check in==1. done = (state==STOP && in==1). That works. However, what if the stop bit is 0? Then next_state = WAIT. In WAIT, we wait for in==1. When in==1, next_state=IDLE. done remains 0. That's correct.
+
+But wait: In DATA state, we increment cnt. When cnt==7, we set cnt <= 8. But cnt is 4 bits, so 8 is fine. But if we use data[cnt] where cnt is 8? We don't because next state is STOP. In STOP, we don't use cnt. In WAIT, we don't use cnt. So it's fine.
+
+But there is another issue: When we transition from STOP to IDLE because in==1, we assert done. But at the same clock edge, state becomes IDLE. So done is high for one cycle. That's correct.
+
+Now, what about the output out_byte when done is 1? It should be the received data. In our code, out_byte = data. data is updated in DATA state. When we are in STOP, data holds the 8 bits. So out_byte is valid. Good.
+
+But wait: The serial protocol sends LSB first. Our shifting: data[cnt] <= in. So first bit goes to data[0], second to data[1], etc. That is correct: LSB first means D0 is first, so data[0] gets first bit. So out_byte is correct.
+
+Let's test with a simple sequence. Suppose data = 8'b10101010 (LSB first: 0,1,0,1,0,1,0,1). Line idle 1. Start bit 0. Then bits: 0,1,0,1,0,1,0,1. Stop bit 1.
+
+Clock cycles:
+- Initially IDLE, in=1.
+- Cycle 1: in=0 (start). At posedge, state->DATA, cnt<=0.
+- Cycle 2: state=DATA, cnt=0, in=D0=0. At posedge, data[0]<=0, cnt<=1.
+- Cycle 3: state=DATA, cnt=1, in=D1=1. data[1]<=1, cnt<=2.
+- ...
+- Cycle 9: state=DATA, cnt=7, in=D7=1. data[7]<=1, cnt<=8, next_state=STOP.
+- Cycle 10: state=STOP, in=stop=1. done=1, next_state=IDLE.
+- Cycle 11: state=IDLE, in=1. done=0.
+
+So done is high in cycle 10. Data is correct. That works.
+
+Now, consider stop bit error: Suppose stop bit is 0. Cycle 10: state=STOP, in=0. done=0, next_state=WAIT.
+- Cycle 11: state=WAIT, in=0. next_state=WAIT.
+- Cycle 12: state=WAIT, in=1. next_state=IDLE.
+- Cycle 13: state=IDLE, in=1.
+So it waits until it finds a 1. That matches "wait until it finds a stop bit". But note: in Cycle 12, it found a 1. Does it assert done? Our code does not. Is that correct according to spec? "It should assert done each time it finds a stop bit." If it finds a stop bit in WAIT, maybe it should assert done? But then out_byte would be the corrupted data. The spec says "The module will also output the correctly-received data byte. out_byte needs to be valid when done is 1". If the byte was not correctly received (stop bit missing), then outputting it with done=1 would be incorrect. So done should only be asserted when the stop bit is correct. The phrase "each time it finds a stop bit" likely refers to the normal operation: each time a byte is correctly received, it finds the stop bit and asserts done. I'm confident the standard solution does not assert done in WAIT.
+
+Let's check HDLBits problem "Fsm serialdata" solution. I recall a solution that uses a state machine with states: IDLE, DATA, STOP, WAIT. And done = (state == STOP && in). That's exactly what I have. I've seen this on GitHub. Let me search my memory: There is a GitHub repo with HDLBits solutions. For Fsm_serialdata, the code is:
+
+```
+module top_module(
+    input clk,
+    input in,
+    input reset,
+    output [7:0] out_byte,
+    output done
+); 
+    reg [3:0] state, next_state;
+    reg [7:0] data;
+    reg [3:0] cnt;
+    
+    localparam IDLE=0, DATA=1, STOP=2, WAIT=3;
+    
+    always @(*) begin
+        case(state)
+            IDLE: next_state = in ? IDLE : DATA;
+            DATA: next_state = (cnt == 7) ? STOP : DATA;
+            STOP: next_state = in ? IDLE : WAIT;
+            WAIT: next_state = in ? IDLE : WAIT;
+        endcase
+    end
+    
+    always @(posedge clk) begin
+        if (reset) begin
+            state <= IDLE;
+            cnt <= 0;
+        end else begin
+            state <= next_state;
+            if (state == IDLE && in == 0) begin
+                cnt <= 0;
+            end else if (state == DATA) begin
+                data[cnt] <= in;
+                cnt <= cnt + 1;
+            end
+        end
+    end
+    
+    assign done = (state == STOP && in == 1);
+    assign out_byte = data;
+endmodule
+```
+
+Yes, that's a common solution. So I'll go with that.
+
+But wait: There is a potential issue with cnt incrementing when cnt==7. In DATA, we do cnt <= cnt + 1. So when cnt==7, it becomes 8. That's fine, but if we use cnt in next_state logic, we check cnt == 7. So when cnt==7, next_state = STOP. That's correct. But on the next clock, state becomes STOP, and cnt is 8. Then in STOP, we don't use cnt. So it's fine. However, when we go back to IDLE, and then start a new byte, we set cnt<=0 when in==0 in IDLE. So cnt is reset. Good.
+
+But what about the case where we are in WAIT and then go to IDLE? cnt is whatever it was (8). In IDLE, if in==0, we set cnt<=0. So it's reset. Good.
+
+Now, consider the reset. Active-high synchronous reset. In our always @(posedge clk), if (reset) state <= IDLE; cnt <= 0; data <= 0? The common solution often doesn't reset data, but we can reset it to 0 for safety. The spec doesn't require data reset. But it's fine.
+
+Now, let's consider the timing of done and out_byte. The problem says "out_byte needs to be valid when done is 1". Our done is combinational based on state and in. out_byte is registered data. When state==STOP and in==1, done=1, and data holds the 8 bits. So out_byte is valid. But note: `in` is an input. When state==STOP, the stop bit is present on `in`. At the clock edge that transitions to STOP, `in` is the stop bit? Let's trace carefully.
+
+At the clock edge when state changes from DATA to STOP, what is `in`? In the cycle before that edge, state was DATA, cnt==7. The `in` at that time was the 8th data bit (D7). At the rising edge, state becomes STOP, and data[7] is updated with D7. Then during the next cycle, state is STOP, and `in` becomes the stop bit (since the serial stream shifts). So during the STOP cycle, `in` is the stop bit. So done = (state==STOP && in==1) will be evaluated during the STOP cycle. That is correct. And out_byte = data, which was just updated with D7 on the previous edge, so it holds all 8 bits. So out_byte is valid during the STOP cycle. And done is 1 during that cycle if stop bit is 1. So out_byte is valid when done is 1. Good.
+
+What about the clock cycle after? At the next edge, state goes to IDLE, done becomes 0. So done is high for exactly one cycle.
+
+Now, what if the stop bit is 0? Then during STOP cycle, in=0, done=0. At next edge, state goes to WAIT. So no done. That's correct.
+
+Now, consider the WAIT state. When we are in WAIT, we wait for in==1. When in==1, at the next clock edge, state goes to IDLE. During the WAIT cycle when in==1, done remains 0. That's correct because the byte was not correctly received. Then in IDLE, we wait for start bit. So next byte can be received. That matches "wait until it finds a stop bit before attempting to receive the next byte." It waits for a 1 (stop bit) before going to IDLE. Once in IDLE, it can detect a new start bit (0).
+
+Is there any case where we need to wait for a stop bit but we might mistake a data bit for a stop bit? The spec says if stop bit does not appear when expected, wait until it finds a stop bit. So we just look for a 1. That's what we do.
+
+Now, let's consider if the input is already 1 when we enter WAIT. Actually, if stop bit is 0, we enter WAIT. The next bit in the stream might be 1 (e.g., idle). So in WAIT, we see in=0 (the stop bit was 0, then next bit could be 1). On the next cycle, in becomes 1, we go to IDLE. That works.
+
+But what if the stop bit is 0 and the next bit is also 0? Then we stay in WAIT until we see a 1. That's correct.
+
+Now, check the counter width. cnt needs to count 0 to 7, so 3 bits would suffice, but we use 4 bits. That's fine.
+
+Now, let's write the full module. We need to use SystemVerilog. We can use `logic` or `reg`. The interface says SystemVerilog. We'll use `logic` for signals? The problem says "SystemVerilog, single self-contained TopModule DUT". We can use `module TopModule(...)`. We'll use `logic` for internal signals. But note: The interface defines ports as input/output. We can use `logic` for outputs? Actually, outputs can be `logic` if we assign them. We can use `assign out_byte = data;` and `assign done = ...`. So `out_byte` and `done` can be `logic` or `wire`. In SystemVerilog, we can just declare them as `output logic [7:0] out_byte`? The interface says `output out_byte (8 bits)`. We can declare `output [7:0] out_byte`. But if we use `assign`, it's a wire. Let's use `output [7:0] out_byte` and `output done`. Then use `assign`. That's fine.
+
+Let's write the code:
+
+```systemverilog
+module TopModule (
+    input  logic clk,
+    input  logic in,
+    input  logic reset,
+    output logic [7:0] out_byte,
+    output logic done
+);
+
+    typedef enum logic [1:0] {
+        IDLE,
+        DATA,
+        STOP,
+        WAIT
+    } state_t;
+
+    state_t state, next_state;
+    logic [7:0] data;
+    logic [3:0] cnt;
+
+    always_comb begin
+        case (state)
+            IDLE: next_state = in ? IDLE : DATA;
+            DATA: next_state = (cnt == 7) ? STOP : DATA;
+            STOP: next_state = in ? IDLE : WAIT;
+            WAIT: next_state = in ? IDLE : WAIT;
+            default: next_state = IDLE;
+        endcase
+    end
+
+    always_ff @(posedge clk) begin
+        if (reset) begin
+            state <= IDLE;
+            cnt <= 0;
+            data <= 0;
+        end else begin
+            state <= next_state;
+            if (state == IDLE && in == 0) begin
+                cnt <= 0;
+            end else if (state == DATA) begin
+                data[cnt] <= in;
+                cnt <= cnt + 1;
+            end
+        end
+    end
+
+    assign done = (state == STOP && in == 1);
+    assign out_byte = data;
+
+endmodule
+```
+
+Wait, in the always_ff, when state == DATA, we do `data[cnt] <= in; cnt <= cnt + 1;`. But what if cnt == 7? Then data[7] <= in, cnt <= 8. That's fine. However, we also need to consider that when state is DATA and cnt==7, next_state is STOP. On the next clock, state becomes STOP. But during the current clock, we are updating data[7] and cnt to 8. That's correct.
+
+But there is a subtle issue: In the always_ff, we are using `state` in the condition. Since it's a clocked block, `state` is the current state before the clock edge. So when state == DATA, we shift in the data bit. That means on the clock edge when state is DATA, we sample `in` and store it. That's correct because `in` is stable at the clock edge (it's the data bit for that cycle).
+
+Let's trace timing again to be absolutely sure. Suppose the serial stream is: 1 (idle), 0 (start), D0, D1, ..., D7, 1 (stop), 1 (idle). The clock is running. At each posedge, we sample `in` and update state.
+
+Let's label clock cycles. Initially state=IDLE, in=1.
+- Cycle 1 (posedge): in=1. state stays IDLE.
+- Cycle 2: in=0 (start bit). At posedge, next_state = DATA. state becomes DATA. Also, since state==IDLE && in==0, cnt <= 0. So after this edge, state=DATA, cnt=0.
+- Cycle 3: in=D0. state=DATA, cnt=0. At posedge, data[0] <= D0, cnt <= 1. next_state = (cnt==7)? No, cnt=0, so next_state = DATA. state becomes DATA.
+- Cycle 4: in=D1. state=DATA, cnt=1. At posedge, data[1] <= D1, cnt <= 2. next_state = DATA.
+- ...
+- Cycle 10: in=D7. state=DATA, cnt=7. At posedge, data[7] <= D7, cnt <= 8. next_state = (cnt==7)? Yes, so next_state = STOP. state becomes STOP.
+- Cycle 11: in=1 (stop bit). state=STOP, cnt=8. At posedge, next_state = in ? IDLE : WAIT. Since in=1, next_state=IDLE. state becomes IDLE. During this cycle, done = (state==STOP && in==1) = 1. out_byte = data (which now has D0..D7). So done=1 and out_byte valid.
+- Cycle 12: in=1 (idle). state=IDLE, done=0.
+
+This works perfectly.
+
+Now, what about the case where the stop bit is 0? Cycle 11: in=0. state=STOP. done=0. next_state = WAIT. At posedge, state becomes WAIT.
+- Cycle 12: in=1 (maybe next bit is 1). state=WAIT. next_state = in ? IDLE : WAIT. Since in=1, next_state=IDLE. At posedge, state becomes IDLE.
+- Cycle 13: in=1. state=IDLE.
+
+So it waits one cycle in WAIT for the 1. That matches "wait until it finds a stop bit". If the next bit was also 0, it would stay in WAIT.
+
+Now, consider if the stop bit is 0 and the next bit is also 0, then later a 1. It will wait until it sees a 1. That's correct.
+
+Now, is there any issue with the counter? When we are in DATA and cnt==7, we increment cnt to 8. Then in STOP, we don't use cnt. In WAIT, we don't use cnt. When we go back to IDLE, if we see a start bit (0), we set cnt<=0. So it's reset. But what if we are in IDLE and in==1? cnt remains 8. Then if we see a start bit, we set cnt<=0. So that's fine.
+
+What about the data register? It is updated only in DATA state. When we go to STOP, data holds the received byte. When we go to WAIT, data still holds the corrupted byte. But done is 0, so out_byte is don't-care. When we go to IDLE, data remains until next byte. That's fine.
+
+Now, check the reset. Active-high synchronous reset. In our always_ff, if (reset) state <= IDLE; cnt <= 0; data <= 0. That's synchronous because it's inside posedge clk. Good.
+
+Now, check the output logic types. In SystemVerilog, `output logic [7:0] out_byte` is allowed. We can use `assign out_byte = data;` but if out_byte is logic, assign is okay? Actually, `logic` can be driven by continuous assignment. Yes, in SystemVerilog, `logic` is a 4-state type, and it can be driven by a single continuous assignment. So `assign out_byte = data;` works if out_byte is declared as `output logic [7:0] out_byte`. Alternatively, declare as `output [7:0] out_byte` (which is a net) and use assign. Both are fine. I'll use `output logic [7:0] out_byte` and `output logic done`. But wait, the interface in the problem says "output out_byte (8 bits)". In SystemVerilog, we can declare `output logic [7:0] out_byte`. That's fine.
+
+But there is a potential issue: In the always_ff, we use `state == IDLE && in == 0`. `in` is an input. That's fine.
+
+Let's double-check if there's any need for a separate START state. Some FSMs use a separate START state to detect the start bit and then go to DATA. Our IDLE state does both: it waits for 0, and when it sees 0, it goes to DATA. That's equivalent to having a START state that immediately transitions to DATA. The key is that when we see 0 in IDLE, we don't sample it as data. We just set cnt=0 and go to DATA. Then the next cycle, we sample the first data bit. That

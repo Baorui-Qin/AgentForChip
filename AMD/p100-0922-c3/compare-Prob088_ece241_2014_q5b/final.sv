@@ -1,0 +1,30 @@
+
+module TopModule (
+    input  logic clk,
+    input  logic areset,
+    input  logic x,
+    output logic z
+);
+
+    logic stateA;
+    logic stateB;
+    logic nextA;
+    logic nextB;
+
+    always_comb begin
+        nextA = stateA & ~x;
+        nextB = (stateA & x) | stateB;
+        z     = stateA ? x : ~x;
+    end
+
+    always_ff @(posedge clk or posedge areset) begin
+        if (areset) begin
+            stateA <= 1'b1;
+            stateB <= 1'b0;
+        end else begin
+            stateA <= nextA;
+            stateB <= nextB;
+        end
+    end
+
+endmodule

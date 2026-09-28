@@ -26,6 +26,13 @@ it('generates only a transparent reference wrapper and refuses unsupported publi
   for (const text of [' - input a (N bits)', ' - inout pin', ' - output a\n - input a', '']) expect(() => publicInterface(text)).toThrow()
   expect(() => referenceWrapper({ ...tasks[0]!, interface_error: 'PUBLIC_INTERFACE_UNSUPPORTED' })).toThrow()
 })
+it('accepts public-list punctuation and unique inline module declarations without reading a reference', () => {
+  expect(publicInterface(' - input a (8 bits),\n - output b (8 bits),')).toEqual(tasks[0]!.interface)
+  expect(publicInterface('Fix this module: module TopModule(input [7:0] a, output reg [7:0] b); always @* b=a; endmodule')).toEqual(tasks[0]!.interface)
+  expect(() => publicInterface('module TopModule(input a, output b); endmodule\nmodule TopModule(input a,output b); endmodule')).toThrow()
+  expect(() => publicInterface('An 8-bit 2-to-1 mux: module TopModule(input sel, input [7:0] a,b, output out); endmodule')).toThrow('PUBLIC_INTERFACE_CONFLICT')
+  expect(() => publicInterface(' - input a;\n - output b')).toThrow()
+})
 it('rejects a different dataset revision before reading assets', async () => {
   await expect(loadP10Dataset('missing', 'changed', '')).rejects.toThrow('REVISION_CHANGED')
 })

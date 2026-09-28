@@ -1,0 +1,242 @@
+We need answer exactly one complete DUT between [BEGIN] and [DONE]. Need no explanation. Need implement TopModule. Need be careful with spec, FSM Moore. Let's derive.
+
+We need outputs registered? Moore state machine, sequential logic triggered posedge clk, async reset positive. areset resets to walk left. Outputs depend on state only. State includes direction and activity: walking left/right, falling, digging. Need remember direction during fall/dig. Since digging continues until ground=0 then fall, then resume original direction. Digging direction? outputs digging=1, walk outputs 0, aaah 0. During digging, direction memory retained. If bump during digging no effect. If ground=0 while digging, transition to falling in same direction. Falling output aaah=1. If ground=1 while falling, resume walking same direction. Bump while falling ignored. If bump same cycle as ground disappears (but not yet falling), or when ground reappears while still falling, ignored.
+
+Precedence: fall higher than dig higher than switch. Need parse edge cases: "Being bumped while falling does not affect walking direction, and being bumped in the same cycle as ground disappears (but not yet falling), or when the ground reappears while still falling, also does not affect the walking direction."
+
+In Moore, state transition on clock based on current state and inputs. If walking on ground and ground=0, transition to falling, bump ignored for direction. If walking and ground=1, dig=1 -> digging. Else bumps switch. If currently digging and ground=1, stay digging; if ground=0, transition to falling. If currently falling and ground=0, stay falling; if ground=1, transition to walking with stored direction (bump ignored). Also when walking ground=1 and bump same cycle as? no ground disappears only if ground=0. So okay.
+
+Outputs:
+- walk_left = state == WALK_L
+- walk_right = state == WALK_R
+- aaah = state == FALL
+- digging = state == DIG
+
+Need encode states with direction for FALL/DIG. States: WL, WR, FL, FR, DL, DR. Reset WL.
+
+Transitions:
+WL:
+ if (!ground) -> FL (fall precedence)
+ else if (dig) -> DL
+ else if (bump_left || bump_right?) Spec: "if bumped on left, walk right. If bumped on right, walk left. If bumped on both sides at same time, still switch directions." For WL (walking left), bump_left means obstacle on left, so switch to right. bump_right means obstacle on right? Wait if walking left, bump on right would be behind? Wording: "if a Lemming is bumped on the left (by receiving a 1 on bump_left), it will walk right. If it's bumped on the right (by receiving a 1 on bump_right), it will walk left." This seems regardless of current direction? Actually state walking left, if bump_left=1 -> walk right. If bump_right=1 -> walk left. So in WL, bump_left -> WR, bump_right keeps WL? But "switch directions if hits obstacle" If walking left, obstacle on left -> switch to right (bump_left). bump_right likely obstacle on right, so while walking left, moving away? But spec says if bumped on right, it will walk left. So in WL, bump_right=1 -> WL (no change), bump_left=1 -> WR. If both -> still switch -> WR. So effective: if bump_left -> WR else stay WL. However some common HDLBits Lemmings problem: state transitions:
+LEFT: if bump_left then RIGHT; if bump_right then LEFT? Actually the classic problem: "If bumped on left, walk right. If bumped on right, walk left. If bumped on both, switch." For state LEFT, bump_left -> RIGHT, bump_right -> LEFT? Let's recall HDLBits Lemmings1: state left/right, inputs bump_left/bump_right. The solution:
+if (bump_left) state <= RIGHT;
+else if (bump_right) state <= LEFT;
+So in LEFT, bump_left switches to RIGHT; bump_right keeps LEFT. In RIGHT, bump_right switches to LEFT; bump_left keeps RIGHT. Both: left state bump_left wins to RIGHT; right state bump_right? Wait if both, for LEFT, bump_left true -> RIGHT. For RIGHT, bump_right true -> LEFT. So switch. That matches "if bumped on both sides at same time, it will still switch directions." So in WL: bump_left => WR; else if bump_right => WL (no change). In WR: bump_right => WL; else if bump_left => WR (no change). But if both, for WR, bump_right -> WL. Good. But could simplify: WL switches to WR if bump_left; WR switches to WL if bump_right. Because bump opposite no effect. But if both, bump_left in WL triggers switch, bump_right in WR triggers switch. Good.
+
+Need consider direction during dig: DL means digging while facing left (was walking left). DR facing right. During dig, if ground=0 -> FL/FR. If ground=1 stay. Bump ignored.
+
+Fall: FL facing left, FR facing right. If ground=0 stay. If ground=1 -> WL or WR. Bump ignored.
+
+Walking: fall if !ground; dig if ground && dig; else switch direction per bumps.
+
+Question: "being bumped in the same cycle as ground disappears (but not yet falling)" Our walking transition if !ground -> fall, ignoring bumps. Good. "or when the ground reappears while still falling" if falling and ground=1 -> walking, ignoring bumps. Good.
+
+Reset positive edge triggered asynchronous positive reset: always @(posedge clk or posedge areset) if (areset) state <= WL; else ...
+
+Need ensure output walk_left etc combinational from state (Moore). Could assign.
+
+Need output exactly one DUT. Use SystemVerilog. Can define localparam or enum. Since exactly one self-contained TopModule and inline helpers. Use enum logic [2:0]? ports one bit. Syntax: module TopModule(input clk, input areset, ... output logic walk_left, ...); Maybe outputs wire? Use logic. Use typedef enum logic [2:0] {WL, WR, FL, FR, DL, DR} state_t; state_t state, next; always_ff @(posedge clk or posedge areset) ... but asynchronous reset in always_ff with posedge areset? SystemVerilog always_ff supports async reset? Actually always_ff @(posedge clk or posedge areset) if (areset) ... else ... Yes. Or always @(posedge clk or posedge areset). Need be safe for synthesis. Use always_ff.
+
+Combinational next with always_comb. Need avoid latch? set default next = state; then case.
+
+Let's verify transitions.
+
+WL:
+ if (!ground) next = FL;
+ else if (dig) next = DL;
+ else if (bump_left) next = WR;
+ else next = WL;
+Wait what about bump_right? If bump_right=1 and bump_left=0, next=WL (no change). That's correct. If both, bump_left true -> WR. Good.
+
+WR:
+ if (!ground) next = FR;
+ else if (dig) next = DR;
+ else if (bump_right) next = WL;
+ else next = WR;
+
+FL:
+ if (ground) next = WL; else next = FL;
+
+FR:
+ if (ground) next = WR; else next = FR;
+
+DL:
+ if (!ground) next = FL; else next = DL;
+
+DR:
+ if (!ground) next = FR; else next = DR;
+
+Outputs:
+assign walk_left = (state == WL);
+assign walk_right = (state == WR);
+assign aaah = (state == FL || state == FR);
+assign digging = (state == DL || state == DR);
+
+Need consider reset: areset positive edge triggered asynchronous. state <= WL. Outputs maybe unknown until reset? okay.
+
+Potential ambiguity: "When ground=0, the Lemming will fall and say aaah! When the ground reappears (ground=1), the Lemming will resume walking in the same direction as before the fall." Our transition from fall to walk occurs on clock cycle when ground=1. If ground=0 and then ground=1 same cycle? No.
+
+What about dig: "starts digging when dig=1. A Lemming can dig if it is currently walking on ground (ground=1 and not falling), and will continue digging until it reaches the other side (ground=0)." When digging and ground=0, transition to fall. Then when ground=1, resume walking in original direction. Good.
+
+"Being bumped while digging has no effect" Our DL/DR ignore bumps. Good.
+
+Need ensure if dig=1 and bump also, dig precedence. Our walking: if !ground fall, else if dig dig, else if bump switch. Good.
+
+"fall has higher precedence than dig, which has higher precedence than switching directions." Our walking: !ground > dig > bump. Good.
+
+One subtlety: "being bumped in the same cycle as ground disappears (but not yet falling)" — if current state walking, ground=0, bump=1, next fall. Our does. "or when the ground reappears while still falling" — if current state falling, ground=1, bump=1, next walking. Our does. Good.
+
+Could there be state where ground=0 but dig=1 while walking? fall wins. Good.
+
+What about if ground=0 while digging, does dig output remain for that cycle? Since Moore outputs based on current state, if current state DL/DR and ground=0, digging=1 for that cycle, next state fall. That matches "will continue digging until it reaches the other side (ground=0). At that point, since there is no ground, it will fall" likely digging output may be high the cycle ground=0? Moore state: it's still digging state until clock edge, so digging=1. At next cycle aaah. That's typical. If spec expects digging goes low when ground=0? "continue digging until it reaches the other side (ground=0). At that point ... it will fall" Could be when ground=0, it is still digging in that cycle? In Moore, outputs depend on state, state changes on clock. If ground=0 sampled at posedge, state goes to fall, output next cycle aaah. During the cycle ground=0, state still digging, output digging=1. Is that "at that point"? Usually synchronous FSM, input ground=0 during cycle, state remains digging until clock edge. That is correct. Similarly, when walking and ground=0, output walk remains 1 for that cycle, aaah next cycle. That's standard.
+
+Need maybe use enum or localparam. Use SystemVerilog. Exact interface names and widths. Ports: clk, areset, bump_left, bump_right, ground, dig, walk_left, walk_right, aaah, digging. All one bit. No other ports.
+
+Return exactly [BEGIN] ... [DONE]. No explanation. Need ensure no markdown? It says exactly one complete DUT between [BEGIN] and [DONE]. Could include module code. No extra text.
+
+Let's craft.
+
+Potential issue: `always_ff` with `posedge areset` is fine. But some tools prefer `or`. Use `always @(posedge clk or posedge areset)` for compatibility. But constraints SystemVerilog. Use `logic` and `typedef enum`. Fine.
+
+Let's write:
+
+module TopModule (
+    input  logic clk,
+    input  logic areset,
+    input  logic bump_left,
+    input  logic bump_right,
+    input  logic ground,
+    input  logic dig,
+    output logic walk_left,
+    output logic walk_right,
+    output logic aaah,
+    output logic digging
+);
+
+    typedef enum logic [2:0] {
+        WL, WR, FL, FR, DL, DR
+    } state_t;
+
+    state_t state, next;
+
+    always @(posedge clk or posedge areset) begin
+        if (areset)
+            state <= WL;
+        else
+            state <= next;
+    end
+
+    always_comb begin
+        next = state;
+        case (state)
+            WL: begin
+                if (!ground)
+                    next = FL;
+                else if (dig)
+                    next = DL;
+                else if (bump_left)
+                    next = WR;
+                else
+                    next = WL;
+            end
+            WR: begin
+                if (!ground)
+                    next = FR;
+                else if (dig)
+                    next = DR;
+                else if (bump_right)
+                    next = WL;
+                else
+                    next = WR;
+            end
+            FL: begin
+                if (ground)
+                    next = WL;
+                else
+                    next = FL;
+            end
+            FR: begin
+                if (ground)
+                    next = WR;
+                else
+                    next = FR;
+            end
+            DL: begin
+                if (!ground)
+                    next = FL;
+                else
+                    next = DL;
+            end
+            DR: begin
+                if (!ground)
+                    next = FR;
+                else
+                    next = DR;
+            end
+            default: next = WL;
+        endcase
+    end
+
+    assign walk_left  = (state == WL);
+    assign walk_right = (state == WR);
+    assign aaah       = (state == FL) || (state == FR);
+    assign digging    = (state == DL) || (state == DR);
+
+endmodule
+
+Check if `always_comb` with next variable and state enum. Good.
+
+Potential issue: Using `dig` as input name conflicts with keyword? `dig` is not a SystemVerilog keyword. Fine.
+
+Potential issue: reset "positive edge triggered asynchronous" means areset positive edge triggers reset. We use posedge areset. Good.
+
+Potential issue: "Assume all sequential logic is triggered on the positive edge of the clock." Asynchronous reset also. Good.
+
+Now, could there be a nuance about bump while digging: "being told to dig when falling or when there is no ground is ignored." In falling, dig ignored. Our fall ignores dig. In walking with ground=0, fall precedence, so dig ignored. Good.
+
+What about "A Lemming can dig if it is currently walking on ground (ground=1 and not falling)" — if walking and ground=1, dig=1, start digging. Good.
+
+What about "will continue digging until it reaches the other side (ground=0). At that point, since there is no ground, it will fall (aaah!), then continue walking in its original direction once it hits ground again." Our dig to fall with same direction, then walk same direction. Good.
+
+What about "As with falling, being bumped while digging has no effect" — our DL/DR ignore bumps. Good.
+
+What about "If it's bumped on both sides at the same time, it will still switch directions." For WL: bump_left=1, bump_right=1 -> next WR. For WR: bump_right=1 -> next WL. Good. If both in WL, our logic checks bump_left only, so switch. If both in WR, checks bump_right only, switch. Good.
+
+But wait: In WL, if bump_right=1 only, our next stays WL. Is that correct? Let's reconsider spec: "It will switch directions if it hits an obstacle. In particular, if a Lemming is bumped on the left (by receiving a 1 on bump_left), it will walk right. If it's bumped on the right (by receiving a 1 on bump_right), it will walk left." This statement might imply regardless of current direction, bump_left causes walk right, bump_right causes walk left. So if current is WL, bump_right=1 would cause it to walk left (no change). If current is WR, bump_left=1 would cause it to walk right (no change). So our logic matches: In WL, bump_right doesn't change. In WR, bump_left doesn't change. Yes.
+
+Let's verify with classic HDLBits Lemmings1:
+The FSM has states left, right. Inputs bump_left, bump_right.
+Transitions:
+left: if (bump_left) right; else if (bump_right) left; (so bump_right no change)
+right: if (bump_right) left; else if (bump_left) right; (so bump_left no change)
+Yes.
+
+Now, should we include `default_nettype none`? Not needed.
+
+Need exactly one DUT between [BEGIN] and [DONE]. So final should be:
+
+[BEGIN]
+module TopModule ...
+endmodule
+[DONE]
+
+No extra.
+
+Double-check if output ports should be `output` not `output logic`? SystemVerilog allows output logic. The interface says output walk_left etc. It's fine.
+
+Potential issue: Enum encoding with 6 states requires 3 bits. Default state WL = 0. Reset WL. Good.
+
+Potential issue: `always_comb` with `next = state;` then case. If state has X, default sets WL. Good.
+
+Potential issue: asynchronous reset in always @(posedge clk or posedge areset) with nonblocking assignment to state. Fine.
+
+Could there be a need to reset next? No.
+
+Let's consider if areset is positive edge triggered, but if areset is high, state resets on posedge areset. If areset high and clock posedge occurs, always block triggers on both, but if areset high, state resets. Good.
+
+Now, any hidden testbench may check outputs at time 0 after reset? Not our concern.
+
+I think this is correct.
+
+Let's finalize.

@@ -1,0 +1,25 @@
+
+module TopModule (
+    input  logic x,
+    input  logic y,
+    output logic z
+);
+
+    logic a1, a2;
+    logic b1, b2;
+    logic or_out, and_out;
+
+    // Module A: z = (x ^ y) & x
+    assign a1 = (x ^ y) & x;
+    assign a2 = (x ^ y) & x;
+
+    // Module B: inferred as XNOR from waveform
+    assign b1 = ~(x ^ y);
+    assign b2 = ~(x ^ y);
+
+    assign or_out  = a1 | b1;
+    assign and_out = a2 & b2;
+
+    assign z = or_out ^ and_out;
+
+endmodule

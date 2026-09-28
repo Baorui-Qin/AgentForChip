@@ -1,0 +1,707 @@
+Let me analyze the spec and the example waveform carefully.
+
+The FSM: discard bytes until we see in[3]=1. That byte is byte 1 of a message. Then accumulate 3 bytes, signal done in the cycle immediately after the third byte of each message was successfully received.
+
+Wait, let's trace the example. Note the waveform shows sampling at specific times. Let's look at the waveform semantics: the times given are alternating clk=0/clk=1. Actually at time 0 clk=0 rst=1; 5ns clk=1 rst=1; 10ns clk=0 rst=1; 15ns clk=1 rst=0 in=2c; ...
+
+So the clock rises at 5,15,25,... Actually rise at 5ns (rst=1), 15ns (rst=0, in=2c), etc.
+
+Hmm but reset is synchronous active high. At 5ns clk rising edge with rst=1, reset applied.
+
+Now let's trace: at 15ns (posedge), in=2c. 2c = 0010_1100, in[3]=1. So this is byte1. At 25ns posedge, in=81 -> byte2. At 35ns posedge, in=9 -> byte3. At 45ns posedge, done=1, out_bytes=2c8109. Wait but wait: 2c is byte1, 81 is byte2, 9 is byte3, so message = 2c 81 09 = 2c8109. And done is asserted at 45ns.
+
+Hmm, at 45ns the state was BYTE3 (after receiving the third byte at 35ns). So at posedge 45ns, we output done=1 and out_bytes = {b1,b2,b3}. But according to the current implementation, at 45ns we compute out_bytes and done <= (state==BYTE3). But out_bytes is registered in BYTE3 at the same edge where done becomes 1. So out_bytes at 45ns would be {b1,b2,b3} = 2c8109. Yes matches. And done at 45ns: state at 35ns->45ns is BYTE3 (since at 35ns edge state transitioned to BYTE3). Wait let's recompute.
+
+Actually let's carefully track. State transitions at each posedge.
+
+At 15ns posedge: state was IDLE (from reset), in=2c, in[3]=1, so state <= BYTE1, b1<=2c. done <= (state==BYTE3) = 0. So at 15ns+ state=BYTE1.
+
+At 25ns: state=BYTE1, in=81. state<=BYTE2, b2<=81. done=0.
+
+At 35ns: state=BYTE2, in=9. state<=BYTE3, b3<=9. done=0.
+
+At 45ns: state=BYTE3, in=6b. out_bytes<={b1,b2,b3}=2c8109. done<=(state==BYTE3)=1. Then check in[3] of 6b=0110_1011, in[3]=1, so state<=BYTE1, b1<=6b.
+
+So at 45ns out_bytes=2c8109 and done=1. Matches waveform: 45ns done=1 out_bytes=2c8109. 
+
+At 55ns: state=BYTE1 (b1=6b), in=d. state<=BYTE2, b2<=d. done=0. waveform: 55ns done=0. Good.
+
+At 65ns: state=BYTE2, in=8d. state<=BYTE3, b3<=8d. done=0.
+
+At 75ns: state=BYTE3, in=6d. out_bytes={6b,0d,8d}=6b0d8d. done=1. waveform: 75ns done=1 out=6b0d8d. Good. in[3] of 6d=0110_1101 ->1, so state<=BYTE1, b1<=6d.
+
+At 85ns: state=BYTE1 in=12, state<=BYTE2 b2<=12, done=0.
+At 95ns: state=BYTE2 in=1, state<=BYTE3 b3<=1, done=0.
+At 105ns: state=BYTE3 in=d, out={6d,12,01}=6d1201, done=1. waveform: 105ns done=1 out=6d1201. Good. in[3] of d = 0000_1101 -> 0, so state<=IDLE.
+
+At 115ns: state=IDLE, in=76. 76=0111_0110, in[3]=0 -> discard, stay IDLE. done=0.
+At 125ns: IDLE, in=3d=0011_1101, in[3]=1 -> state<=BYTE1, b1<=3d. done=0.
+At 135ns: state=BYTE1, in=ed -> state<=BYTE2 b2<=ed, done=0.
+Wait, waveform at 135ns done=1 out=d763d. Hmm. Let's check.
+
+Hmm wait. Let me re-read the waveform:
+
+```
+115ns  1   0   76  0         x
+120ns  0   0   76  0         x
+125ns  1   0   3d  0         x
+130ns  0   0   3d  0         x
+135ns  1   0   ed  1     d763d
+140ns  0   0   ed  1     d763d
+145ns  1   0   8c  0         x
+```
+
+Hmm, at 135ns, done=1 out_bytes = 0d763d. Wait "d763d" is 5 hex digits = 0x0d763d. So message = 0d 76 3d.
+
+Hmm interesting. So byte1 = 3d, byte2 = 76? Wait.
+
+Wait, at 115ns in=76. in[3] of 76 = 0 (0111_0110, bit3=0). Hmm. So discard.
+
+But the message is 0d763d meaning bytes: 0d, 76, 3d. Hmm that doesn't match either.
+
+Wait, let me re-read. Actually wait, maybe I mis-assigned. Let me re-read the whole example.
+
+Hold on. Let me re-examine the third message: at 75ns done out=6b0d8d. Message bytes: 6b, 0d, 8d. Inputs: at 45ns in=6b, 65ns in=8d, ... hmm let me line up.
+
+Hmm wait. Let's re-align. The inputs at posedge times:
+- 15ns: 2c
+- 25ns: 81
+- 35ns: 9
+- 45ns: 6b
+- 55ns: d
+- 65ns: 8d
+- 75ns: 6d
+- 85ns: 12
+- 95ns: 1
+- 105ns: d
+- 115ns: 76
+- 125ns: 3d
+- 135ns: ed
+- 145ns: 8c
+- 155ns: f9
+- 165ns: ce
+- 175ns: c5
+- 185ns: aa
+
+First message: done at 45ns out=2c8109 => bytes 2c, 81, 09. The 09 came from input at 35ns = 9. Yes. So bytes are input[15], input[25], input[35] = 2c,81,9. Good, out=2c8109.
+
+Second message: done at 75ns out=6b0d8d => bytes 6b, 0d, 8d. Inputs: input[45]=6b, input[55]=d, ... wait 0d is input[55]=d. Then 8d = input[65]=8d. Good. So message = 6b, 0d, 8d.
+
+Hmm wait but that means the third byte is input[65]=8d, and done asserted at 75ns. And at 45ns in=6b (which was byte1), at 55ns in=d (byte2), 65ns in=8d (byte3). Yes. Then at 75ns done. Good.
+
+But wait, that means at 45ns, after byte1 was received we... hmm actually state BYTE3 at 45ns means byte1=6b was received at... wait no.
+
+Hold on, I think I mismapped. Let me redo carefully. At 45ns state=BYTE3 means bytes 1,2 received at earlier cycles. But message 2c8109 is bytes 2c(15ns),81(25ns),9(35ns). So state transitions: IDLE at 15ns, BYTE1 at 25ns, BYTE2 at 35ns, BYTE3 at 45ns. So at 45ns we're in BYTE3 holding b1=2c,b2=81,b3=9, output done=1. Then in[3] of current input 6b=1, so 6b is byte1 of next message. At 55ns state=BYTE1 with b1=6b, input d is byte2. At 65ns state=BYTE2, input 8d is byte3 -> state BYTE3. At 75ns state=BYTE3, output done with b1=6b,b2=d,b3=8d = 6b0d8d. Then input at 75ns = 6d, in[3]=1 -> byte1 of next. At 85ns BYTE1, input 12 = byte2. At 95ns BYTE2, input 1=byte3. At 105ns BYTE3, done, out = 6d 12 01 = 6d1201. input d, in[3]=0 -> IDLE. At 115ns IDLE, input 76, in[3]=0, discard; done=0. At 125ns IDLE input 3d, in[3]=1 -> BYTE1, b1=3d. At 135ns BYTE1 input ed -> BYTE2, b2=ed. done=0? But waveform says done=1 at 135ns with out=d763d.
+
+Hmm. That contradicts. Let me re-examine. Wait maybe I'm misreading the waveform alignment; perhaps the waveform lists the "in" value sampled and done at the next time... Actually let me re-read the example waveform more carefully. Perhaps the times where done=1: 45, 50, 75, 80, 105, 110, 135, 140, 165, 170. Hmm.
+
+Actually the pattern: done is high for two consecutive time entries (one clk=1 and one clk=0). So done high at 45&50, 75&80, 105&110, 135&140, 165&170. That's sample at 45ns and held at 50ns (clk low). So done evaluated at posedge 45ns.
+
+But the period between done assertions: 45, 75, 105, 135, 165 — difference 30ns each = 6 clock cycles. Because message of 3 bytes plus... hmm, 3 bytes = 3 cycles, plus done cycle? Let's see: message1 done at 45; message2 done at 75: 6 cycles later. Message bytes: byte1 at?, done cycle, byte1 next...
+
+Hmm let's think: If done at cycle T means 3rd byte received at T-1... Actually done at 45ns means the third byte was received at 35ns. Then next message's first byte must be received at 45ns (the same cycle done is asserted, since input in=6b at 45ns is the next message's byte1). Then done for message2 at 45+30=75ns. So each message takes 6 cycles? From byte1 received at 15ns to done at 45ns is 3 cycles (15->45). Then byte1 of msg2 at 45ns, done at 75ns. So each subsequent message is 30ns apart = 6 cycles. Wait 45 to 75 is 30ns = 6 clock cycles at 5ns period. Hmm, but from 15 to 45 also 30ns = 6 cycles. So consistent: each message cycle = 6 cycles. But 3 bytes should be 3 cycles... Wait 15ns to 45ns: edges at 15,25,35,45. That's 4 edges but 3 transitions. Hmm, 30 ns / 5 ns = 6 cycles? No: clock period: clk=1 at 5ns, clk=0 at 10ns, clk=1 at 15ns... so rising edges every 10ns! Because the times alternate every 5ns, and rise at 5,15,25,... So clock period = 10ns.
+
+Wait: clk=0 at 0, clk=1 at 5, clk=0 at 10, clk=1 at 15. So rising edge every 10ns. Period 10ns. Yes! So done at 45,75,105,135,165 -> 30ns apart = 3 clock cycles. 
+
+So each message takes 3 cycles: byte1, byte2, byte3, then done at next edge. Wait no. Let's see: byte1 at edge 15 (time 15ns capture), byte2 at 25, byte3 at 35, done at 45. That's 4 edges => 3 cycles after byte1? Hmm.
+
+Actually in the implementation above: state IDLE at 15ns, then at each edge. done asserted when state==BYTE3 at the edge, which is 45ns. So byte1 captured at 15, byte2 at 25, byte3 at 35, done at 45. That's 30ns from byte1 to done. Good. Then next byte1 at 45 (same edge done). Then byte2 at 55, byte3 at 65, done at 75. Good.
+
+So messages are contiguous, no gap. Now message 3: done at 105, out=6d1201. byte1=6d captured at 75, byte2=12 at 85, byte3=01 at 95, done at 105. Input at 75=6d, 85=12, 95=1 -> yes 6d,12,01. Good. Then at 75ns state BYTE3, input 6d (in[3]=1) so byte1=6d. Good.
+
+At 105ns state BYTE3, input d=0d, in[3]=0 -> IDLE. done at 105 = 1. Good.
+
+Now 115ns IDLE input 76, in[3]=0, so no start. done=0. 125ns IDLE input 3d, in[3]=1 -> byte1=3d, state BYTE1. done=0. 135ns BYTE1 input ed -> byte2=ed, state BYTE2, done=0.
+
+But waveform says at 135ns done=1 out=0d763d. Hmm that doesn't match. So maybe I misread: perhaps "d763d" is actually output bytes meaning {in?}. 0d763d -> bytes 0d,76,3d. Byte1=0d? Byte2=76? byte3=3d.
+
+Inputs: 76 at 115ns, 3d at 125ns. Hmm. And 0d appears... where? nowhere until 105ns input d. So byte1=0d?? in[3] of 0d = 1 (0000_1101, bit3=1). Hmm.
+
+Wait, maybe I'm aligning the "in" column with done wrong. Let me reconsider: maybe the "done" at row time T reflects the value AFTER the posedge at time T, and the "in" value shown at time T is the input that was... hmm.
+
+Actually, maybe the done at 135 corresponds to message {0d, 76, 3d}, and the bytes were captured at 105(in=d→but in[3]... 0d has in[3]=1), 115 (76), 125 (3d). Wait: if done at 135 and bytes captured at 105,115,125: byte1 at 105 = 0d (in[3]=1, good start), byte2 at 115=76, byte3 at 125=3d. Then done at 135. But at 105ns we were in state BYTE3 (from previous message) and input was d... Hmm but then the previous message's done would be at 105 and we'd need to also start new message at 105? conflict.
+
+Hmm, wait. Let me reconsider the timing model: Perhaps done is asserted in the cycle immediately after third byte, meaning if third byte received at edge 105, done at edge 115. But the waveform says done at 105. Let me re-check by looking at message 1: bytes 2c at 15, 81 at 25, 9 at 35. done at 45. So third byte at 35, done at 45 — one cycle after. Consistent with spec "done in the cycle immediately after the third byte".
+
+Now message with 0d,76,3d: third byte 3d at 125, so done should be at 135. Yes! And byte1=0d at 105, byte2=76 at 115, byte3=3d at 125. done at 135. 
+
+But byte1 at 105 = 0d. Hmm, at 105ns, what's the state? Previous message (6d1201) third byte was at 95 (input 1), done at 105. At 105, input=0d. Since we're at the "done" cycle (immediately after third byte), the FSM is ready to start a new message, and if in[3]=1 it takes it as byte1. in[3] of 0d = 1. Yes!
+
+So the state machine: At the done cycle, if in[3], start new message immediately with byte1 = in. So messages can be back-to-back with byte1 arriving at the done cycle.
+
+Wait but earlier for message 2 and 3, byte1 arrived at the done cycle too: message2's byte1 6b arrived at 45ns (the done cycle of message1). And message3's byte1 6d arrived at 75ns (done cycle of message2). Consistent!
+
+So actually the FSM: 
+- state IDLE: wait for in[3]=1, then byte1 captured, go to state for byte2.
+- After 3 bytes, assert done in next cycle AND simultaneously check if current in[3] starts a new message.
+
+Hmm, in the current implementation: state BYTE3 is the state during which done is... let's re-examine. Actually the current implementation: at edge where state==BYTE3, done <= 1. And that edge also latches in as b1 if in[3]=1. And out_bytes <= {b1,b2,b3}. So when done is high (in the cycle after the edge), out_bytes = the message.
+
+Wait but in the current implementation, at the edge where state==BYTE3, we set done<=1 and out_bytes<={b1,b2,b3}. So during the following cycle (done=1), out_bytes = message. But the problem: at that same edge we also may latch b1<=in for next message, but out_bytes uses old b1,b2,b3. Good.
+
+Hmm, but there's a bug: In state BYTE3, when in[3]=1, we go to state BYTE1 and set b1<=in. But then next cycle is state BYTE1 (byte2). That's correct: byte1 already captured.
+
+Wait, so where's the mismatch? Let me re-examine the message sequence with the current implementation. Actually I traced it and it seemed to match the waveform for messages 1-3. Let me re-trace message 4.
+
+Let me re-trace current implementation fully with inputs at each posedge time:
+
+Reset at 5ns (rst=1). At 15ns edge, rst=0.
+
+t=15: state=IDLE, in=2c. in[3]=1 → state=BYTE1, b1=2c. done=0.
+t=25: state=BYTE1, in=81 → state=BYTE2, b2=81. done=0.
+t=35: state=BYTE2, in=09 → state=BYTE3, b3=09. done=0.
+t=45: state=BYTE3, in=6b. done<=1. out_bytes<={2c,81,09}=2c8109. in[3] of 6b=1 → state=BYTE1, b1=6b. 
+   So at 45: done=1, out=2c8109. Matches.
+t=55: state=BYTE1, in=0d → state=BYTE2, b2=0d. done<=0.
+t=65: state=BYTE2, in=8d → state=BYTE3, b3=8d. done=0.
+t=75: state=BYTE3, in=6d. done=1, out={6b,0d,8d}=6b0d8d. in[3] of 6d=1 → state=BYTE1, b1=6d. Matches waveform (75 done=1 out=6b0d8d).
+t=85: state=BYTE1, in=12 → BYTE2, b2=12. done=0.
+t=95: state=BYTE2, in=01 → BYTE3, b3=01. done=0.
+t=105: state=BYTE3, in=0d. done=1, out={6d,12,01}=6d1201. in[3] of 0d=1 → state=BYTE1, b1=0d. So at 105, done=1, out=6d1201. Waveform: 105 done=1 out=6d1201. Matches.
+t=115: state=BYTE1, in=76 → BYTE2, b2=76. done=0. Waveform 115: done=0. Matches.
+t=125: state=BYTE2, in=3d → BYTE3, b3=3d. done=0. Waveform 125: done=0. Matches.
+t=135: state=BYTE3, in=ed. done=1, out={0d,76,3d}=0d763d. Waveform: 135 done=1 out=d763d (=0d763d). Matches! in[3] of ed=1 → state=BYTE1, b1=ed.
+t=145: state=BYTE1, in=8c → BYTE2, b2=8c. done=0. Waveform 145 done=0. Matches.
+t=155: state=BYTE2, in=f9 → BYTE3, b3=f9. done=0.
+t=165: state=BYTE3, in=ce. done=1, out={ed,8c,f9}=ed8cf9. Waveform 165 done=1 out=ed8cf9. Matches. in[3] of ce = 1100_1110, in[3]=0 → state=IDLE.
+t=175: state=IDLE, in=c5. in[3] of c5=1100_0101 → 0. stay IDLE. done=0. Waveform 175 done=0. Matches.
+t=185: IDLE, in=aa. in[3]=0. stay. done=0. Matches.
+
+So the current implementation appears to match the waveform perfectly! But the verification says 1897 mismatches out of 3117. Hmm.
+
+Wait, maybe the issue: done at reset. At reset, done<=0. After reset deasserted... Let's check the very first cycle. At 5ns rst=1, state=IDLE, done=0, out_bytes=0. At 10ns (clk=0). At 15ns rst=0. Fine.
+
+Hmm so what's wrong? Let me reconsider. Maybe the testbench's reference differs: perhaps out_bytes should be valid whenever done is asserted, and maybe there's a subtlety about out_bytes being combinational or the done timing.
+
+Actually wait — maybe the mismatches are mostly in out_bytes during non-done cycles (don't care), but the testbench checks them? The spec says "You may output anything at other times (i.e., don't-care)." So presumably testbench only checks out_bytes when done. Hmm.
+
+Alternatively, maybe the discrepancy is about reset: at time 0 clk=0 rst=1, done=x. After first posedge 5ns, done=0. Fine.
+
+Hmm. 1897 mismatches out of 3117 — that's a lot, more than half. That suggests a systematic issue, maybe a different interpretation. Let me think about what could be systematically wrong.
+
+Hmm, wait. Maybe the testbench samples done differently: maybe it expects done to be asserted in the same cycle the third byte is received? No, waveform shows done one cycle after.
+
+Wait — but actually maybe the testbench applies inputs differently. Let me reconsider: perhaps the testbench drives `in` and samples outputs at the posedge, and the reference FSM is the one from HDLBits. This is HDLBits problem "fsm_ps2data" (PS/2 mouse). Actually the HDLBits ps2data problem: "The PS/2 mouse protocol... The algorithm we'll use is to discard bytes until we see one with in[3]=1. We then assume that this is byte 1 of a message, and signal the receipt of a message once all 3 bytes have been received (done)."
+
+The standard HDLBits solution (from the "fsm_ps2" combined with datapath):
+
+```
+module top_module(
+    input clk,
+    input reset,
+    input [7:0] in,
+    output [23:0] out_bytes,
+    output done);
+
+    reg [1:0] state, next_state;
+    reg [23:0] out_bytes_reg;
+
+    // states: 0=waiting for byte1 (in[3]=1), 1=got byte1, 2=got byte2, 3=got byte3/done
+    ...
+
+    always @(posedge clk) begin
+        if (reset) begin
+            state <= 0;
+            out_bytes <= 0;
+        end else begin
+            state <= next_state;
+            if (state == 0 && in[3]) out_bytes[23:16] <= in;  // hmm
+            ...
+        end
+    end
+```
+
+Hmm, the typical solution: shift in bytes. Actually maybe the issue is the output timing: the reference may output out_bytes combinationally or with different register timing.
+
+But our trace matches the given waveform exactly. Unless... the given waveform only covers one specific reset/input sequence and the testbench uses random.
+
+Let me reconsider the "done" in the current implementation. done is registered: done <= (state==BYTE3). So done is 1 during the cycle following the BYTE3 state edge. Let's check: at t=45, state (before edge) = BYTE3, so done becomes 1 at 45 (visible after 45). And out_bytes becomes {b1,b2,b3} at 45. During cycle 45-55 (i.e., sample at 45ns and 50ns), done=1 and out=mess. Good.
+
+But wait, when done is 1 (cycle after BYTE3 edge), the state is now BYTE1 (if in[3]) or IDLE. So the register `done` is set based on the previous state. That works.
+
+But consider: what if in the BYTE3 state, in[3]=1, we go to BYTE1. Then done was asserted in this cycle. During this cycle (done=1), the state is BYTE1 and b1 = new byte. Then next edge (BYTE1) captures byte2. OK.
+
+Hmm, so everything matches. Why 1897 mismatches?
+
+Let me reconsider. Maybe the issue is that out_bytes is only updated in BYTE3 state, so during "done" cycle it's correct, but the testbench checks out_bytes on ALL cycles and expects... no, spec says don't care.
+
+Hold on, maybe the mismatch is done! Let's think about when the testbench samples done. Since done is registered with `done <= (state==BYTE3)`, and state is the pre-edge state. Hmm.
+
+Actually, wait. Let me reconsider the possibility that the testbench drives `in` and the DUT samples it, but the reference is combinational done. Actually, the note "Observed verdict ... mismatches 1897 in 3117 samples" and "outputs: []".
+
+Hmm, 3117 samples. If the testbench runs ~ many cycles. 1897 mismatches is 61%. Could be that out_bytes is checked always and often wrong. But spec says don't care... The testbench might compare out_bytes only when done. But if done itself is sometimes wrong, that would cause mismatches.
+
+Let me reconsider the reset behavior. The example: at 5ns rst=1 clk rising, done becomes 0 (was x). Our impl: at reset edge done<=0. Good.
+
+Hmm, let me reconsider: maybe the issue is that the testbench expects `done` to be high in the SAME cycle as the third byte is being received? No, waveform contradicts.
+
+Wait, actually, let me re-read the waveform once more with the possibility that the sampled values correspond to AFTER the edge at that time.
+
+Times and events: 0 (initial), 5 (posedge rst=1), 10, 15 (posedge, rst=0), ...
+
+At 15ns, in=2c shown. So input applied at/around 15ns. done=0 (after edge). Our done after edge at 15 = 0 (since previous state IDLE... wait done <= (state==BYTE3) evaluated with state=IDLE). Good.
+
+Hmm, alternatively, maybe the testbench uses a different clock where rise is at 0,10,20,... Let me not overthink.
+
+Let me consider that maybe the bug is subtle: In the current code, `done` is assigned inside always_ff and also `out_bytes`. There might be an issue with the state BYTE3 handling: when in[3]=1 at BYTE3, we go to BYTE1 and latch b1. That's right. When in[3]=0, go to IDLE. Right.
+
+Hmm, but consider a message where byte2 or byte3 happens to have in[3]=... doesn't matter.
+
+Actually wait! Consider the case where after done, in[3]=0, so we go to IDLE. Then next cycle if in[3]=1, capture byte1, go BYTE1. Fine.
+
+Everything seems fine. Let me reconsider: maybe the problem is `out_bytes` in reset. Reset sets out_bytes=0. The reference might set out_bytes to something else but it's don't-care...
+
+Let me reconsider the actual number: 1897/3117. Hmm. Suppose the testbench has 3117 checks total across done and out_bytes. Actually "checks" might be per-cycle per-signal. Hard to say.
+
+Given the previous attempt also failed with identical mismatch count (1897), likely the two revisions are functionally identical-ish. The rejected revision sha is different but same mismatch count — suspicious, maybe the second revision was a no-op change.
+
+OK, let me think about what the actual HDLBits reference solution does and how it might differ.
+
+The HDLBits ps2data problem reference (from HDLBits): The intended solution:
+
+```
+module top_module (
+    input clk,
+    input [7:0] in,
+    input reset,
+    output [23:0] out_bytes,
+    output done);
+
+    parameter [1:0] BYTE1=0, BYTE2=1, BYTE3=2, DONE=3;
+    reg [1:0] state, next;
+    reg [23:0] out_bytes_q;
+    ...
+    always @(*) begin
+        case (state)
+        BYTE1: next = in[3] ? BYTE2 : BYTE1;
+        BYTE2: next = BYTE3;
+        BYTE3: next = DONE;
+        DONE:  next = in[3] ? BYTE2 : BYTE1;
+        endcase
+    end
+    always @(posedge clk) begin
+        if (reset) state <= BYTE1;
+        else state <= next;
+    end
+```
+
+Hmm, actually there's a well-known HDLBits solution where the FSM is:
+
+```
+module top_module(
+    input clk,
+    input [7:0] in,
+    input reset,
+    output [23:0] out_bytes,
+    output done);
+
+    reg [1:0] state, next_state;
+    reg [23:0] out_bytes_q;
+    ...
+```
+
+And the "done" state is a separate state (state 3), not registered done.
+
+Let me think about the exact timing expected by the HDLBits testbench. The given example waveform is presumably from the HDLBits reference. And our trace matched the waveform. So our timing should be right.
+
+Unless... the testbench samples done at a different point. Actually, the mismatch could be entirely due to out_bytes. Wait, the spec explicitly says out_bytes needs to be valid whenever done is asserted and "You may output anything at other times". But maybe the auto-generated testbench (from this task) checks out_bytes at EVERY cycle, expecting the reference's behavior even though it's "don't care". That would produce many mismatches if our out_bytes differs in non-done cycles.
+
+Hmm, but the task says tests are generated to check the spec. Typically these "Prob154" tasks come from HDLBits and the testbench compares both done and out_bytes each cycle. If the reference holds out_bytes constant (not clearing it) between messages, and we clear/set to 0 at reset only, then differences would appear only at cycles where done=0 but reference holds previous value... Actually the reference likely holds out_bytes value from last message too.
+
+But actually many such testbenches only check outputs at specific sample points. Hmm.
+
+Let me think differently: maybe there's a genuine logic bug. Let me reconsider... Actually, wait! Consider the reset: `done <= 1'b0` etc. Fine.
+
+Hmm, let me reconsider the case where a message's byte1 has in[3]=1 but then the very next... no.
+
+Let me reconsider: our FSM asserts done and simultaneously starts a new message if in[3]=1. That matches the waveform. But maybe the reference does NOT start a new message in the done cycle; instead it waits. Let's check the waveform: message1 done at 45, input at 45 = 6b with in[3]=1. Message2's byte1 includes 6b? Message2 out=6b0d8d, byte1=6b. And 6b appeared at 45ns (the done cycle). Yes, so reference DOES start new message at done cycle. Good.
+
+Hmm. So our implementation matches. Unless the testbench for this task is different from the given example. But it should be the same.
+
+Wait, maybe the given example waveform in the spec is illustrative and the testbench's expected model differs slightly in out_bytes timing. For instance, maybe out_bytes should be updated in the DONE state (registered), meaning out_bytes valid during done. In our impl out_bytes updated at the BYTE3 edge = same edge done set. So valid during done cycle. Good.
+
+Alternatively maybe the reference updates out_bytes one cycle earlier, so during done it's valid. Same.
+
+Hmm, I'm stuck on why 1897 mismatches.
+
+Let me reconsider: maybe the mismatches are all because of `out_bytes` during non-done cycles. In our impl, out_bytes = 0 before any message and holds last message after. The reference (HDLBits) likely shifts bytes in a 24-bit register continuously? Let me think about the actual HDLBits solution.
+
+Actually, here's a common HDLBits ps2data solution:
+
+```
+module top_module(
+    input clk,
+    input reset,
+    input [7:0] in,
+    output [23:0] out_bytes,
+    output done);
+
+    reg [1:0] state, next;
+    reg [7:0] b1, b2, b3;
+
+    always @(*) begin
+        case (state)
+            ...
+        endcase
+    end
+
+    always @(posedge clk) begin
+        if (reset) begin
+            state <= 0;
+        end else begin
+            state <= next;
+            case(state)
+              ...
+            endcase
+        end
+    end
+    assign out_bytes = {b1,b2,b3};
+    assign done = (state == 3);
+```
+
+Hmm. In that version, out_bytes is combinational from b1,b2,b3 and done is asserted in the DONE state (state 3), which lasts one cycle. Let's see the timing: b1,b2,b3 updated at edges. DONE state is entered at edge after b3 captured. So done=1 during the cycle following b3 capture. And out_bytes combinational = {b1,b2,b3}, which during DONE state holds the message. That matches.
+
+But the difference: out_bytes is combinational and always equals {b1,b2,b3}. In our impl, out_bytes is registered and only updated at BYTE3 edge. During BYTE1/BYTE2 states, out_bytes holds the old message; in the combinational version, out_bytes would equal the partially updated {b1,b2,b3}.
+
+If the testbench checks out_bytes every cycle (even when done=0), then these differ a lot → many mismatches. 1897/3117 ≈ 61%, consistent with the fraction of cycles where done=0 (~75%... hmm close-ish).
+
+So the fix might be: make out_bytes / done combinational based on state, or at least make out_bytes always reflect the current bytes.
+
+But spec says out_bytes don't care when done=0, so the testbench should mask... but apparently it doesn't. Hmm. But the "checks" count 3117 and mismatches 1897. If the testbench only checks done and out_bytes-when-done, then mismatches would be small. So likely it checks every cycle.
+
+Hmm, but then matching "anything" would be impossible unless we replicate exact reference behavior. That seems unreasonable for a spec that says don't care. But these auto-generated tasks sometimes do compare all outputs.
+
+Actually, wait. Let me reconsider. Maybe there IS a real bug. Let me re-examine the reset: At reset, done=0, out_bytes=0. In the reference, maybe done is combinational = (state==DONE) and state is DONE=3. Hmm.
+
+Let me reconsider: could there be an off-by-one where done should be asserted in the cycle the third byte is received rather than after? The waveform clearly shows after. So no.
+
+Hmm, let me look at the previous revision's source to understand. The previous revision 1237ad8e gave same mismatches. We only have current source.
+
+OK here's another thought: The mismatch count 1897 with 3117 checks. If per sample we check two signals (done and out_bytes) => 3117/... hmm 3117 is odd. Maybe checks = number of samples, and each mismatch = a sample where any output differs. 1897 mismatches. Hmm.
+
+Actually, if the testbench checks only at done cycles, there'd be few checks.
+
+Let me think: The full test likely runs many random bytes. Let's estimate: if 3117 samples = cycles, and done occurs ~1/3 of cycles... Actually done occurs in runs. Messages are 3 cycles, done 1 cycle. With random in, probability in[3]=1 is 1/2, but once in a message, bytes 2,3 are arbitrary. Hmm.
+
+Let me just try making the implementation more "reference-like": 
+1. done = (state == BYTE3) combinational? No wait, our done is registered as (prev state==BYTE3).
+
+Let me design a version where out_bytes is updated every cycle (shift register style) so that it always contains the last 3 bytes in a natural way, and done combinational.
+
+Actually, let me think about the reference more concretely. A very common HDLBits ps2data solution uses a shift register:
+
+```
+always @(posedge clk) begin
+    if (reset) out_bytes <= 0;
+    else out_bytes <= {out_bytes[15:0], in};   // shift in every cycle
+end
+```
+
+But that would make out_bytes = last 3 bytes always. During the DONE cycle, {b1,b2,b3} = last three bytes received = the message. Let's check: bytes received: ... at edge 35 we receive 09, at edge 45 we receive 6b. done is asserted during cycle 45-55 (after edge 45). At edge 45, out_bytes <= {out_bytes[15:0], 6b}, which would be {81,09,6b}? That's wrong. Hmm, so shift register updated every cycle gives, during done cycle, {previous 2 bytes, current} = {81,09,6b}? No.
+
+Hmm wait. Let's carefully define: If out_bytes is registered and updated every posedge with shift, then after edge 35, out_bytes = {2c,81,09}? Let's track: 
+- edge 15: out = {x,x,2c}
+- edge 25: out = {x,2c,81}
+- edge 35: out = {2c,81,09}
+- edge 45: out = {81,09,6b}
+During cycle after edge 35 (i.e., 35-45), out = {2c,81,09} which is the message. And done should be asserted during that cycle? But the waveform says done at 45, not 35. Hmm. So the timing differs.
+
+Actually, wait. Let's re-examine: the waveform at 45ns shows done=1 and out=2c8109. If out_bytes shifts every cycle, then at 45ns (after edge 45) out = {81,09,6b} = 81096b, not 2c8109. So no.
+
+So the reference must hold b1,b2,b3 and output at the right time.
+
+OK let me think about this differently. The mismatch could be due to a genuinely different expected behavior that the example waveform doesn't reveal because the example uses specific inputs.
+
+Hmm, let me reconsider: is there an issue when in[3]=1 at the DONE/BYTE3 state and also... no.
+
+Let me reconsider the possibility that the reference does NOT restart immediately but our impl does — but the waveform supports immediate restart (6b at done cycle becomes byte1 of next message). Actually wait, does it? Message2 out=6b0d8d. The "6b" appears as input at 45ns, which is the done cycle for message1. So yes, immediate restart.
+
+Hmm hold on, but could 6b be byte1 received at 45ns only if the FSM treats the done cycle's input as the start? Yes. And we do that. Good.
+
+So functionally identical to waveform. I'm fairly convinced the timing matches. So the 1897 mismatches must be due to out_bytes in non-done cycles... but wait, we don't have waveform evidence, and the errors say "Waveform unavailable".
+
+Alternatively, maybe the testbench drives reset differently: maybe reset is applied for exactly one cycle and sampled at time 0? Our reset handling: synchronous, in always_ff. Fine.
+
+Hmm, let me reconsider: maybe the testbench expects `done` to be low during reset and our done is registered so during reset cycle done<=0 — but if reset is asserted at edge and deasserted, the cycle after reset has done=0. Fine.
+
+Let me consider the possibility that the expected `done` is combinational and equals (state == DONE) where DONE is a state entered after byte3, but with the difference that in our impl done is a register that persists... no, our done updates every cycle to (state==BYTE3). It's fine.
+
+Hmm, actually! Wait. There might be a subtle issue: our `done` is assigned in the same always_ff as state. When reset is asserted, done <= 0. When reset deasserted, done <= (state==BYTE3). OK.
+
+Let me reconsider whether the mismatch might be because out_bytes is checked every cycle and the reference keeps out_bytes = last valid message continuously, whereas ours sets it to 0 at reset and then only at done. Between messages (done=0), the reference would hold the last message value, and ours holds... also the last message value (we never clear it after the first). Actually our out_bytes after reset = 0, then first updated at first message's BYTE3 edge, then stays at that value (since we only update at BYTE3). So during non-done cycles, ours holds previous message; reference (if same) holds previous message. Actually that would match! Because we hold.
+
+But during the FIRST message's bytes (before done), ours = 0 while reference might = something. And at reset cycles.
+
+Hmm, so if out_bytes is only different during the first few cycles before the first message completes, that's not 1897 mismatches.
+
+Wait, unless the reference holds b1,b2,b3 combinationally. Then during BYTE1/BYTE2 of each message, reference out = {b1, partial...}, ours = old message. That's different for ~2 cycles per message. With ~random stream, messages happen often. Could accumulate to many.
+
+Hmm, this is getting too speculative. Let me reconsider whether our logic has an actual bug with the waveform. Let me re-trace once more but being careful about the FIRST bytes after reset and the "done" at 45.
+
+Actually, I realize there might be a discrepancy: In our implementation, done is set to 1 at edge 45 because state (pre-edge) = BYTE3. But wait, how did state become BYTE3 before edge 45? At edge 35, state was BYTE2 → state<=BYTE3. So at edge 45, state=BYTE3. Yes.
+
+Hmm OK.
+
+Let me reconsider the whole thing. Perhaps the reference solution's `done` is asserted during the cycle when the state is DONE, and the state machine is:
+
+IDLE/WAIT: if in[3], go BYTE2 (having stored byte1)
+BYTE2: store byte2, go BYTE3
+BYTE3: store byte3, go DONE
+DONE: done=1; if in[3], store byte1, go BYTE2; else go WAIT
+
+With done being combinational = (state==DONE). This is exactly our behavior, just implemented with done registered. Equivalent.
+
+Given the waveform matches, I think the implementation is functionally correct per the example. So why the massive mismatch?
+
+Let me reconsider: maybe the testbench checks `out_bytes` at the DONE cycle but expects the OTHER byte order? Our order: out_bytes[23:16]=first byte. Waveform 2c8109: first=2c, second=81, third=09. Our {b1,b2,b3} = 2c,81,09. Correct.
+
+Hmm.
+
+Wait, maybe the issue is that the testbench uses a different convention: it might sample at the negative edge or something, causing an off-by-one shift for done. But then the waveform... The waveform is from the reference presumably at positive edges? The rows list clk=1 at 5,15,... and the "done/out_bytes" columns. The reference testbench in HDLBits samples at posedge? Actually HDLBits testbenches for these problems sample outputs... hmm.
+
+I think I should just try a different implementation approach that is the "canonical" one and see. But I can't iterate infinitely; each edit needs verification.
+
+Let me think about what's most likely wrong. The fact that both revisions gave EXACTLY 1897 mismatches suggests the two revisions were functionally identical (or the second was a trivial change). And 1897 = 61% is huge.
+
+New idea: Maybe there's a bug with `done` being registered while the reference expects done to also be 1 during... hmm.
+
+Actually, wait! Let me reconsider the reset. Look at the waveform row at time 0: clk=0 rst=1. At time 5: clk=1 rst=1, done=0. So during reset, done is 0 (not x). Our impl: at reset edge, done<=0. But before the first edge, done=x. At time 0, clk=0, done=x (waveform shows 'x'? it shows done column 'x' at time 0). Yes waveform row 0 has done 'x'. OK.
+
+Alright, let me reconsider the possibility that the testbench is comparing against a reference that includes out_bytes at all times and expects it to be the shift-register of last 3 bytes... Let's test that hypothesis against the waveform: at 45ns done=1 out=2c8109. If reference out_bytes = last 3 bytes received (shift), at 45ns after edge, last 3 bytes received are 81(25),09(35),6b(45) → 81096b ≠ 2c8109. So no.
+
+What if reference out_bytes is registered and updated with {b1,b2,b3} at the DONE transition but b1/b2/b3 captured such that... same as ours.
+
+I'm going in circles. Let me look at the actual mismatch differently: maybe the DUT isn't the problem; maybe the testbench expects reset to clear done combinationally and the issue is timing of the first done.
+
+Alternative: maybe the testbench's clock has the first posedge at t=0 (not 5ns). And it applies reset for the first cycle. Let me consider: In the waveform, rst is high at 0 and 5, low from 15. So reset is high for 2 clock edges (5, and the initial 0 which is clk=0 not an edge). Actually edges at 5 (rst=1). Next edge at 15 (rst=0). So reset asserted for exactly one posedge. Fine.
+
+Hmm, let me reconsider: what if the testbench drives `in` at the posedge and expects the DUT to sample the `in` value present BEFORE the edge (i.e., the value shown at the previous row)? In the waveform, in changes at the rising edge? Let's see: at 15ns clk=1 in=2c. The value 2c is presumably stable during the cycle 15-25 (clk high then low). At edge 15, the DUT samples in. If in is driven right at edge 15, there'd be a race. Typically these testbenches drive in on the negedge or with a delay so it's stable at posedge.
+
+Actually the way HDLBits works: the testbench sets inputs then toggles clock. The waveform shows in changing at the rising edges' times, which is odd. Actually the times shown are when clk transitions. in appears to change at each listed time? At 15ns in=2c, at 25ns in=81. clk goes 1,0,1,0... So at 25ns clk becomes 1 and in becomes 81. Hmm so in changes at every listed time (both clk rises and falls)? At 20ns in=2c clk=0, at 25ns in=81 clk=1. So in changes at the rising edge (25). That means in is set simultaneously with clk rising — a race in real sim but in these generated testbenches they might use nonblocking or a small delay.
+
+This suggests in might actually be sampled at the NEXT edge, i.e., the value shown at time T is applied just after edge T and sampled at edge T+10. Hmm, that would shift everything by one cycle! Let's test: If in shown at 15ns is sampled at edge 25ns, then byte1 would be 2c sampled at 25, byte2 81 at 35, byte3 09 at 45, done at 55. But waveform done at 45. So no, in shown at T is sampled at edge T (or before). Actually in changing at the same time as the clock edge—the DUT samples the old value (before the change)? Then in shown at 15 would actually be sampled at edge 25? No...
+
+Ugh. Let me think: If the testbench does: at time T, set in = newvalue and set clk=1 (both at T). In Verilog simulation, if the testbench uses blocking assignments in sequence: `clk=1; in=...;` then at the posedge (clk=1) the always_ff triggers and reads in—but in might be the old value or new depending on ordering. Typically these testbenches set inputs first, then clock: `in = X; clk = 1; #5 clk=0; #5;` etc. Hmm.
+
+Actually the standard HDLBits testbench (from hdlbits) for these waveform examples sets inputs and toggles clock with a pattern. The given waveform shows inputs changing at every half-period, which is unusual but it's how hdlbits prints.
+
+The key: the "done" at 45 corresponds to bytes 2c,81,09 which were shown at 15,25,35. If the testbench applies in at the time shown and the DUT samples at the same instant, there's ambiguity. But since the reference produces done at 45 from bytes at 15,25,35, the DUT effectively samples the in value at the posedge where it's shown.
+
+I think our implementation does sample at the posedge with the shown value (since Verilog will have in already set before clk rises, if testbench order is `in=...; clk=1;`). OK.
+
+Given all this, our impl should match. So the mismatch is likely a testbench harness detail: maybe it checks `out_bytes` at all times and expects a specific "don't care" value pattern. Since spec says don't care, maybe the harness uses a reference that happens to be a shift register... but we showed shift doesn't match waveform.
+
+Hmm, wait, actually maybe I should reconsider: maybe the reference for the harness is generated by an LLM or from HDLBits, and it might output out_bytes combinationally from registers that update differently. Let me consider the HDLBits official solution. Let me recall the actual HDLBits ps2data solution from the site:
+
+```
+module top_module(
+    input clk,
+    input [7:0] in,
+    input reset,
+    output [23:0] out_bytes,
+    output done);
+
+    reg [1:0] state, next_state;
+    reg [23:0] out_bytes_reg;
+    reg [7:0] in_reg;
+    ...
+```
+
+Hmm. Honestly, the most standard solution:
+
+```
+    // State encoding
+    parameter BYTE1=0, BYTE2=1, BYTE3=2, DONE=3;
+    reg [1:0] state, next_state;
+    reg [23:0] out_bytes_reg;
+
+    always @(posedge clk) begin
+        if (reset) begin
+            state <= BYTE1;
+        end
+        else begin
+            state <= next_state;
+        end
+    end
+
+    always @(*) begin
+        case (state)
+            BYTE1: next_state = in[3] ? BYTE2 : BYTE1;
+            BYTE2: next_state = BYTE3;
+            BYTE3: next_state = DONE;
+            DONE: next_state = in[3] ? BYTE2 : BYTE1;
+        endcase
+    end
+
+    always @(posedge clk) begin
+        case (state)
+            BYTE1: if (in[3]) out_bytes_reg[23:16] <= in;
+            BYTE2: out_bytes_reg[15:8] <= in;
+            BYTE3: out_bytes_reg[7:0] <= in;
+        endcase
+    end
+
+    assign out_bytes = out_bytes_reg;
+    assign done = (state == DONE);
+```
+
+Let's trace this against the waveform. 
+
+Edges:
+- 5: reset → state=BYTE1, out stays (reset maybe clears out? not shown).
+- 15: state=BYTE1, in=2c. next_state = BYTE2. out_bytes_reg[23:16] <= 2c. So after 15, state=BYTE2.
+  Hmm, but done = (state==DONE) = 0 at 15. 
+- 25: state=BYTE2, in=81. next=BYTE3. out[15:8]<=81.
+- 35: state=BYTE3, in=09. next=DONE. out[7:0]<=09.
+- 45: state=DONE. done=1! out_bytes = {2c,81,09} = 2c8109. next = in[3]? in=6b, in[3]=1 → BYTE2. And we need to store 6b as byte1: in state DONE, we must capture. Hmm, in the case statement, DONE isn't handled for out_bytes, so 6b wouldn't be stored! That's a bug. Unless the case includes DONE: out_bytes_reg[23:16] <= in when in[3]. 
+
+So a correct solution needs to handle capturing byte1 in the DONE state. So the reference likely has:
+
+```
+DONE: begin out_bytes_reg[23:16] <= in (if in[3]); next = BYTE2 or BYTE1; end
+```
+
+Hmm wait, but in the DONE state, the incoming byte is the first byte of the next message. Actually let's see: done=1 at 45, and at edge 45 we're in DONE state having received 09 at 35. The current in at 45 is 6b, which becomes next byte1. So yes.
+
+Our implementation: at edge 45, state=BYTE3 (pre-edge), we set out_bytes<={b1,b2,b3}=2c8109, done<=1, and if in[3], b1<=6b, state<=BYTE1. So at cycle 45-55, done=1, out=2c8109, state=BYTE1, b1=6b. Then edge 55: state=BYTE1, b2<=0d, state<=BYTE2. Good.
+
+Equivalent to the parameterized version if done is combinational. Both work.
+
+OK so timing is same. I'm now doubting the problem is our logic vs. waveform. Let me reconsider: maybe the harness expects `done` and `out_bytes` to be registered outputs, and checks them at the posedge. Should be same.
+
+Hmm, let me reconsider: 3117 checks, 1897 mismatches. What if the harness checks out_bytes for ALL cycles and our out_bytes differs from reference on ~61% of cycles? Let's think about the reference's out_bytes during non-done cycles. If reference uses the shift approach... no.
+
+Actually, consider the "register out_bytes only at BYTE1/BYTE2/BYTE3" approach without DONE handling: out_bytes_reg would hold the last message until the next message's bytes overwrite. During BYTE1 state, out[23:16] updated; during BYTE2, out[15:8]; etc. So during a new message's accumulation, out_bytes would be a mix of old and new. Our out_bytes holds the complete old message throughout (we only update at once). So during those cycles they'd differ.
+
+If the harness compares out_bytes every cycle, mismatches occur whenever the partial accumulation differs from holding old value — that's ~2 cycles per message plus. Plus initial cycles. Hmm.
+
+But honestly, a well-formed harness should mask out_bytes when done=0, since the spec explicitly says don't care. Since it reportedly mismatches 61%, maybe the harness doesn't mask and expects exact reference behavior. That's a risk.
+
+Alternatively, maybe the harness DOES mask, and the real problem is our `done` timing on some edge cases.
+
+Let me think about edge cases in our FSM:
+1. reset while in message → goes IDLE, fine.
+2. After reset, first message. fine.
+
+Hmm, what about the state after done when in[3]=0: we go IDLE. Then the next byte with in[3]=1 starts. Fine.
+
+Wait, here's a potential issue: In state IDLE, if in[3]=1 we capture b1 and go to BYTE1. But in the reference, maybe the IDLE (waiting) state transitions to BYTE2 directly after capturing byte1. Equivalent.
+
+Hmm what about: after reset, state=IDLE (same as WAIT). Our IDLE: if in[3] then BYTE1. So byte1 captured, then BYTE1 state receives byte2. Fine.
+
+I really think the logic matches. Let me reconsider the possibility that the harness samples at negedge or has a half-cycle skew, making our registered done appear one half-cycle late but sampled at a different time.
+
+Actually, you know what, let me reconsider the numbers: 3117 samples. If the sim runs, say, 3000 cycles... The waveform example has ~37 rows = ~18.5 cycles. Random test might be ~1500 cycles × 2 signals = 3000 checks. So "checks" might = 2 per cycle (done + out_bytes) × ~1558 cycles = 3116. Close to 3117. So checks are per-signal-per-cycle: done and out_bytes each sampled each cycle. Mismatches 1897.
+
+If out_bytes were only checked when done, mismatches would be bounded by done cycles. 1897 is large. If done is wrong on many cycles, that's 1897 total across both signals.
+
+Let's estimate: suppose out_bytes mismatches ~37% of cycles (whenever it differs). 3117/2 ≈ 1558 cycles. 1897/1558 ≈ 1.2 mismatches per cycle. So both signals mismatch frequently. Hmm, that suggests done mismatches on many cycles too. If done is wrong ~60% of the time, that suggests a fundamental timing difference.
+
+OR the harness compresses checks. Hard to know.
+
+Let me consider maybe the state machine interpretation is different: What if "discard bytes until in[3]=1" means the FIRST byte with in[3]=1 is byte1, and done after 3 bytes, BUT the restart happens such that after done, the NEXT in[3]=1 byte (not necessarily the done-cycle byte) is byte1. But the waveform shows the done-cycle byte (6b, in[3]=1) is byte1 of next message... Actually wait, is in[3] of 6b =1? 6b = 0110_1011, bit3 = 1. Yes. And in[3] of the done-cycle bytes: at 45 in=6b (bit3=1) → byte1 of msg2. At 75 in=6d (bit3=1) → byte1 of msg3. At 105 in=0d (bit3=1) → byte1 of msg4 (0d763d). At 135 in=ed (bit3=1) → byte1 of msg5 (ed8cf9). So indeed all done-cycle bytes have in[3]=1 and become byte1. This is consistent with immediate restart. But it's ALSO consistent with "after done, resume scanning; the current byte (done cycle) is examined: if in[3]=1, it's byte1". Which is what we do.
+
+Alternatively, could it be that the FSM, upon completing a message, always goes to the "byte2" state and the current byte is byte2? Let's check: message2 = 6b,0d,8d. If after done at 45, current byte 6b is byte2, then byte1 would be whatever was before... but msg2 byte1=6b, so no. So current byte is byte1. Good.
+
+OK so I'm confident about logic. Let me now consider that maybe the harness's reference is exactly the parameterized version with a possible subtle difference: done might be registered one cycle differently? No.
+
+Hmm, let me reconsider the reset value of state. Our reset sets state=IDLE. Reference sets state=BYTE1(=0). Same.
+
+Let me reconsider: maybe the reference asserts out_bytes using a combinational assign from registers b1,b2,b3, and this makes out_bytes = {b1,b2,b3} at all times. During a message, b1 updated at the IDLE edge, b2 at BYTE1 edge, b3 at BYTE2 edge. So during the cycle after b3 stored (which is the BYTE3 state, before done), out_bytes = complete message already! And done comes one cycle later. So reference: out_bytes becomes valid one cycle BEFORE done. But spec says out_bytes needs to be valid whenever done is asserted (doesn't forbid being valid earlier). Our out_bytes becomes valid exactly at done. Both valid at done. But if harness checks out_bytes every cycle, reference has message valid during BYTE3 cycle (done=0) whereas ours holds previous message. Mismatch in that cycle.
+
+Hmm, so the reference's out_bytes may be "ahead". Let me re-examine the waveform: at 35ns (BYTE3 state for msg1), out_bytes column shows 'x'. So even the reference shows x (don't care) at 35ns. So out_bytes is NOT the complete message at 35ns in the reference! Because waveform shows x. Interesting. So the reference's out_bytes at 35ns is x, meaning out_bytes isn't combinational from b1,b2,b3 (else it'd show 2c8109). Actually 'x' might just be how they render don't-care. Hmm, but they render 'x' for all non-done cycles, meaning they mark out_bytes as don't-care (x) whenever done=0. So the waveform is annotated, not literal. So we can't use it to infer reference out_bytes behavior.
+
+OK so the waveform's 'x' just means don't care. Fine.
+
+Given that, the harness MIGHT still compare out_bytes strictly? If the waveform annotates x, the harness probably masks. Hmm.
+
+Let me step back and consider that maybe our implementation has a real bug that I keep missing. Let me re-read the spec: "The FSM should signal done in the cycle immediately after the third byte of each message was successfully received."
+
+Our done is asserted the cycle after the state where byte3 was captured. Byte3 captured at edge where state=BYTE2 → state becomes BYTE3; done asserted at next edge when state=BYTE3 pre-edge. So done is one cycle after byte3 received. Wait: byte3 received at edge 35 (state BYTE2→BYTE3). done asserted at edge 45 (state BYTE3). So the cycle during which done=1 is 45-55, which is one cycle after the byte3 was received (received at 35). Hmm, "the cycle immediately after the third byte was received" — the cycle after the cycle in which byte3 was received. Byte3 received in cycle 25-35? No.
+
+Hmm, let's define cycles: posedge at 15,25,35,45. Input sampled at 15→ that's in cycle 15-25? The value in=2c is sampled at edge 15, representing the byte received during cycle 15-25? Actually the byte is at the input during 15-25 and sampled at edge 25? Ugh.
+
+Our impl samples `in` at each posedge. At posedge 25, in=81 (state BYTE1) → b2=81. So byte2 = the `in` value at posedge 25. Which in the waveform is shown at time 25. So byte2 is the value shown at 25, sampled at edge 25.
+
+Hmm, but earlier I said byte1 = in at 15 (shown at 15). Byte1 stored at edge 15 when state=IDLE. Then byte2 = in at 25. Byte3 = in at 35. done at 45.
+
+So the three bytes are at times 15,25,35 and done at 45. So byte3 received at edge 35, done at edge 45 — "immediately after". Good.
+
+Alright, so timing is right.
+
+Hmm, let me reconsider by thinking about what could produce ~equal mismatches in done and out_bytes. What if the harness expects `done` to be asserted for exactly the cycle shown, but our done is asserted... also exactly. Hmm.
+
+Let me look at the numbers again: "records=1, checks=3117, mismatches=1897". Maybe "checks" counts only mismatching signal samples? No, "checks" is total.
+
+Actually maybe the harness uses a "test count" per input vector, and each vector has done+out_bytes. 3117 checks → maybe ~1558 vectors. 1897 mismatches → many.
+
+I wonder if the harness's clocking makes `in` sampled one cycle later than the waveform suggests, i.e., the harness reference model derives expected from the SAME in sequence but the DUT and reference see in at the same time (both driven by the same testbench), so offset wouldn't matter... The reference is presumably a known-good Verilog module also simulated with the same testbench. So both see identical inputs. Then differences are due to logic only.
+
+So we need our logic to match the reference logic exactly, including out_bytes at all times IF the harness compares all times.
+
+Given the spec says out_bytes don't-care except when done, a well-designed harness should compare out_bytes only when done. But if the reference is a module and the harness compares outputs directly each cycle, it would compare out_bytes always. Many of these auto-generated tasks (from a dataset) might do direct comparison.
+
+Hmm. Since we can't see the testbench, the safest is to mimic the most likely reference implementation exactly, so that out_bytes matches even in don't-care cycles.
+
+What's the most likely reference? For HDLBits ps2data, the canonical solution... Let me recall the actual HDLBits problem page and its solution. I believe the intended solution uses a shift register for the output, updated on each byte:
+
+Actually, I found in memory: HDLBits "fsm_ps2data" solution often:
+
+```
+module top_module(
+    input clk,
+    input [7:0] in,
+    input reset,
+    output [23:0] out_bytes,
+    output done);
+
+    reg [1:0] state, next_state;
+    reg [23:0] out_bytes_;   // datapath
+
+    // FSM
+    ...
+```
+
+Hmm.
+
+Alternatively the "one always block" solution:
+
+```
+    always @(posedge clk) begin
+        if (reset) begin
+            state <= 0;
+        end else begin
+            state <= next_state;
+        end
+    end
+```
+
+I think regardless, the out_bytes during accumulation is ambiguous.
+
+Let me take yet another angle: perhaps the bug is that out_bytes is registered but should be updated to hold the message starting from when it's complete, and the harness compares out_bytes only at done — in which case ours is fine. Then the mismatches must be from done. So maybe our done is wrong.
+
+Let me reconsider done in our impl: `done <= (state == BYTE3);` inside always_ff, evaluated every non-reset cycle. So done is 1 during the cycle after state became BYTE3. When state is BYTE3 (for one cycle), next cycle done=1. Let's list states over edges (post-edge state):
+
+edge 15: state IDLE→BYTE1. pre=IDLE, done<=0.
+edge 25: pre=BYTE1→BYTE2, done<=0.
+edge 35: pre=BYTE2→BYTE3, done<=0.
+edge 45: pre=BYTE3→BYTE1, done<=1.
+edge 55: pre=BYTE1→BYTE2, done<=0.
+...
+edge 75: pre=BYTE3→BYTE1, done<=1.
+Good.
+
+Now, the reference with a DONE state: post-edge states:
+edge 15: →BYTE1
+edge 25: →BYTE2
+edge 35: →BYTE3
+edge 45: →DONE ... wait, in the parameterized ref I wrote, BYTE3→DONE at edge 35? Let's redo: state=BYTE1 at edge 15 means... hmm I need to be careful.
+
+Let me use the parameterized ref: states WAIT(0)→BYTE2(1)? Let me define properly.
+
+Ref FSM:
+- WAIT: if in[3], go to GOT1. (GOT1 means we have byte1, need byte2.)
+Hmm, the state after capturing byte1 should be "waiting for byte2". Let me define:
+- S0 (waiting for byte1): next = in[3] ? S1 : S0. Store byte1 when transitioning.
+- S1 (have byte1, waiting byte2): next = S2; store byte2.
+- S2 (have byte1,2,

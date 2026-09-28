@@ -1,0 +1,19 @@
+
+module TopModule (
+    input  logic clock,
+    input  logic a,
+    output logic p,
+    output logic q
+);
+
+    always @(*) begin
+        if (clock)
+            p = a;
+    end
+
+    always @(*) begin
+        if (!clock)
+            q = p;
+    end
+
+endmodule

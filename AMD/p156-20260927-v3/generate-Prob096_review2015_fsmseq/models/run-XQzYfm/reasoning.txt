@@ -1,0 +1,132 @@
+We need answer with one complete DUT between [BEGIN] and [DONE]. Need implement FSM sequence 1101, set start_shifting=1 forever until reset. Reset active high synchronous. Need infer maybe expected Moore? Let's reason.
+
+We need produce SystemVerilog TopModule with clk reset data start_shifting. Sequence detector for 1101. Once found, output high forever until reset. Reset synchronous active high. Could implement state machine states for prefix detection and a sticky output. Need ensure overlapping detection? Since once found sticky, no need further, but sequence detection before found should handle overlaps. Search for 1101 in input bitstream. After found, start_shifting=1. Before found, start_shifting=0. The sequence bits arrive on data one per clock. Need detect when four consecutive bits equal 1,1,0,1. Reset synchronous active high: on posedge clk if reset start=0 state initial. Otherwise process data. Output start_shifting could be registered, set when state reaches DONE. It remains 1 until reset. If output registered, after detecting sequence ending at current clock edge, start_shifting becomes 1 at next edge? Let's consider typical FSM.
+
+We need decide timing semantics. Usually in Verilog FSM, input `data` sampled at posedge. State transition based on data. Output start_shifting assigned based on state. If Moore, when state is FOUND, output 1. At reset, state IDLE. On edges, sample data. When sequence 1101 completed (the 1 arrives), transition to FOUND at that same edge, so output becomes 1 immediately after edge (combinational from state or registered). That is fine.
+
+Implement states:
+IDLE: if data==1 -> S1 (last bit 1) else IDLE.
+S1: if data==1 -> S2 (11), else IDLE? Actually sequence 1101. Last bits: after 1, next 0 would fail, need maybe no prefix? Pattern start 1. If data 0 from S1, can't use last bit? Let's define.
+
+States representing longest suffix of input that is prefix of "1101":
+S0 = no prefix (or empty)
+S1 = last bit 1 (prefix "1")
+S2 = last bits 11 (prefix "11")
+S3 = last bits 110 (prefix "110")
+S4 = found / sticky (prefix "1101" complete)
+
+Transitions:
+S0: data 1 -> S1; data 0 -> S0.
+S1 (matched "1"): data 1 -> S2 ("11"); data 0 -> S0? Inputs ... 1 0: suffix after 10: last bit 0, no prefix; correct S0.
+S2 (matched "11"): data 1 -> S2? Inputs "111": last two bits 11 -> S2. data 0 -> S3 ("110"). 
+S3 (matched "110"): data 1 -> S4; data 0 -> S0? Inputs "1100": suffix last bits "0", no prefix; yes S0. Note if "1101" done -> S4.
+S4: any data -> S4, output 1.
+
+Output start_shifting = (state==S4). If output combinational from state, then after reset state S0 output 0. Good. But spec says output maybe register? "When sequence is found, it should set start_shifting to 1, forever, until reset." Sequential logic triggered on posedge. Could also have start_shifting reg set to 1 in S3 when data==1. Synchronous reset.
+
+Need produce clean SystemVerilog. Must be one module. No includes. Use typedef enum logic [2:0]. Inline. Need handle width. The interface ports one bit. Could use localparam. We need ensure no latches. Use always_ff.
+
+Let's write:
+
+module TopModule(
+    input  logic clk,
+    input  logic reset,
+    input  logic data,
+    output logic start_shifting
+);
+
+    typedef enum logic [2:0] {
+        S0, S1, S2, S3, S4
+    } state_t;
+    state_t state, next_state;
+
+    always_comb begin
+        next_state = state;
+        unique case (state)
+            S0: next_state = data ? S1 : S0;
+            S1: next_state = data ? S2 : S0;
+            S2: next_state = data ? S2 : S3;
+            S3: next_state = data ? S4 : S0;
+            S4: next_state = S4;
+            default: next_state = S0;
+        endcase
+    end
+
+    always_ff @(posedge clk) begin
+        if (reset)
+            state <= S0;
+        else
+            state <= next_state;
+    end
+
+    assign start_shifting = (state == S4);
+
+endmodule
+
+Check sequence: data 1,1,0,1. Initially S0. clock1 data1 -> next S1 at edge. state S1 after. clock2 data1 -> S2. clock3 data0 -> S3. clock4 data1 -> S4. After clock4 state S4 assign output 1. That detects. If reset synchronous on clock edge, reset goes high, state S0 output 0. Good.
+
+Potential issue: If start_shifting must be registered and set when sequence found, maybe at clock4 output would only be 1 after clock edge anyway. assign is fine. The phrase "all sequential logic triggered on positive edge" doesn't necessarily require output reg. But maybe reviewers expect start_shifting as registered? Let's consider timing with waveforms. If state transition to S4 on edge where data=1 sampled, assign start_shifting becomes 1 delta after edge. That's typical Moore output. If they expect start_shifting to be set in same cycle? No difference at edge.
+
+Need maybe consider reset active high synchronous: always_ff @(posedge clk) if (reset). Correct.
+
+Need maybe consider input stream including sequence overlapping: e.g., 1101101. At clock4 S4, output 1. Good.
+
+Maybe there are hidden issues: SystemVerilog enum default maybe state has unknown. Use localparam for compatibility. `logic` okay. For xczu3eg and synthesis, typedef enum fine. Use `always_comb`, `unique case`. Fine.
+
+But the instruction says "Return exactly one complete DUT between [BEGIN] and [DONE], without explanation." So final should just those tags and code.
+
+Need ensure no extra text. Use [BEGIN] and [DONE]. Could include code block? Probably not; just raw code between tags. They said exactly one complete DUT between [BEGIN] and [DONE]. We can provide code. Maybe no markdown fences. Let's craft.
+
+One more check: Does `start_shifting` set forever until reset? If state S4, next S4 regardless data. If reset high, state S0. Yes.
+
+Could simplification: use state reg [2:0]. But enum is SV. Fine.
+
+Potential issue: `default` in always_comb with enum maybe okay. `unique case` plus default? Unique with default is allowed but may be contradictory? Actually `unique case` with default okay but if default unreachable maybe. Could omit unique to avoid synthesis warnings. Use `case`.
+
+Let's produce:
+
+module TopModule (
+    input  logic clk,
+    input  logic reset,
+    input  logic data,
+    output logic start_shifting
+);
+
+    typedef enum logic [2:0] {
+        IDLE,
+        GOT_1,
+        GOT_11,
+        GOT_110,
+        FOUND
+    } state_t;
+
+    state_t state, next_state;
+
+    always_comb begin
+        next_state = state;
+        case (state)
+            IDLE:     next_state = data ? GOT_1 : IDLE;
+            GOT_1:    next_state = data ? GOT_11 : IDLE;
+            GOT_11:   next_state = data ? GOT_11 : GOT_110;
+            GOT_110:  next_state = data ? FOUND : IDLE;
+            FOUND:    next_state = FOUND;
+            default:  next_state = IDLE;
+        endcase
+    end
+
+    always_ff @(posedge clk) begin
+        if (reset)
+            state <= IDLE;
+        else
+            state <= next_state;
+    end
+
+    assign start_shifting = (state == FOUND);
+
+endmodule
+
+Check GOT_11 when data=1 remains GOT_11? Pattern "11" + "1" = "111", longest suffix prefix "11" yes. data=0 -> "110" GOT_110. GOT_110 data=0 -> "1100", longest suffix prefix? Last bit "0", no 1 prefix; IDLE. Could there be suffix "0" no. data=1 -> found. Good.
+
+One subtlety: if input is 11011: after found at first 1101, state FOUND; next data 1 stays FOUND, start_shifting 1. Good.
+
+Now final.

@@ -1,0 +1,325 @@
+We need answer only DUT between [BEGIN] and [DONE]. Need implement TopModule HDLC FSM. Need think thoroughly. No tools. Need provide complete SystemVerilog module. Need comply interface. Need infer Moore FSM recognizing sequences after 0 baseline. Need outputs asserted complete cycle beginning clock after condition occurs. Reset active high synchronous, state behaves previous input 0.
+
+Let's design robust state machine.
+
+We need decode continuous bitstream. Patterns:
+- disc: 0111110, signal bit needs discarded. In HDLC receiver, after five consecutive 1s, if next bit is 0, discard that zero. Sequence 0111110? Wait exactly 6 consecutive 1s? Let's parse spec: "Seeing exactly 6 consecutive 1s (i.e., 01111110) is a 'flag'... sender inserts a zero after every 5 consecutive 1s which receiver must detect and discard. ... recognize these three sequences:
+(1) 0111110: Signal a bit needs to be discarded (disc).
+(2) 01111110: Flag ...
+(3) 01111111...: Error (7 or more 1s) (err)."
+
+They include leading 0 in all sequences. Need FSM probably detect based on run of ones. Outputs one cycle after condition occurs, Moore. Since outputs registered? Moore output from state after transition. "asserted for complete cycle beginning on clock cycle after condition occurs." If condition completed at input cycle N, then at N+1 output asserted. A Moore state entered at N+1 can assert output. Need decide exact output timing. If synchronous reset active high, state reset. Outputs combinational from state maybe okay; state updated each posedge. At cycle after condition occurs state reflects condition, output combinational asserted. Good.
+
+Need implement states counting consecutive 1s after reset as previous input 0. Need distinguish 0 run, 1 run length 1..5, 6? Wait sequences with leading 0? Pattern includes a 0 before the run of six 1s? For flag 01111110: It starts with 0 then six 1s then 0. But in HDLC flag is exactly 01111110, a zero followed by six ones followed by zero. The leading 0 is just boundary before flag, maybe not part of "run" condition? Error 7 or more consecutive 1s: sequence 01111111... includes leading 0 before seven 1s. Disc 0111110 includes leading 0 then six 1s then 0? Wait "after every 5 consecutive 1s sender inserts zero": data payload can have 0111110 where the zero is stuffed. That is 0 then five 1s then 0? Let's count 0111110: characters: 0,1,1,1,1,1,0 = five consecutive 1s between zeros? Actually "0111110" has 5 ones after first 0? Let's count: 0 + 11111 + 0 = 5 ones yes. But they wrote "exactly 6 consecutive 1s (i.e., 01111110)" for flag: 0 + 111111 + 0 = six ones. So disc pattern is leading 0, five 1s, trailing 0. Yes. Error: leading 0, seven 1s (or more): 0 + 1111111... So run lengths:
+- five consecutive 1s followed by 0 => disc (the 0 after 5 ones is stuffed).
+- six consecutive 1s followed by 0 => flag.
+- seven consecutive 1s => err (regardless following? 7 or more; assert when reaching 7 perhaps on next cycle after the 7th 1? "sequences 01111111..." output should be when condition occurs (after 7th 1). Error for 7+ consecutive ones. If next is 0 after seven ones, still error because 7 or more consecutive 1s occurred. Should assert on state 7+ and maybe remain while ones continue? Need Moore output err maybe high while in error state? "output signals should be asserted for a complete cycle beginning on the clock cycle after the condition occurs." For err condition "7 or more consecutive 1s" occurs as soon as 7th consecutive 1 seen; if continue, condition persists? Could assert each cycle while run length >=7? Need decide. Typical FSM for HDLC from HDLBits? This is likely HDLBits problem "Fsm hdlc" maybe. I recall a problem: "Synchronous HDLC framing" from HDLBits. States: 0,1,2,3,4,5,6,7? Let's recall outputs:
+HDLBits "Fsm hdlc" maybe has module top_module(input clk, input reset, input in, output disc, output flag, output err). I remember solution states:
+- state 0: previous input 0 (or reset)
+- state 1: got 1
+- state 2: got 11
+- state 3: got 111
+- state 4: got 1111
+- state 5: got 11111
+- state 6: got 111111
+- state 7: got 1111111 (error)
+Transitions: from state 0 if in=1 -> state1 else state0. For states 1-5 if in=1 -> next, if in=0 -> state0, except state5 with in=0 enters state6? Wait disc output when pattern 0111110: after five ones followed by zero. So state5 + in=0 -> special state? Moore output disc asserted when in state? Let's recall typical solution: assign disc = (state == 5 && in == 0)? No Moore output can't depend on in? But in Verilog Moore output can depend only state if state transition includes input? We can make state state6 representing got 0111110? Let's reason.
+
+Need output disc when after seeing 0 then five 1s then 0. The condition occurs on the trailing 0 edge. At next clock, state should indicate that. So add state D (or state6) for pattern 0111110. But also state6 needed for six ones? Let's count.
+
+Let's define states as number of consecutive 1s since last 0, but with special states for "after 5 ones, saw 0" and "after 6 ones, saw 0" and error. Since output Moore, can have states:
+S0: previous input 0 / reset.
+S1: 1 consecutive 1.
+S2: 2.
+S3: 3.
+S4: 4.
+S5: 5.
+S6: 6 consecutive 1s? Or state after 0111110? Let's map.
+
+Need detect:
+- 0 followed by five 1s followed by 0 => disc. If we are in S5 (five ones) and input=0, transition to D state; D output disc high.
+- 0 followed by six 1s followed by 0 => flag. If in S6 (six ones) and input=0, transition to F state; F output flag high.
+- 0 followed by seven or more 1s => err. When in S7 (seven ones) (or more) output err high? Need state E.
+
+But note sequences include leading 0. What if run starts at reset? Reset behaves previous input 0. So initial S0.
+
+Now when input has longer runs:
+S0 --1--> S1
+S1 --1--> S2
+S2 --1--> S3
+S3 --1--> S4
+S4 --1--> S5
+S5 --1--> S6 (six ones)
+S6 --1--> S7 (seven ones) => error condition occurs after 7th 1. At next cycle state S7 output err.
+S7 --1--> S7 (still err) or maybe S8? err should remain asserted while 7+ consecutive ones. If S7 output err high, staying in S7 for additional ones asserts every cycle. If input 0 while in S7, error has occurred; on next cycle? Condition 7 consecutive ones occurred already, output err should have been asserted beginning after 7th 1. If the 8th input is 0, at that same cycle state S7 (from 7th 1) output err high, and transition to S0 next. So err high for one cycle after 7th 1 even if next input 0. Good. If 8th input 1, state remains S7 and err continues high. Good.
+
+What about S5 + input 0 => disc. Need state D. S5 represents exactly 5 consecutive ones. If input 0, transition to D. D output disc high. Next cycle maybe from D: if in=0 -> S0? If in=1 -> S1? The trailing 0 is consumed; previous input at D is 0. So D should behave as previous input 0: on next bit, if 0 -> S0; if 1 -> S1. But note output disc asserted while in D for one cycle after condition. The state D is entered on clock edge after input trailing 0. At that time, output disc high regardless of next input. On next edge, leave based on new input. So D can be same as S0 for transitions except output. Similarly F state for flag (six ones then 0) output flag high, transitions based on input as previous input 0 (since trailing 0). But wait flag pattern 01111110 ends with 0, so state F entered when trailing 0 seen. It outputs flag, and next input transitions as if previous was 0. So F behaves like S0 for transitions but flag high.
+
+S6 (six consecutive 1s) + input 0 => F. S6 output? No. S6 + input 1 => S7 (error).
+S7 output err high. Transitions: if in=1 -> S7; if in=0 -> S0? But note if in=0 after 7 ones, the sequence 01111111... has trailing 0. Error condition was already met. At next clock, if we transition to S0, err deasserts. That's okay? "output asserted for a complete cycle beginning on clock cycle after condition occurs." If 7th 1 is at cycle N, state S7 at N+1, err high. If input at N+1 is 0, condition occurred at N, output high at N+1 for complete cycle. At N+2 state S0. Good. If input at N+1 is 0, should we also detect flag? No because 7 ones and then 0 is error, not flag. So transition S7 + in=0 -> S0.
+
+What about S5 + input 0 => D. D output disc. If the sequence is 0111110, at the trailing 0 edge (cycle N), state D at N+1. disc high. If input at N+1 is 0, transition to S0. If input at N+1 is 1, transition to S1. Good.
+
+What about S6 + input 0 => F. F output flag. At trailing 0 edge, state F at N+1. If input at N+1 is 1, transition to S1. Good.
+
+What about S0 + input 0: stay S0. S1 + input 0: transition to S0? But could there be disc or flag? No because only one 1. S2 + 0 -> S0, etc. S4+0 -> S0. S5+0 -> D. S6+0 -> F. S7+0 -> S0 (or maybe S0). S7 + 1 -> S7.
+
+Need consider overlapping patterns. Suppose input 01111101111110. After disc, state D at trailing 0. Next input 1 -> S1, then five ones etc. Good.
+
+Now output timing: Moore outputs based on state. If we use always_comb assign disc = (state==D), flag=(state==F), err=(state==E). But need ensure output asserted for complete cycle beginning on clock after condition. Let's simulate:
+Cycle: clk edge updates state based on input sampled. At cycle after condition occurs, state is D/F/E. Outputs combinational from state, so high during that cycle. Good.
+Reset: active high synchronous. On posedge if reset -> state <= S0. Outputs? During same cycle after reset asserted? Usually state resets at edge; outputs follow state. At time reset high before edge, state maybe old; after edge state S0. Active high synchronous means reset sampled at edge. That's fine.
+
+Need decide coding style. Use SystemVerilog. Single module. Ports as specified. Need maybe use logic. No tools. Should be self-contained.
+
+Let's verify against known HDLBits problem. I recall possible solution states:
+parameter A=0,B=1,C=2,D=3,E=4,F=5,G=6,H=7,I=8,J=9.
+Maybe outputs:
+disc = state == D? flag = state == F? err = state == H? Let's recall from HDLBits "Fsm hdlc" solutions. I have seen code:
+module top_module(
+    input clk,
+    input reset,
+    input in,
+    output disc,
+    output flag,
+    output err);
+    reg [3:0] state, next_state;
+    parameter S0=0, S1=1, S2=2, S3=3, S4=4, S5=5, S6=6, S7=7, DISC=8, FLAG=9, ERR=10;
+    ...
+    assign disc = (state == DISC);
+    assign flag = (state == FLAG);
+    assign err = (state == ERR);
+Maybe.
+
+Let's deeply analyze spec wording: "Create a Moore-type finite state machine to recognize these three sequences:
+(1) 0111110: Signal a bit needs to be discarded (disc).
+(2) 01111110: Flag the beginning/end of a frame (flag).
+(3) 01111111...: Error (7 or more 1s) (err)."
+
+The sequences all start with 0. Does disc pattern "0111110" mean exactly 0 then five 1s then 0? Let's count: after leading 0, there are five 1s? String 0 1 1 1 1 1 0 = six digits after? Let's count characters: 0(1),1(2),1(3),1(4),1(5),1(6),0(7). That's five ones. Yes. The flag "01111110": 0,1,1,1,1,1,1,0 = six ones. Error "01111111..." = 0, then seven ones. So our run counts align.
+
+But wait: The spec says "Seeing exactly 6 consecutive 1s (i.e., 01111110) is a 'flag'". That pattern has leading 0 and trailing 0. Exactly 6 consecutive 1s. If input has just 6 consecutive 1s without trailing 0, e.g., ...0111111..., does that count as flag? No, flag requires 0 after six 1s. If after six 1s next is 1, then 7 consecutive ones -> error. If after six 1s next is 0 -> flag. So our S6 + 0 => F, S6 + 1 => E. Good.
+
+What about disc: "sender inserts a zero after every 5 consecutive 1s which receiver must detect and discard." So if five consecutive 1s followed by 0, disc. If five consecutive 1s followed by 1, then not disc yet; continues to six or more. Our S5+0=>D, S5+1=>S6.
+
+What about error: "7 or more consecutive 1s". So as soon as 7th 1 occurs. Our S6+1=>E. E output high. If in E and input 1 stay E; if input 0 -> S0 (since 0 ends run). Should E + 0 maybe transition to S0 or to something? If 0 ends run, previous input is 0. So S0. Good.
+
+What about if after 7 ones, next 0, then at that cycle err high (state E from 7th 1) and transition to S0. At next cycle err low. Condition lasted for cycle after 7th 1. If there were 8 ones, E stays high for multiple cycles. The spec says "output signals should be asserted for a complete cycle beginning on the clock cycle after the condition occurs." For err, condition occurs on 7th 1 and continues while more ones. Asserting continuously might be okay or maybe should assert only one cycle? "7 or more consecutive 1s" is a condition; while condition holds, output could be asserted. Typical FSM err output stays high while in error state? Let's recall HDLBits expected. In HDLBits, err output is probably high when state == ERR, and transitions from ERR: if in==1 -> ERR, else -> state0. So it stays high as long as ones continue. That's likely expected. The statement "asserted for a complete cycle beginning on the clock cycle after the condition occurs" might mean for sequences, each output is one cycle. For err, condition is "7 or more consecutive 1s", so if 8 consecutive, condition occurs at 7th and also at 8th? It might assert each cycle. Let's not overthink; typical solution.
+
+Let's search memory: HDLBits Fsm hdlc expected waveform? I remember a problem "Exams/2014 q3bfsm" maybe not. There is problem "Fsm hdlc" from HDLBits. The solution often uses states:
+localparam S0=0, S1=1, S2=2, S3=3, S4=4, S5=5, S6=6, S7=7, DISC=8, FLAG=9, ERR=10;
+always @(*) begin
+    case (state)
+        S0: next = in ? S1 : S0;
+        S1: next = in ? S2 : S0;
+        S2: next = in ? S3 : S0;
+        S3: next = in ? S4 : S0;
+        S4: next = in ? S5 : S0;
+        S5: next = in ? S6 : DISC;
+        S6: next = in ? ERR : FLAG;
+        DISC: next = in ? S1 : S0;
+        FLAG: next = in ? S1 : S0;
+        ERR: next = in ? ERR : S0;
+    endcase
+end
+assign disc = (state == DISC);
+assign flag = (state == FLAG);
+assign err = (state == ERR);
+Wait check S5: five ones followed by 0 -> DISC. S6: six ones followed by 0 -> FLAG; six ones followed by 1 -> ERR. So S5 + 1 -> S6. S6 + 0 -> FLAG, S6 + 1 -> ERR. But what about S5 + 0 -> DISC. That matches. But note S6 state means six ones seen. If next is 0, flag. If next is 1, error (7th one). So error entered on S6 + 1. That means in state ERR at next cycle after 7th one. Yes.
+
+But let's count: S0 reset previous 0. S1 one. S2 two. S3 three. S4 four. S5 five. S6 six. S5 + 0 -> DISC (pattern 0 then five 1s then 0). S6 + 0 -> FLAG (0 then six 1s then 0). S6 + 1 -> ERR (0 then seven 1s). That matches.
+
+However, in above transition, S5 + in=0 -> DISC. But what about pattern 0111110: it has leading 0, then five 1s, then 0. Our state S5 means we've seen five 1s. If previous input was 1, and we've seen run of five. The leading 0 was before run. Yes. So disc.
+
+Now consider reset: active high synchronous. state reset to S0. Outputs combinational from state. At time reset high, if state not S0, outputs might be high until clock edge? Usually synchronous reset only affects at edge. That's correct.
+
+Need maybe use nonblocking assignments. Use always_ff @(posedge clk) if (reset) state <= S0; else state <= next_state; Use always_comb for next_state. Outputs assign.
+
+Need ensure no latches. Use case full.
+
+Let's think about possible off-by-one with output timing. Spec: "The output signals should be asserted for a complete cycle beginning on the clock cycle after the condition occurs." Suppose condition is disc: input sequence 0 1 1 1 1 1 0. The trailing 0 occurs at some clock cycle. The condition "seeing 0111110" is complete when trailing 0 is sampled. At the next clock edge, state becomes DISC. Output disc is high during that clock cycle. That is "beginning on the clock cycle after the condition occurs." Yes. If we instead asserted in same cycle combinational based on input, that would be before edge. But Moore outputs from state after edge. Good.
+
+Now what about state S5 + in=0 -> DISC. The transition occurs at edge when trailing 0 sampled. State becomes DISC at that same edge. Wait careful: At clock edge, state updates based on current input. If input is sampled at setup time before edge, then after edge state becomes DISC. The output disc (combinational from state) changes immediately after edge, i.e., at the beginning of the next clock cycle. That next clock cycle is the cycle after the trailing 0 was present. Let's map:
+Cycle N: input = 0 (trailing). State during cycle N is S5 (assuming five ones before). At edge ending cycle N (start N+1), state updates to DISC. During cycle N+1, disc high. So condition occurred during cycle N (input 0 sampled), output asserted during cycle N+1. That matches "beginning on clock cycle after condition occurs." Good.
+
+For error: sequence 0 1 1 1 1 1 1 1. The 7th 1 occurs in some cycle. State before edge maybe S6. At edge, next state ERR. During next cycle, err high. Condition (7 consecutive ones) completed when 7th 1 sampled. Output next cycle. Good.
+
+For flag: trailing 0 after six ones. State S6 + in=0 -> FLAG at next cycle. Good.
+
+Now need provide final answer only. But before final, let's consider if there are any subtle overlapping issues. Suppose input 01111110. Sequence: reset state S0.
+Cycle input bits:
+0: S0 -> S0
+1: S0 -> S1
+1: S1 -> S2
+1: S2 -> S3
+1: S3 -> S4
+1: S4 -> S5
+1: S5 -> S6 (sixth one)
+0: S6 -> FLAG
+Next cycle output flag high. State FLAG. Next input maybe 0: FLAG -> S0; if 1: FLAG -> S1. That seems correct.
+
+What about disc pattern 0111110: after first 0, five ones, then 0.
+0: S0->S0
+1: S1
+1: S2
+1: S3
+1: S4
+1: S5 (fifth one)
+0: S5->DISC
+Next cycle disc high. Good.
+
+What about error 01111111 (seven ones then maybe 0):
+0: S0
+1: S1
+1: S2
+1: S3
+1: S4
+1: S5
+1: S6
+1: S6->ERR (7th one)
+Next cycle err high. If next bit 0, ERR->S0; err high during cycle after 7th one. If next bit 1, ERR->ERR; err high continues. Good.
+
+Now, is there any need to output err when 7 or more consecutive 1s even if preceded by no leading 0? Reset behaves previous input 0, so if stream begins with seven ones, the initial implicit 0 before reset acts as leading 0. Our S0 -> S1 etc. So yes.
+
+Let's consider if the spec expects "exactly 6 consecutive 1s" for flag. The pattern 01111110. What if there are 6 consecutive 1s and then another 1? That's 7, error. Our S6 + 1 -> ERR, not flag. Good. What if there are 5 consecutive 1s then 0, disc. What if there are 6 consecutive 1s then 0, flag. What if there are 7 consecutive 1s then 0, error. Our ERR + 0 -> S0, not flag. Good.
+
+Now, possible issue: In state S5 + in=0, we go to DISC. But what if the run of ones started after a 0 that was part of a flag? E.g., flag 01111110, then next bits 111110? After flag state FLAG (previous input 0). Then 1 -> S1, etc. If five ones then 0 -> DISC. That's correct: after flag, new data can have stuffing.
+
+Now, what about state DISC and FLAG transitions. DISC means we just saw a stuffed zero after five ones. The receiver discards the zero. The state should behave as though previous input were 0? Actually the stuffed zero is discarded, but for the purpose of detecting subsequent patterns, the zero is not part of data? The FSM is looking for sequences in the raw bitstream. After 0111110, the trailing 0 is the stuffed zero. Should the FSM treat it as a 0 for future run counting? For subsequent bits, if next is 1, we start counting ones from that 1. The preceding discarded zero is a 0 in the raw stream, so yes, previous input was 0. So DISC transitions based on in: if 1 -> S1, if 0 -> S0. That's what we have. However, consider overlapping: pattern 0111110111110. After DISC, next input 1 -> S1, then five ones, then 0 -> DISC again. Good.
+
+What about FLAG: pattern 01111110. The trailing 0 is part of flag, not discarded. For subsequent bits, previous input is 0. So FLAG transitions: if 1 -> S1, if 0 -> S0. Good.
+
+What about ERR: after error, if input 0, previous input is 0, so S0. If input 1, still error. Good.
+
+Now, is there any state for after 0 following six ones? We have FLAG. But what if the sequence is 01111110 and then immediately another flag? E.g., 01111110 01111110. After FLAG, next input 0 -> S0, then 1 -> S1, etc. The leading 0 of next flag is processed. Good.
+
+Now, coding. Need SystemVerilog, single module. Use module TopModule (input logic clk, reset, in, output logic disc, flag, err). Since outputs are assigned, can use logic. Need be careful with port directions. Interface says input clk, reset, in; output disc, flag, err. All 1-bit. We can declare as input wire clk, reset, in; output reg disc, flag, err? But Moore outputs combinational from state; assign wire. In SystemVerilog, use logic.
+
+Let's write:
+
+module TopModule (
+    input  logic clk,
+    input  logic reset,
+    input  logic in,
+    output logic disc,
+    output logic flag,
+    output logic err
+);
+
+    typedef enum logic [3:0] {
+        S0, S1, S2, S3, S4, S5, S6, DISC, FLAG, ERR
+    } state_t;
+
+    state_t state, next_state;
+
+    always_ff @(posedge clk) begin
+        if (reset)
+            state <= S0;
+        else
+            state <= next_state;
+    end
+
+    always_comb begin
+        next_state = state;
+        case (state)
+            S0:   next_state = in ? S1 : S0;
+            S1:   next_state = in ? S2 : S0;
+            S2:   next_state = in ? S3 : S0;
+            S3:   next_state = in ? S4 : S0;
+            S4:   next_state = in ? S5 : S0;
+            S5:   next_state = in ? S6 : DISC;
+            S6:   next_state = in ? ERR : FLAG;
+            DISC: next_state = in ? S1 : S0;
+            FLAG: next_state = in ? S1 : S0;
+            ERR:  next_state = in ? ERR : S0;
+            default: next_state = S0;
+        endcase
+    end
+
+    assign disc = (state == DISC);
+    assign flag = (state == FLAG);
+    assign err  = (state == ERR);
+
+endmodule
+
+Wait, count states: S0..S6 = 7 states (0 through 6 ones). S6 is six ones. Then DISC, FLAG, ERR. That's 10 states. But is there a need for state after six ones followed by 0? That's FLAG. After five ones followed by 0? DISC. After seven ones? ERR. But what about seven ones followed by 0? ERR transitions to S0. That's fine.
+
+But let's double-check S5 + 0 -> DISC. If we are in S5 (five ones), and input 0, we transition to DISC. That means the pattern is 0 followed by five ones followed by 0. But wait: The leading 0 in the pattern 0111110 is before the five ones. In our state sequence, we start from S0 after a 0. Then five ones lead to S5. Then 0 leads to DISC. So the leading 0 is the previous input before the first 1. That matches.
+
+But what about if the five ones are preceded by a 1? That can't happen because if preceded by 1, it would be part of a longer run. For example, sequence 1111110. If we have six ones followed by 0, what should happen? The pattern 01111110 requires a leading 0 before six ones. In sequence 1111110 (six ones then 0), there is no leading 0 before the run? But in continuous bitstream, there might be a 0 earlier. Let's trace: Suppose input bits: 0 1 1 1 1 1 1 0. That is 0 followed by six ones then 0 -> flag. Our FSM: S0 (after 0) -> S1 (1) -> S2 -> S3 -> S4 -> S5 -> S6 (sixth one) -> FLAG (0). Good.
+
+What if input bits: 1 1 1 1 1 1 0 (six ones then 0) with no leading 0? Reset behaves as previous input 0, so initial implicit 0. Trace: reset S0 -> S1 (first 1) -> S2 -> S3 -> S4 -> S5 -> S6 (sixth 1) -> FLAG (0). So it treats reset as leading 0. That's consistent with "reset behaves as though previous input were 0." So flag detected even if stream starts with six ones then 0. Is that correct? If the stream starts with six ones then 0, the sequence is 0 (implicit) then six ones then 0, so it matches 01111110. Probably yes.
+
+What about sequence of seven ones then 0 starting from reset: S0 -> S1 -> S2 -> S3 -> S4 -> S5 -> S6 -> ERR (7th one) -> S0 (0). Error detected. Good.
+
+Now, consider a sequence with five ones then 0, but preceded by more ones? E.g., 1 1 1 1 1 1 0. That's six ones then 0. Our FSM: reset S0 -> S1 -> S2 -> S3 -> S4 -> S5 -> S6 (sixth one) -> FLAG (0). It detects flag, not disc. That's correct because after five ones, the next bit was 1 (sixth), so no stuffed zero after five ones. The zero after six ones is flag. Good.
+
+What about sequence 1 1 1 1 1 0? Five ones then 0. Our FSM: S0 -> S1 -> S2 -> S3 -> S4 -> S5 -> DISC (0). That detects disc. But wait: the pattern for disc is 0111110, which is 0 + five ones + 0. Here we have reset implicit 0 + five ones + 0. So yes.
+
+Now, is there any issue with S6 + 1 -> ERR. Suppose we have exactly six ones then 1, that's seven ones. Error. Good.
+
+Now, let's think about the wording "Seeing exactly 6 consecutive 1s (i.e., 01111110) is a 'flag'... We also need to signal an error if there are 7 or more consecutive 1s." If there are exactly six consecutive 1s followed by a 0, flag. If there are exactly six consecutive 1s followed by another 1, that's seven, error. If there are exactly six consecutive 1s followed by end of transmission? Not relevant.
+
+Now, potential issue: The outputs should be asserted for a complete cycle beginning on the clock cycle after the condition occurs. For disc, condition is "0111110". That includes the trailing 0. Our output disc is high in state DISC, which is entered after the trailing 0. So it's high during the cycle after the trailing 0. That is correct. However, what about the "condition occurs" might be considered when the five ones are seen and the next bit is 0? Yes.
+
+Let's maybe refer to known HDLBits solution. I recall the state transition for S5 might be: if (in) next = S6; else next = DISC; and S6: if (in) next = ERR; else next = FLAG. This matches exactly. I remember a solution with states: S0, S1, S2, S3, S4, S5, S6, DISC, FLAG, ERR. Yes.
+
+Let's check if there is a state S7? Some solutions might use S7 for error state. But we use ERR for error. That's fine.
+
+Now, need ensure SystemVerilog syntax. Use typedef enum logic [3:0]. That's fine. But some tools might prefer localparam. Since no tools, any valid SystemVerilog. However, to be safe for synthesis, use simple reg [3:0] state, next_state; localparam. But SystemVerilog supports enum. The problem says SystemVerilog. Use logic. Should be okay.
+
+Let's write with localparam to avoid any enum issues. But enum is fine. I'll use localparam for maximum compatibility.
+
+module TopModule (
+    input  logic clk,
+    input  logic reset,
+    input  logic in,
+    output logic disc,
+    output logic flag,
+    output logic err
+);
+
+    localparam S0 = 4'd0,
+               S1 = 4'd1,
+               S2 = 4'd2,
+               S3 = 4'd3,
+               S4 = 4'd4,
+               S5 = 4'd5,
+               S6 = 4'd6,
+               DISC = 4'd7,
+               FLAG = 4'd8,
+               ERR = 4'd9;
+
+    logic [3:0] state, next_state;
+
+    always_ff @(posedge clk) begin
+        if (reset)
+            state <= S0;
+        else
+            state <= next_state;
+    end
+
+    always_comb begin
+        next_state = state;
+        case (state)
+            S0:   next_state = in ? S1 : S0;
+            S1:   next_state = in ? S2 : S0;
+            S2:   next_state = in ? S3 : S0;
+            S3:   next_state = in ? S4 : S0;
+            S4:   next_state = in ? S5 : S0;
+            S5:   next_state = in ? S6 : DISC;
+            S6:   next_state = in ? ERR : FLAG;
+            DISC: next_state = in ? S1 : S0;
+            FLAG: next_state = in ? S1 : S0;
+            ERR:  next_state = in ? ERR : S0;
+            default: next_state = S0;
+        endcase
+    end
+
+    assign disc = (state == DISC);
+    assign flag = (state == FLAG);
+    assign err  = (state == ERR);
+
+endmodule
+
+Wait, check S5 + in=0 -> DISC. But what about if we are in S5 and input is 0, we go to DISC. That means the output disc will be high in the next cycle. But the condition 0111110 includes a leading 0. In our state S5, we have seen five consecutive 1s. The leading 0

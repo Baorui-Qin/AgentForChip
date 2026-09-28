@@ -46,6 +46,7 @@ async function actionSetup() {
     retryPolicy: { mode: 'normal', maxRetries: 0, retryableCodes: [], initialDelayMs: 0, maxDelayMs: 0, jitterRatio: 0 },
     async *stream(request): AsyncGenerator<StreamChunk> {
       wires.push(request)
+      if (respond === 'many-chunks') for (let i = 0; i < 11000; i++) yield { type: 'reasoning-delta', index: 0, text: 'abc' }
       if (['tool', 'finish', 'mixed'].includes(respond)) yield { type: 'tool-call-delta', index: 0, id: ToolCallId('call'), name: respond === 'finish' ? 'finish' : 'read_current_rtl', argumentsDelta: '{}' }
       if (respond === 'text' || respond === 'mixed') yield { type: 'text-delta', index: 1, text: 'I will think about it.' }
       if (respond === 'truncated') yield { type: 'tool-call-delta', index: 0, id: ToolCallId('call'), name: 'edit_dut', argumentsDelta: '{' }
@@ -105,6 +106,38 @@ it('stops before dispatch when even the mandatory compact core cannot fit', asyn
   const result = await callAction(s.args)
   expect(result).toMatchObject({ error_code: 'CONTEXT_UNSATISFIABLE', dispatched: false })
   expect(s.wires).toHaveLength(0)
+})
+
+it('retains a stream larger than the event envelope without truncating bounded model text', async () => {
+  const s = await actionSetup(); s.respond('many-chunks')
+  const result = await callAction(s.args)
+  expect(result).toMatchObject({ error_code: null, finish_kind: 'stop', response_bytes: 33000 })
+  expect(Buffer.byteLength(await readFile(join(s.directories[0]!, 'stream.json'), 'utf8'))).toBeGreaterThan(524288)
+  expect((await readFile(join(s.directories[0]!, 'stream.jsonl'), 'utf8')).trim().split('\n')).toHaveLength(11001)
+  expect(await readFile(join(s.directories[0]!, 'reasoning.txt'), 'utf8')).toBe('abc'.repeat(11000))
+})
+
+it('still bounds response bytes and archives the chunk that crosses the limit', async () => {
+  const s = await actionSetup(); s.respond('many-chunks'); s.args.model.maxResponseBytes = 5
+  expect(await callAction(s.args)).toMatchObject({ error_code: 'OUTPUT_TRUNCATED', truncation_reason: 'response_bytes', response_bytes: 6 })
+  expect(await readFile(join(s.directories[0]!, 'reasoning.txt'), 'utf8')).toBe('abcabc')
+})
+
+it('retains the previous host tool result even when compacting away the message history', async () => {
+  const s = await actionSetup(); s.args.input.core_only = true
+  s.args.input.previous_tool_result = { tool: 'edit_dut', accepted: false, observation: { error: 'REPEATED_CANDIDATE' } }
+  await callAction(s.args)
+  const wire = JSON.parse(await readFile(join(s.directories[0]!, 'prompt-final.txt'), 'utf8'))
+  expect(JSON.parse(wire.messages.find((m: { role: string }) => m.role === 'user').content).previous_tool_result).toEqual(s.args.input.previous_tool_result)
+  expect(JSON.parse(wire.messages.find((m: { role: string }) => m.role === 'user').content).previous_tool_result).toMatchInlineSnapshot(`
+    {
+      "accepted": false,
+      "observation": {
+        "error": "REPEATED_CANDIDATE",
+      },
+      "tool": "edit_dut",
+    }
+  `)
 })
 
 it('orders compatible revisions but never scores missing evidence or different sample counts', () => {

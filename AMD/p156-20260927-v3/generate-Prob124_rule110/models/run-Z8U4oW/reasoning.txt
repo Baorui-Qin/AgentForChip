@@ -1,0 +1,266 @@
+We need answer only DUT between BEGIN and DONE. Need implement TopModule Rule110 512-bit. Need be careful bit ordering. Spec table labels Left[i+1], Center[i], Right[i-1]. They describe neighbors. In typical HDLBits Rule110 problem, q[511:0], q[-1]=q[512]=0. Usually next state for cell i depends on left neighbor q[i+1], center q[i], right neighbor q[i-1]? Need derive.
+
+Rule 110 table:
+Left | Center | Right -> next
+111 0
+110 1
+101 1
+100 0
+011 1
+010 1
+001 1
+000 0
+
+If using concatenation {left, center, right} as 3-bit index? next = pattern 01101110? Let's list index from 111 to 000:
+111 ->0
+110 ->1
+101 ->1
+100 ->0
+011 ->1
+010 ->1
+001 ->1
+000 ->0
+Bits for indices 7..0: index7 111=0, 6 110=1, 5 101=1, 4 100=0, 3 011=1, 2 010=1, 1 001=1, 0 000=0 => 8'b01101110 = 0x6E. Rule 110 is 01101110 indeed (binary 110). So next = (left & ~center) | (center & ~right)? Let's check: standard Rule 110 next = (left & ~center) | (center & ~right) | (~left & ~center & right)? Wait standard rule 110: 01101110 for {left,center,right}. That equals (left & ~center)?? For left center right:
+111=0
+110=1 => left=1 center=1 right=0. 
+101=1 => left=1 center=0 right=1.
+100=0
+011=1 => left=0 center=1 right=1.
+010=1 => left=0 center=1 right=0.
+001=1 => left=0 center=0 right=1.
+000=0.
+Standard formula: next = right | center ^? Actually Rule 110 boolean: next = (center & ~left) | (center & ~right) | (~center & ~left & right)? Let's not need.
+
+Need implement synchronous load. Output q. On posedge clk: if load q <= data; else q <= next state. Boundaries zero.
+
+Question of neighbor orientation. The spec says table columns: Left[i+1] | Center[i] | Right[i-1]. So left neighbor has index i+1, right neighbor i-1. That is unusual because q[511:0] usually cell i's left neighbor maybe q[i+1] if left is higher index. Need define q[-1]=q[512]=0. If q vector indices 511 downto 0. For each i, left = q[i+1] if i<511 else 0; right = q[i-1] if i>0 else 0. Need implement.
+
+Could use generate loop or assign. In SystemVerilog, can define next[511:0]. For i 0..511:
+next[i] = (left & ~center) ... but simpler use case with concatenation {left, center, right}. Since indexes. Then q <= next.
+
+Need exactly one self-contained TopModule. Use always @(posedge clk). Inline. Could use combinational function? Must not define auxiliary modules. Can define automatic function inside module? That's okay? "Inline all helper logic inside TopModule" function inside is okay but perhaps simplest use generate with assign to wire [511:0] next. But generate with always? Let's do:
+
+module TopModule (
+  input logic clk,
+  input logic load,
+  input logic [511:0] data,
+  output logic [511:0] q
+);
+  logic [511:0] next;
+  genvar i;
+  generate
+    for (i = 0; i < 512; i = i + 1) begin : gen_rule110
+      logic left, center, right;
+      assign center = q[i];
+      assign left = (i == 511) ? 1'b0 : q[i+1];
+      assign right = (i == 0) ? 1'b0 : q[i-1];
+      assign next[i] = (left & center & ~right) |  // 110? Wait table next for left center right:
+...
+    end
+  endgenerate
+
+Need compute next expression. Let's derive from table for {left,center,right}:
+111 ->0
+110 ->1
+101 ->1
+100 ->0
+011 ->1
+010 ->1
+001 ->1
+000 ->0
+
+Let's minimize:
+next = (left & center & ~right)  // 110=1
+     | (left & ~center & right) // 101=1
+     | (~left & center & right) // 011=1
+     | (~left & center & ~right) // 010=1
+     | (~left & ~center & right); // 001=1
+That's 5 terms. Can simplify:
+next = (~left & (~center & right | center))? Let's use Gray? Better use case statement with concatenation:
+
+assign next[i] = ( {left, center, right} == 3'b111 ) ? 0 :
+                 ( {left, center, right} == 3'b110 ) ? 1 :
+...
+But assign with case not simple. Could use expression from standard rule 110: next = (center & ~left) | (~center & right) | (center & ~right)? Let's test:
+left center right
+111: center&~left=0 | ~center&right=0 | center&~right=0 ->0 correct
+110: center&~left=0 | ~center&right=0 | center&~right=1 ->1 correct
+101: center&~left=0 | ~center&right=1 | center&~right=0 ->1 correct (center=0)
+100: 0 | 0 | 0 ->0 correct
+011: center&~left=1 | ~center&right=0 | center&~right=0 ->1 correct
+010: center&~left=1 | 0 | center&~right=1 ->1 correct
+001: center&~left=0 | ~center&right=1 | 0 ->1 correct
+000: 0. Yes expression: next = (center & ~left) | (~center & right) | (center & ~right). Wait check 111: center&~left=0, ~center&right=0, center&~right=0. Good. That simplifies to center ^? Actually next = center ? (~left | ~right) : right. Or next = center ? (~left | ~right) : right. Check 011 center=1 -> ~left|~right=1|0=1. 010 ->1|1=1. 110 ->0|1=1. 100 center=0 -> right=0. 101 center=0 -> right=1. 001 center=0 -> right=1. 000 ->0. Yes next = center ? (~left | ~right) : right. Wait 110: center=1, left=1, right=0 => ~left=0, ~right=1 =>1. Good. 111: 0|0=0. That's simple: next = center ? (~left | ~right) : right. Let's verify against 011: center=1, left=0, right=1 =>1|0=1. Good. 010: 1|1=1. 001 center=0 right=1 =>1. Perfect. So next[i] = center ? (~left | ~right) : right. Or next = center ? ~(left & right) : right. Yes.
+
+Boundaries: left = q[i+1], right = q[i-1]. So for i=511 left=0. For i=0 right=0.
+
+Need be careful about nonblocking and combinational next computed from q. Fine.
+
+Possible issue: In SystemVerilog, output q declared logic [511:0], can assign in always. Use always_ff @(posedge clk). The constraints say SystemVerilog. Use logic. Need exactly one module. Could avoid generate by using shifts directly:
+
+wire [512:0] ext = {1'b0, q, 1'b0};? Let's determine mapping. If q[511:0], cell i center q[i]. left q[i+1] (except i=511 ->0), right q[i-1] (except i=0 ->0). If we form extended vector maybe q_ext[513:0]? Let's derive easier use generate.
+
+Potential issue with generate assign to next[i] inside loop with logic left,center,right. That's okay.
+
+Alternatively, use always_comb with for loop:
+integer i;
+always_comb begin
+  for (i=0; i<512; i=i+1) begin
+    logic left, center, right; // cannot declare inside for? In SystemVerilog, can declare in named block? 
+    next[i] = q[i] ? (~left | ~right) : right;
+  end
+end
+But need compute left/right. Can directly:
+next[i] = q[i] ? (~( (i==511)?0:q[i+1] ) | ~( (i==0)?0:q[i-1] )) : ((i==0)?0:q[i-1]);
+This is fine.
+
+Then always_ff @(posedge clk) begin
+  if (load) q <= data;
+  else q <= next;
+end
+
+Need ensure next becomes q next state. Rule110 advances each clock cycle unless load. Correct.
+
+Let's consider if q is output and also used to compute next. That's normal.
+
+Potential pitfalls: The table labels "Left[i+1] | Center[i] | Right[i-1]". That is exactly we used. Sometimes HDLBits problem "Rule 110" has q[511:0] with cell i neighbors q[i+1] and q[i-1]? Let's recall HDLBits Rule110: "q[-1] and q[512] are zero". The solution I remember:
+module top_module(
+    input clk,
+    input load,
+    input [511:0] data,
+    output reg [511:0] q
+);
+    always @(posedge clk) begin
+        if (load) q <= data;
+        else begin
+            q <= (q & ~{q[510:0],1'b0}) | (~q & {1'b0,q[511:1]}) | (q & ~{1'b0,q[511:1]});
+        end
+    end
+endmodule
+Wait let's map. In HDLBits, they often define left neighbor as q[i+1]? They use {q[510:0],1'b0} as? Let's derive. q[511:0]. For cell i, next depends on q[i+1], q[i], q[i-1]. If we want left neighbor q[i+1] shifted? Vector q[i+1] for all i: this is q shifted right? Actually q[511:0]. If we want an array L where L[i] = q[i+1], then L = q >> 1? Example q[2:0]=abc, indices 2=a,1=b,0=c. L[2]=0, L[1]=q[2]=a, L[0]=q[1]=b. L vector = {1'b0, q[2:1]}? That's {1'b0, q[511:1]}? Wait q[511:1] gives bits 511 down to 1. If assign L = {1'b0, q[511:1]}, then L[511]=0, L[510]=q[511], ..., L[0]=q[1]. Yes L[i]=q[i+1] for i<511. That is right shift. For right neighbor R[i]=q[i-1], R = {q[510:0], 1'b0}? Check R[0]=0, R[1]=q[0], R[511]=q[510]. Yes.
+
+In my expression next = center ? (~left | ~right) : right = (q & ~left) | (~q & right) | (q & ~right). Wait center = q. next = q ? ~(left & right)? Actually got q ? (~left | ~right) : right = q & (~left | ~right) | ~q & right = (q & ~left) | (q & ~right) | (~q & right). Same as standard.
+
+Using L = {1'b0, q[511:1]}, R = {q[510:0], 1'b0}. Then next = (q & ~L) | (~q & R) | (q & ~R). This matches one of common solutions. Need map HDLBits solution maybe q <= (q & ~{q[510:0],1'b0}) | (~q & {1'b0,q[511:1]}) | (q & ~{1'b0,q[511:1]}); Here they use different L/R maybe. Let's verify our mapping.
+
+Let's test cell i=0 boundary right=0. Our R[0]=0. L[0]=q[1]. next[0] = q[0] ? (~L[0] | 1) : 0 = q[0] ? 1 : 0 = q[0]? Wait if center=1 then next=1 regardless left/right because right=0 -> ~right=1. Check table for right=0, center=1: left=0,center=1,right=0 -> 010 -> next=1. left=1,center=1,right=0 -> 110 -> next=1. So next=q[0] if q[0]=1; if center=0, right=0 -> next=0. So next[0]=q[0]. Is that correct? For cell 0 right boundary 0. If center 1 -> next 1. If center 0 -> right 0, left maybe q[1]. Table for center=0,right=0: 000->0, 100->0. So yes next[0]=q[0]. Interesting.
+
+Cell i=511 left=0. next[511] = center ? (1 | ~right) : right = center ? 1 : right. Check table left=0: center=1,right=1 -> 011->1; center=1,right=0 ->010->1; center=0,right=1 ->001->1; center=0,right=0 ->000->0. So next[511] = center | right. Our expression center?1:right = center | right. Correct.
+
+Now, need decide orientation. The spec explicitly table header "Left[i+1] | Center[i] | Right[i-1]". They might consider left neighbor is index i+1. So we used that. However, some might interpret cell i's left neighbor as q[i-1] (towards lower index) if array displayed left-to-right as q[511] leftmost? But the table says Left[i+1] Center[i] Right[i-1]. That is clear: left column is q[i+1], right column is q[i-1]. So our mapping is correct according to provided spec.
+
+Let's double-check the problem statement: "Assume the boundaries (q[-1] and q[512], if they existed) are both zero (off)." q[-1] would be right neighbor for i=0, q[512] would be left neighbor for i=511. So q[i-1] right, q[i+1] left. Yes.
+
+Thus implement.
+
+Need output exactly one complete DUT between [BEGIN] and [DONE], no explanation. Format likely:
+[BEGIN]
+module TopModule ...
+endmodule
+[DONE]
+
+Check no other text. Use SystemVerilog. Use always_ff or always @(posedge clk). Since xczu3eg, 5ns synthesis. No issue.
+
+Let's write robust code:
+
+module TopModule (
+    input  logic clk,
+    input  logic load,
+    input  logic [511:0] data,
+    output logic [511:0] q
+);
+
+    logic [511:0] next;
+
+    always_comb begin
+        for (int i = 0; i < 512; i++) begin
+            logic left;
+            logic center;
+            logic right;
+            center = q[i];
+            left = (i == 511) ? 1'b0 : q[i+1];
+            right = (i == 0) ? 1'b0 : q[i-1];
+            next[i] = center ? (~left | ~right) : right;
+        end
+    end
+
+    always_ff @(posedge clk) begin
+        if (load) begin
+            q <= data;
+        end else begin
+            q <= next;
+        end
+    end
+
+endmodule
+
+Potential issue: declaring logic inside always_comb for loop? In SystemVerilog, you cannot declare variables inside unnamed for loop? Actually SystemVerilog allows declarations in for initialization? But here we declare inside begin block inside loop. The loop body is a sequential block. It is allowed to declare variables in a block? SystemVerilog permits block item declarations in any begin-end block. Yes, you can declare `logic left;` inside begin end. But if multiple iterations, variables are elaborated per loop? It's fine. Alternatively, to avoid any tool issues, compute directly without local variables:
+
+next[i] = q[i] ? ( ~((i == 511) ? 1'b0 : q[i+1]) | ~((i == 0) ? 1'b0 : q[i-1]) ) : ((i == 0) ? 1'b0 : q[i-1]);
+
+That avoids declarations inside loop. But readability okay. I'd use direct expression to be safe.
+
+always_comb begin
+    for (int i = 0; i < 512; i++) begin
+        next[i] = q[i] ? ( ~( (i == 511) ? 1'b0 : q[i+1] ) | ~( (i == 0) ? 1'b0 : q[i-1] ) )
+                       : ( (i == 0) ? 1'b0 : q[i-1] );
+    end
+end
+
+This is fine. Use `int` in for loop, SystemVerilog allows. Could use integer i; always_comb. `int i` inside for is allowed.
+
+Alternatively use generate to avoid always_comb with variable index. But always_comb is fine. Synthesis will unroll.
+
+Potential issue: `always_comb` with output q read? q is output reg, read is fine.
+
+Could also use `always @(posedge clk)` and inside compute next from q using for loop. But nonblocking assignment with loop referencing q is fine. But if load, still compute next unnecessarily. Use separate combinational next. Fine.
+
+Let's make sure load is synchronous active high. Yes.
+
+No reset needed.
+
+Let's consider if the problem expects q to be `output [511:0] q` not logic? SystemVerilog allows logic. Interface says output q (512 bits). We can use `output logic [511:0] q`. That's fine.
+
+Need maybe use `wire` or `reg`? SystemVerilog accepted. I'll use `output logic [511:0] q`.
+
+Let's write final.
+
+Check expression with direct boundaries again. For i=511, left=0. next[511] = q[511] ? (~0 | ~right) : right = q[511] ? 1 : right. Correct. For i=0, right=0. next[0] = q[0] ? (~left | 1) : 0 = q[0] ? 1 : 0 = q[0]. Correct.
+
+Let's test small pattern: q = 512'h0... maybe not needed.
+
+One more thought: In table, header "Left[i+1] | Center[i] | Right[i-1]". They use indices maybe left neighbor of cell i is i+1 because array indexing from left to right? If q[511:0] displayed as q[511] ... q[0], then leftmost is q[511]. The cell i's left neighbor would be i+1 if left means higher index. Yes.
+
+Let's ensure no clock domain issue.
+
+We'll output exactly:
+
+[BEGIN]
+module TopModule (
+    input  logic clk,
+    input  logic load,
+    input  logic [511:0] data,
+    output logic [511:0] q
+);
+
+    logic [511:0] next;
+
+    always_comb begin
+        for (int i = 0; i < 512; i++) begin
+            next[i] = q[i] ? ( ~((i == 511) ? 1'b0 : q[i+1]) | ~((i == 0) ? 1'b0 : q[i-1]) )
+                           : ( (i == 0) ? 1'b0 : q[i-1] );
+        end
+    end
+
+    always_ff @(posedge clk) begin
+        if (load) begin
+            q <= data;
+        end else begin
+            q <= next;
+        end
+    end
+
+endmodule
+[DONE]
+
+That should be it.

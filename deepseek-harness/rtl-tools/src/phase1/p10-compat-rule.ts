@@ -8,8 +8,8 @@ export const rule = { id: 'VIVADO_COMPAT_001', version: 1, name: 'move_tb_match_
 /** Static inspection outcomes, never substitute for EDA verdicts. */
 export type ScanStatus = 'MATCH_VIVADO_COMPAT_001' | 'NO_KNOWN_COMPAT_ISSUE' | 'UNKNOWN_TEMPLATE' | 'MULTIPLE_MATCH' | 'STATIC_ANALYSIS_ERROR'
 
-// Preserve offsets while excluding comments and quoted strings from scope analysis.
-function mask(text: string): string {
+/** Preserve offsets while excluding comments and quoted strings. @param text - Verilog source. @returns masked source for bounded template recognition. */
+export function mask(text: string): string {
   let out = '', i = 0
   while (i < text.length) {
     const start = i

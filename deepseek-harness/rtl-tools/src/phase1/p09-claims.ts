@@ -13,10 +13,11 @@ export async function claimExperiment(root: string, identity: unknown, experimen
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw new Error('EXPERIMENT_ALREADY_CLAIMED'); throw error }
   return key
 }
-/** Reserve before dispatch; uncertain deliveries retain their ticket. @param root - campaign root. @param bucket - independently bounded partition. @param owner - request identity. @param signal - cancellation. @param bucketLimit - frozen campaign override, bounded by the global cap. @returns ticket filename. */
-export async function reserveDispatch(root: string, bucket: 'preflight' | 'ablation', owner: unknown, signal: AbortSignal, bucketLimit?: number): Promise<string> {
+/** Reserve before dispatch; uncertain deliveries retain their ticket. @param root - campaign root. @param bucket - independently bounded partition. @param owner - request identity. @param signal - cancellation. @param bucketLimit - frozen partition limit. @param campaignLimit - explicitly authorized whole-campaign limit; legacy P09 keeps 375. @returns ticket filename. */
+export async function reserveDispatch(root: string, bucket: 'preflight' | 'ablation', owner: unknown, signal: AbortSignal, bucketLimit?: number, campaignLimit = 375): Promise<string> {
   const limit = bucketLimit ?? (bucket === 'ablation' ? 225 : 150)
-  if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 375) throw new Error('INVALID_DISPATCH_BUDGET')
+  if (!Number.isSafeInteger(campaignLimit) || campaignLimit <= 0 || campaignLimit > 20124 ||
+    !Number.isSafeInteger(limit) || limit <= 0 || limit > campaignLimit) throw new Error('INVALID_DISPATCH_BUDGET')
   const directory = join(root, 'dispatches'); await mkdir(directory, { recursive: true })
   const path = join(directory, '.lock')
   let lock
@@ -29,7 +30,7 @@ export async function reserveDispatch(root: string, bucket: 'preflight' | 'ablat
   try {
     const files = (await readdir(directory)).filter(file => file.endsWith('.json'))
     const records = await Promise.all(files.map(async file => JSON.parse(await readFile(join(directory, file), 'utf8')) as { bucket: string }))
-    if (records.length >= 375 || records.filter(r => r.bucket === bucket).length >= limit) throw new Error('CAMPAIGN_BUDGET_EXHAUSTED')
+    if (records.length >= campaignLimit || records.filter(r => r.bucket === bucket).length >= limit) throw new Error('CAMPAIGN_BUDGET_EXHAUSTED')
     const ticket = String(records.length + 1).padStart(4, '0') + '.json'
     await publish(directory, ticket, JSON.stringify({ bucket, owner, reserved_at: new Date().toISOString() }))
     return ticket

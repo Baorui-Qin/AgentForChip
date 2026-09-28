@@ -1,0 +1,132 @@
+We need answer only DUT between [BEGIN] and [DONE]. Need implement FSM. Need parse problem: serial pattern 1101, then shift_ena exactly 4 cycles, then counting until done_counting, then done until ack, reset to search.
+
+This is classic HDLBits problem "fsm_serialdata" or "2015 review". Need determine exact state transitions. Let's recall.
+
+Problem statement: timer started when pattern 1101 detected. Then shifts in 4 more bits to determine duration. After that counting, wait done_counting high. Then done, wait ack. Active high synchronous reset sets state to where begins searching for 1101.
+
+Need outputs: shift_ena, counting, done. There's an FSM. Sequence detection includes overlapping? Typically pattern 1101, and if wrong bit, fall back according to suffix. Need detect exact 1101 on data input. In many solutions, states: S (search), then 1, 11, 110, then 1101 detected -> shift4. Or use shift register. The spec mentions "starts when pattern 1101 is detected". Then shift_ena exactly 4 clock cycles. Then counting. The shift_ena is asserted for 4 cycles to shift in 4 bits. After detecting 1101, likely next 4 cycles are shift state(s). Need ensure shift_ena high for exactly 4 consecutive cycles, then counting.
+
+We need be careful about timing relative to clock. They say "When pattern 1101 is received, the state machine must then assert output shift_ena for exactly 4 clock cycles." This likely means after detecting in a cycle (e.g., data sampled high for last bit 1 when in state 110), the output shift_ena should go high starting next clock? In synchronous FSM, state transitions on clock edge. The detection occurs on the edge when data=1 and current state=110. After that edge, state becomes shift state, and shift_ena output is combinational from state, so it will be high during the next clock cycle. That's 4 cycles: shift states 0..3. Then counting. That matches standard.
+
+Let's recall exact HDLBits solution: 
+```
+module top_module (
+    input clk,
+    input reset,
+    input data,
+    output shift_ena,
+    output counting,
+    input done_counting,
+    output done,
+    input ack );
+    parameter S=0, S1=1, S11=2, S110=3, B0=4, B1=5, B2=6, B3=7, COUNT=8, WAIT=9;
+    reg [3:0] state, next;
+    always @(*) begin
+        case(state)
+            S: next = data ? S1 : S;
+            S1: next = data ? S11 : S;
+            S11: next = data ? S11 : S110;
+            S110: next = data ? B0 : S;
+            B0: next = B1;
+            B1: next = B2;
+            B2: next = B3;
+            B3: next = COUNT;
+            COUNT: next = done_counting ? WAIT : COUNT;
+            WAIT: next = ack ? S : WAIT;
+            default: next = S;
+        endcase
+    end
+    always @(posedge clk) begin
+        if (reset) state <= S;
+        else state <= next;
+    end
+    assign shift_ena = (state == B0 || state == B1 || state == B2 || state == B3);
+    assign counting = (state == COUNT);
+    assign done = (state == WAIT);
+endmodule
+```
+Wait is that correct? In S110, if data=1 then next B0. So detection of 1101. Then B0..B3 are 4 shift cycles. Yes.
+
+But let's double-check overlap and fallback. In sequence detection, if we see 1101, the last 1 could be part of new start? The spec says "started when a particular pattern (1101) is detected" and then shifts 4 bits. It doesn't mention overlapping. The standard solution uses states S, S1, S11, S110. On failure, transitions: S: data? S1 : S; S1: data? S11 : S; S11: data? S11 : S110; S110: data? B0 : S. Is S11 on 1 stays S11? Let's think: sequence 1101. If we have 11 and next is 1, then we have 111. The last two bits are 11, so we can stay in S11 (meaning last two bits are 11). If next is 0, we have 110, so S110. If in S110 and next is 1, we have 1101 detected. If next is 0, we have 1100; what suffix could start? The last bit 0 doesn't match start 1, so reset to S. That's correct.
+
+But wait, what about overlapping start sequence? The pattern 1101 could have overlapping? For example 1101101. After detecting 1101, we shift 4 bits. The data during those 4 bits are the duration bits, not part of pattern search. So no overlap after detection.
+
+Now, need consider reset: active high synchronous reset, setting state to search. So in always block, if (reset) state <= S; else state <= next; That's synchronous because on posedge clk. Good.
+
+Check outputs: shift_ena high for exactly 4 cycles: B0, B1, B2, B3. That's 4 states. Then COUNT. counting high in COUNT until done_counting high. Then WAIT, done high until ack. Then S. That matches.
+
+But need verify if shift_ena should be high for exactly 4 clock cycles. If we detect 1101, state goes to B0 at clock edge. In that same cycle, shift_ena becomes high. Next edge, state B1, shift_ena high. Next edge B2, high. Next edge B3, high. Next edge COUNT, shift_ena low. So high for 4 cycles (B0..B3). Good.
+
+Potential issue: In S110, if data=1, next=B0. But what if reset? reset overrides.
+
+Let's ensure no other defects. The problem says "The serial data is available on the data input pin. When the pattern 1101 is received, the state machine must then assert output shift_ena for exactly 4 clock cycles." The detection occurs when data=1 and state=S110. At that clock edge, state becomes B0. So shift_ena is asserted starting the next cycle. That is correct.
+
+Now, we need output exactly one complete DUT between [BEGIN] and [DONE]. Use SystemVerilog. Inline all helper logic. No auxiliary modules. Use always_ff? Can use always @(posedge clk) with reg. Ports as inputs/outputs. Since SystemVerilog, we can declare logic. But to be safe, use standard Verilog-2001 style? The constraints say SystemVerilog. We can use logic. But top module ports are 1-bit. Let's write:
+
+```
+module TopModule (
+    input  logic clk,
+    input  logic reset,
+    input  logic data,
+    input  logic done_counting,
+    input  logic ack,
+    output logic shift_ena,
+    output logic counting,
+    output logic done
+);
+    typedef enum logic [3:0] {
+        S, S1, S11, S110, B0, B1, B2, B3, COUNT, WAIT
+    } state_t;
+    state_t state, next;
+    always_comb begin
+        case (state)
+            S:      next = data ? S1 : S;
+            S1:     next = data ? S11 : S;
+            S11:    next = data ? S11 : S110;
+            S110:   next = data ? B0 : S;
+            B0:     next = B1;
+            B1:     next = B2;
+            B2:     next = B3;
+            B3:     next = COUNT;
+            COUNT:  next = done_counting ? WAIT : COUNT;
+            WAIT:   next = ack ? S : WAIT;
+            default: next = S;
+        endcase
+    end
+    always_ff @(posedge clk) begin
+        if (reset) state <= S;
+        else state <= next;
+    end
+    assign shift_ena = (state == B0 || state == B1 || state == B2 || state == B3);
+    assign counting = (state == COUNT);
+    assign done = (state == WAIT);
+endmodule
+```
+
+Is there any potential issue with using typedef enum? Should be fine in SystemVerilog. But some simulators might require bit widths. The ports width 1. Use logic. The constraints say exactly one self-contained TopModule. So this is fine.
+
+Let's double-check the state transitions for S110. If data=1, next=B0. If data=0, next=S. Wait, what about sequence 110? If we are in S110, it means we have seen 110. If next data is 0, we have 1100. The last bit is 0, so we cannot be in any prefix of 1101 except maybe S? Actually, if we see 1100, the last two bits are 00, not 11 or 1. So reset to S. That's correct. If we see 1101, we go to B0. But what if we see 11011? That would be 1101 then next 1. But after 1101, we go to B0, so the next 1 is treated as first duration bit. That's correct because after detection, we shift 4 bits.
+
+What about overlapping? Suppose data is 1101101. We detect 1101 at the 4th bit, go to B0. The next bit is 1, which becomes B0->B1. The next bit is 1, B1->B2. Next bit 0, B2->B3. Next bit 1, B3->COUNT. So we shifted 4 bits: 1,1,0,1. That's correct.
+
+Now, the problem says "The module should implement a timer that: (1) is started when a particular pattern (1101) is detected, (2) shifts in 4 more bits to determine the duration to delay, (3) waits for the counters to finish counting, and (4) notifies the user and waits for the user to acknowledge the timer." So our FSM does exactly that.
+
+Check outputs: shift_ena is high in B0..B3. counting high in COUNT. done high in WAIT. That matches.
+
+Let's consider if the reset is synchronous active high. In our always_ff, if (reset) state <= S; else state <= next; This is synchronous because it's inside always_ff on posedge clk. Active high because reset=1 causes reset. Good.
+
+Now, ensure no latches in combinational. We have full case with default. Good.
+
+One minor thing: In SystemVerilog, we can use `always_comb` and `always_ff`. But some tools might prefer `always @(posedge clk)`. The constraints say SystemVerilog. Both are fine. I'll use `always_ff` for sequential and `always_comb` for combinational. To be safe, maybe use `always @(posedge clk)` and `always @(*)`? The problem says SystemVerilog, so either is fine. But `always_ff` is a SystemVerilog keyword. It should be accepted. I'll use `always_ff` and `always_comb`.
+
+Wait, the interface ports are given as `input clk` etc., not `input logic clk`. In SystemVerilog, we can declare `input logic clk`. That's fine.
+
+Let's check if there is any need to output shift_ena for exactly 4 cycles. Our B0..B3 states are 4 cycles. However, note that when state is B3 and next is COUNT, at the clock edge, state becomes COUNT. So in the cycle when state is B3, shift_ena is high. Next cycle state is COUNT, shift_ena low. So shift_ena is high for B0, B1, B2, B3 = 4 cycles. Correct.
+
+What about the first cycle of detection? Suppose state=S110, data=1. At the clock edge, state becomes B0. So during the cycle when state=S110 and data=1, shift_ena is low. At the next clock edge, state becomes B0, and shift_ena goes high. So shift_ena is not high in the same cycle as detection. That is correct because the problem says "When pattern 1101 is received, the state machine must then assert output shift_ena for exactly 4 clock cycles." "then" implies after detection.
+
+Now, consider if data=1101 and then immediately done_counting? No, we wait for counting.
+
+Everything seems correct.
+
+I'll provide the code between [BEGIN] and [DONE]. No explanation.

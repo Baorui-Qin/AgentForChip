@@ -13,6 +13,7 @@ import { simulationFeedback, withWaveform, type SimulationFeedback } from './wav
 export function diagnosticKind(code: string | null, message: string): string {
   if (code === 'VRFC 10-8549' && /^SystemVerilog keyword '[A-Za-z_][A-Za-z_0-9]*' used in incorrect context$/.test(message)) return 'syntax'
   if (code === 'VRFC 10-3380') return 'declaration_order'
+  if (code === 'VRFC 10-3818' && /^variable '[A-Za-z_$][\w$]*' is driven by invalid combination of procedural drivers$/.test(message)) return 'multiple_drivers'
   if (['VRFC 10-8530', 'Synth 8-6156', 'Common 17-69'].includes(code ?? '')) return 'consequential'
   if (/language_mode_error/.test(message)) return 'language_mode'
   if (/syntax error/i.test(message)) return 'syntax'
@@ -39,7 +40,17 @@ export function normalizeStage(record: StageRecord, parsed: RepairStage['diagnos
   const clean = normal && processes.every(p => p.exit_code === 0)
   const functional = record.stage === 'simulation' && complete && clean && verdict.completed && verdict.mismatches! > 0 && !parsed.some(d => d.severity === 'ERROR')
   const observed = parsed.map(d => (['testbench', 'reference'].includes(d.origin) && !['declaration_order', 'unsupported_feature', 'consequential'].includes(d.kind))
-    ? { ...d, attribution: 'UNKNOWN' as const, repairable_by_model: false } : d)
+    ? { ...d, attribution: 'UNKNOWN' as const, repairable_by_model: false } : { ...d })
+  const errors = observed.filter(d => d.severity === 'ERROR')
+  const primary = errors.filter(d => d.origin === 'dut' && d.attribution === 'DUT_COMPILE_ERROR' && d.kind === 'multiple_drivers')
+  if (record.stage === 'elaborate' && complete && normal && primary.length && errors.every(d => primary.includes(d) || (
+    d.origin === 'unknown' && d.file === null && d.message_id === 'XSIM 43-3322' &&
+    d.message === 'Static elaboration of top level Verilog design unit(s) in library work failed.' && primary.some(p => p.invocation === d.invocation)))) {
+    for (const d of errors) {
+      if (primary.includes(d)) d.repairable_by_model = true
+      else d.kind = 'consequential'
+    }
+  }
   if (record.stage === 'simulation' && record.status !== 'SKIPPED' && !verdict.passed) observed.push({ category: verdict.completed && verdict.mismatches! > 0 ? 'functional_mismatch' : 'simulation_evidence',
     kind: verdict.completed && verdict.mismatches! > 0 ? 'functional_mismatch' : 'simulation_evidence',
     message_id: null, file: null, line: null, origin: 'unknown', attribution: 'UNKNOWN', repairable_by_model: false,
@@ -65,7 +76,7 @@ export async function readDiagnostics(directory: string, kind: DiagnosticReceipt
   const parserBytes = []
   for (const path of parserFiles) parserBytes.push(await readFile(fileURLToPath(new URL(path, import.meta.url))))
   const receipt: DiagnosticReceipt = { schema_version: '1.4', evidence_kind: kind, eda_rerun: false, model_repair_executed: false,
-    original_run: root, result_sha256: sha256(bytes), parser_version: 'counter-diagnostics-2', parser_sha256: sha256(Buffer.concat(parserBytes)), inputs: [], stages: [], old_diagnostics: {} }
+    original_run: root, result_sha256: sha256(bytes), parser_version: 'counter-diagnostics-3', parser_sha256: sha256(Buffer.concat(parserBytes)), inputs: [], stages: [], old_diagnostics: {} }
   const manifestRef = record.artifact_manifest.find(path => /^snapshot-[^/]+\/manifest.json$/.test(path))
   let dataset = false, assetsValid = false
   if (manifestRef) {
@@ -86,7 +97,7 @@ export async function readDiagnostics(directory: string, kind: DiagnosticReceipt
     if (!stage) continue
     const evidence = new SimulationEvidence(dataset), diagnostics: RepairStage['diagnostics'] = []
     const simulationLines: string[] = []
-    let complete = assetsValid && !stage.diagnostic_excerpt_truncated && stage.diagnostics_omitted === 0 && !!stage.invocations
+    let complete = assetsValid && !!stage.invocations
     for (const invocation of stage.invocations ?? []) {
       if (invocation.version_matches === true) continue
       const parser = new VivadoDiagnostics(100, 4096)
@@ -103,7 +114,7 @@ export async function readDiagnostics(directory: string, kind: DiagnosticReceipt
         } catch { complete = false; receipt.inputs.push({ path, sha256: null, issue: 'log_unavailable_or_over_limit' }) }
       }
       complete &&= !parser.lineTruncated && !parser.omitted && !invocation.process.log_truncated
-      const sources = stage.invocations!.flatMap(item => item.sources)
+      const sources = Object.values(record.stages).flatMap(item => item?.invocations?.flatMap(run => run.sources) ?? [])
       diagnostics.push(...attributeDiagnostics([...parser.errors, ...parser.warnings], sources, join(root, 'build'), stage.stage, complete, parser.environmentFailure)
         .map(d => ({ ...d, kind: diagnosticKind(d.message_id, d.message), invocation: invocation.label })))
     }

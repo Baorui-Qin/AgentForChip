@@ -2,6 +2,22 @@
 import { checkInterface, type DUTInterface } from './candidates.ts'
 import type { ToolSchema } from '@deepseek-ai/dsh-llm'
 
+/** Candidate-only policy failure with an original source location. */
+export class RtlDirectiveError extends Error {
+  constructor(readonly line: number, readonly directive: string) { super('RTL_SYNTHESIS_DIRECTIVE_REJECTED') }
+}
+
+/** Inspect meta comments before stripping them; never rewrite the submitted source. @param source - original candidate bytes. */
+export function checkSynthesisDirectives(source: string): void {
+  for (const token of source.matchAll(/"(?:\\.|[^"\\])*"|\/\*[\s\S]*?\*\/|\/\/[^\r\n]*/g)) {
+    if (token[0].startsWith('"')) continue
+    const body = token[0].startsWith('/*') ? token[0].slice(2, -2) : token[0].slice(2)
+    const directive = /^\s*(?:synthesis|synopsys|pragma|xilinx)\s+(translate_off|translate_on|off|on|full_case|parallel_case)\b/i.exec(body)
+      ?? /^\s*(translate_off|translate_on|full_case|parallel_case)\b/i.exec(body)
+    if (directive) throw new RtlDirectiveError(source.slice(0, token.index).split('\n').length, directive[1]!.toLowerCase())
+  }
+}
+
 /** The host owns every path, test asset, command and budget. */
 export type AutoAction = { name: 'read_current_rtl' | 'retrieve_skill' | 'finish' } |
   { name: 'edit_dut'; expected_revision_id: string; source: string } |
@@ -20,6 +36,7 @@ export function parseAutoAction(name: string, text: string): AutoAction {
 /** Reject unsupported effects without rewriting any RTL bytes. @param source - single DUT. @param expected - frozen public interface. */
 export function checkAutoSource(source: string, expected: DUTInterface): void {
   if (!source.trim() || Buffer.byteLength(source) > 65536 || /[^\x09\x0a\x0d\x20-\x7e]/.test(source)) throw new Error('UNSUPPORTED_RTL_BYTES')
+  checkSynthesisDirectives(source)
   // Strings and escaped identifiers are unnecessary for this fixed development suite.
   const code = source.replace(/\/\*[\s\S]*?\*\/|\/\/[^\r\n]*/g, ' ')
   if (/"|\\|`/.test(code) || /\b(import|export|bind|force|release|class|program|interface|package)\b/.test(code)) throw new Error('RTL_POLICY_REJECTED')
