@@ -1,3 +1,4 @@
+const snapshotEnvironment = { expectedVivadoVersion: '2026.1', part: 'xczu3eg-sbva484-1-e' as const, clockPeriodNs: 5 as const }
 import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -70,9 +71,9 @@ it('only strips a whole-response fence and never repairs source or accepts multi
 
 it('pins reviewed DUT bytes separately without replacing the trusted evaluator', async () => {
   const root = await temporary()
-  await expect(createReviewedCounterSnapshot(root, source, '0'.repeat(64))).rejects.toThrow('hash')
+  await expect(createReviewedCounterSnapshot(root, source, '0'.repeat(64), snapshotEnvironment)).rejects.toThrow('hash')
   expect(await readdir(root)).toEqual([])
-  const snapshot = await createReviewedCounterSnapshot(root, source, sha256(source))
+  const snapshot = await createReviewedCounterSnapshot(root, source, sha256(source), snapshotEnvironment)
   expect(snapshot.trust).toBe('reviewed_candidate')
   for (const [path, bytes] of Object.entries(fixtureFiles('counter'))) expect(snapshot.files[path]).toBe(sha256(bytes))
   await checkSnapshot(snapshot)

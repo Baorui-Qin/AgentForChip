@@ -79,7 +79,7 @@ Host 专用预检注册原始 reference/testbench 字节和纯 TopModule 到 Ref
 
 独立的[兼容构建器](../../src/phase1/p10-compat.ts) 只接受十一份经审查的原始字节哈希。它在 `tb` 内整体搬动两行 net 声明，保留其他所有字节，并在数据集外发布派生 TB、统一差异、可逆行映射及来源元数据。[兼容预检](../../src/phase1/p10-compat-preflight.ts) 保持无模型运行，先记录仅调整声明顺序的探针结果，只有真实 xelab 诊断要求时才启用评测器专属 `1ps/1ps` 默认值，不覆盖显式 timescale。参考转接正例和独立错误 DUT 必须分别呈现预期仿真判据；二者都不是模型成绩。
 
-[模型 profile](../profiles/rtl-p10-model/cordis.patch.yml) 提供 `generate <task-id>`、`compare <task-id>` 和 `repair-control <task-id>`。生成阶段只发起一次不含反馈或技能的纯文本请求；Host 分词器可以使用受管理子进程。对照阶段先评分不可变初始源码，再复用 P09 工具、分词器、已验证技能和诊断进行有界修复。Host 评分与生成使用独立命令。修复校准使用负例 DUT 副本，不进入模型成绩。所有评分读取同一份冻结派生评测器；仅 DUT 综合和 reference 依赖拒绝防止将校准转接模块当作候选。导出要求当前版本四阶段验证通过且源码哈希一致。
+[模型 profile](../profiles/rtl-p10-model/cordis.patch.yml) 提供 `generate <task-id>`、`compare <task-id>` 和 `repair-control <task-id>`。生成阶段只发起一次不含反馈或技能的纯文本请求；Host 分词器可以使用受管理子进程。对照阶段先评分不可变初始源码，再复用 P09 工具、分词器、已验证技能和诊断进行有界修复。Host 评分与生成使用独立命令。修复校准使用负例 DUT 副本，不进入模型成绩。所有评分读取同一份冻结派生评测器；仅 DUT 综合和 reference 依赖拒绝防止将校准转接模块当作候选。导出要求当前版本四阶段验证通过、源码哈希一致，并满足强制[网表验收](#netlist-acceptance)。
 
 这些开发命令需要显式完整访问授权，并保留 `full_os_isolation_verified=false`。P10 对同一 wire 最多执行两次 transport retry，冻结退避为 1000/2000 ms；每个逻辑请求最多执行一次 output recovery。只有零响应字节的连接失败、502/503/504 和请求级 timeout 可以重试；用户取消和 1200 秒活动时限是终态。截断的文本或 tool call 永不执行；恢复请求保留模型、题目、源码和绑定反馈，并记录父请求与恢复请求 SHA。修复恢复采用下文的仅行动设置。恢复派发不增加 semantic repair。
 
@@ -100,7 +100,7 @@ Campaign 不会自动扩展兼容套件或授权四十题。新规则或协议�
 
 [prepare-stability.ps1](prepare-stability.ps1) 创建固定十题的新批次，冻结源码、配置和评测资产哈希，并复用显式指定的正负例校准。[generation-stability.mjs](generation-stability.mjs) 接收批次目录、仓库目录和 `generation`、`compare`、`smoke` 或 `report` 阶段，仅通过现有 dsh profile 启动模型。生成先于对照；对照要求十题全部获得候选。首个任务耗尽 transport 重试窗口后打开断路器，等待冻结的 15 秒，执行一次独立计数的健康探针。探针失败时，后续题目保持未启动；成功时允许对同一道题执行 `resume-generate <task-id>`，默认最多续跑一次（`maxGenerationResumes`，上限两次）。完整或已有部分输出的响应不能使用此续跑机制。活动取消仍是终态。进程在终态记录前中断时须人工审查，不能自动重新生成。
 
-生成保留一个逻辑请求、原实验身份、不可变的分窗口结果及全部物理尝试。续跑校验相同请求哈希和源码冻结。最新结果通过原子替换更新，不修改历史证据。已有候选永不重新生成；完整但非法的候选属于模型输出失败，不是重试机会。新稳定性入口独立于历史单次批处理，不修改旧实验。
+旧版生成保留一个逻辑请求、原实验身份、不可变的分窗口结果及全部物理尝试。续跑校验相同请求哈希和源码冻结。最新结果通过原子替换更新，不修改历史证据。已有候选永不重新生成。Repair-v4 增加独立有界的候选纠正；不修改历史单次入口及旧实验。
 
 每个模型运行包含 `transport.json`，记录请求准备、stream 调用、实际观测到的 HTTP 响应或 provider 活动、首次输出、usage、finish 和完整成功响应。旧 `dispatched` 仅表示调用 stream。本地产生的错误 finish 不算服务端活动。Node fetch 诊断只保存白名单网络错误码及 HTTP 状态，通过调用的异步上下文隔离。不可用的网络细节保持 null；没有 HTTP 观测不代表服务端一定没收到请求。
 
@@ -113,7 +113,16 @@ P10 写入 `tool-trace.jsonl`，记录可用和选中工具、接受或拒绝、
 每次文本或工具请求在响应校验前增量写入 `stream.jsonl`，包含触发超限或拒绝的那个 chunk。文件保存有序、带时间的 Harness 规范化 provider chunk，不是原始 HTTP/SSE 字节。`reasoning.txt` 和 `output.txt` 提取接口返回的文本，包括部分响应；`transcript.json` 记录字节数、SHA-256、完整性及是否返回 reasoning。工具参数保存在流记录和组装的模型响应中，Host 执行结果保存在工具轨迹及验证产物中。无法取得未公开或内部思考，不保存凭据、请求头和不安全的传输异常文本。既有 token、字节和超时上限仍会终止请求，并明确标记响应不完整，不会将有限响应冒充无限制完整输出。
 
 <a id="repair-v2"></a>
+
+[证据恢复决策](../../../.agents/notes/implemented/bug-fix/2026-09-22-p10-evidence-recovery.zh.md)定义 repair-v3 实验。流封装大小不作为输出上限；token、响应字节与超时上限仍然有效。关闭思考的工具回合不会回放到思考模式，而是在下一次请求的事实核心中保留已持久化的 Host 工具结果。最近的工具结果也在压缩后保留。候选拒绝记录区分响应、提取/接口及 RTL 策略失败。
+
+诊断完整性由保留的原始日志、源文件哈希、解析器上限和进程事实确定，而非受限的阶段摘要。展开阶段使用同一次运行中可信的编译源路径确定归属。只有完整的 DUT 过程驱动冲突及完全匹配的同次调用 XSIM 展开摘要才获得专用修复规则；未知错误、评测器错误及环境错误仍被阻塞。历史回放不能授权执行。
+
+显式执行 `prepare-stability.ps1 -Hundred -PreflightRoot <calibrated-root> -HundredManifestSha256 <hash> -CampaignRoot <new-directory>` 要求唯一且由 SHA 固定的 `manifest-100.json`、一致的选题顺序，以及 100 条可评测的正负例校准记录。调用方在获得模型结果前冻结选题与排除项。此模式允许两个比较工作进程，并保留整个实验最多分发 375 次请求的全局上限。`selectedTaskCount` 最大支持 100，但默认仍为十题；仅存在清单不会扩大执行权限。
+
 ## 修复 V2
+
+本节说明历史 v2/v3 预算。新的稳定性准备流程采用下述修复 V4 限制，替换三轮修改上限和旧的总活动时限。
 
 新批次冻结 `repairMaxTokens=16384`、`forcedActionMaxTokens=4096`、`repairMaxResponseBytes=262144`、`compactThreshold=0.8` 和 `maxRepairRounds=3`。初始生成仍使用独立的 `maxTokens=8192` 预算。这些是总输出 token 上限，不是独立的 reasoning token 配额。现有 provider 接口不提供 12000 token 流内行动截止点或强制工具选择标志。截断后切换到 `reasoningEffort=off`，移除 `finish`，要求一个完整工具调用并拒绝非行动响应；不能保证 provider 一定服从。恢复永不执行半截工具参数，也没有无限重试路径。
 
@@ -122,3 +131,39 @@ Action caller 使用固定分词器计量完整 wire。达到阈值或本地超�
 仿真反馈保留有界的原始 XSim 提示、输出名、失配数和首次失败时间。已有 `build/wave.vcd` 提供最早失败时间附近最多三个时间戳级样本，包含顶层信号及配对的 `*_ref`/`*_dut` 输出，不暴露 reference 模块内部状态。支持的 XSim 子集要求 1ps timescale，并限制字节数、信号数及位宽。缺失或不支持的波形明确记为可选证据缺口，不改变判定。VCD 时间戳末尾的值可能不同于 testbench 在同一时间戳内采样的值。反馈不会编造周期、采样瞬间的 expected/actual 或根因。收据保留原始日志和波形哈希。
 
 Host 在同一冻结评测器下保留证据最好的版本。完整 PASS 优于综合失败、仿真失配、展开失败和编译失败；仿真失配数只在样本数相同时可比较。候选退化或打平时，在下次编辑前恢复最佳源码、revision 和收据，并将候选 SHA 加入拒绝缓存。不可比较或不完整的证据会恢复原最佳版本，但停止并要求调查，不掩盖基础设施故障。每次决策都保留被拒绝候选和验证产物。`best-observed.sv` 是恢复产物，不是通过导出；只有绑定的最终 PASS 才写入 `final.sv`。`revision_decisions`、`rejected_revisions` 和 `context_compactions` 用于批次审计。[修复决策](../../../.agents/notes/implemented/feature/2026-09-21-p10-repair-v2.zh.md) 说明限制及验证范围。
+
+<a id="repair-v4-and-all-task-campaigns"></a>
+## 修复 V4 与全题库实验
+
+新的稳定性准备流程分别限制每题最多 15 次接受的 RTL 修改、60 个工具动作和 120 次修复请求尝试。零输出传输重试、强制动作及上下文恢复共用请求额度，不消耗修改轮数。策略、请求、工具、取消和批次上限分别记录。15 是上限，不代表通过验证或证据无效后仍强制继续。当前或已拒绝源码的首尾空白变体不能消耗新的修改轮。P09 历史请求默认值不变。
+
+生成选择首个合法候选，而非首个完整响应。空输出、截断、收到部分内容后传输失败或完整 RTL 被拒绝时，最多纠正两次。每次纠正使用 `reasoningEffort=off`、16384 输出 token 和 262144 响应字节，将不变的公开题面、Host 拒绝原因及已归档的上一轮输出/reasoning 写入请求日志。旧模型文本是不可信草稿。只有完整且通过验证的单模块 RTL 才进入 EDA。鉴权、配置及限流错误不触发候选纠正。这种有界候选获取不能称为严格的单调用 pass@1。
+
+显式执行 `prepare-stability.ps1 -AllTasks -PreflightRoot <root> -FullManifestSha256 <hash> -MaxDispatches <authorized-cap> -SettingsFile <settings> -CampaignRoot <new-root>` 要求固定顺序的全部 156 个唯一题号及每题校准记录。接口合法但未通过校准的题可以生成候选，不能计分。接口冲突和评测排除项仍保留在 156 行分母中。公开接口解析支持列表末尾逗号及唯一的内嵌模块，不擅自修订题面矛盾或从参考答案推断端口。原十/四十/百题选择仍可用；`selectedTaskCount` 现在最多为 156。
+
+全局调用上限默认 375；只有显式授权值才能提高，最高 20124。禁用生成续跑和探测后，全题库上界为 `156 * (3 * 3 + 120)`：初次生成加两次纠正，每次最多两次零输出传输重试，再加 120 次修复请求。全部物理调用共享一个 claim 账本。每题八小时总活动上限用于容纳请求及验证的最坏预算，不延长单次截止时间。本次授权的设置应冻结综合为 600000 ms，即十分钟；每次验证总时限为 900000 ms。两个比较工作进程遇到执行/证据故障停止调度，并等待活动作业结束。任何变更需要新冻结批次。参见[决策记录](../../../.agents/notes/implemented/bug-fix/2026-09-23-p10-candidate-budget.zh.md)。
+
+<a id="netlist-acceptance"></a>
+## 网表验收
+
+P10 使用 `acceptance_protocol=p10-netlist-1`。候选生成、纠正、编辑及验证在删除注释前拒绝综合控制 metacomment，不改写源码。`RTL_SYNTHESIS_DIRECTIVE_REJECTED` 保留注释所在行和指令。拒绝编辑消耗工具动作，不计入接受的 RTL 修改。普通注释、标识符及合法初始化仍允许使用。
+
+只有四阶段成功候选进入[纯网表检查器](../../src/phase1/p10-netlist.ts)。它复用封存的综合产物，不编译原始 DUT。既有公开规格导线、非门和同步复位 DFF8 oracle 与[已校准的数据集绑定规则](../../src/phase1/p10-netlist-calibrated.ts) 共存，使用哈希固定的 Windows Vivado 2025.2 UNISIM 库。题目、题面不匹配或数据集资产变化时拒绝验收。隐藏参考答案不能授权静默修正接口。
+
+[已批准的公开勘误](../../src/phase1/p10-interface-errata.ts) 绑定精确题面哈希：Prob031 将 `q` 解释为一位输出，Prob062 将 `out` 解释为八位输出。原始题面及数据集文件不变。新目录记录修正接口和批准信息；生成与修复在记录的任务约束中收到相同公开说明。校准冻结独立的有效目录，这两条规则要求匹配勘误元数据。旧冻结目录及成绩不追溯升级；新实验必须重新预检和冻结。
+
+[题库构建器](../../src/phase1/p10-netlist-suite.ts) 使用固定参考行为和激励，不复用上游存在竞争的比较进程。GSR/GTS 释放后于 101 ns 启动激励。除物理时钟和已审查的锁存器使能外，数据保持延迟为 0.1 ns；每半周期后 0.5 和 4.8 ns 采样。激励使用不依赖 DUT 展开层级的显式随机种子，仅观察参考反馈。参考 X/Z 位不作断言，每个必检输出位必须出现已知值；参考已知时 DUT 的 X/Z 判失败。Prob094 明确不规定 `out_both[3]` 和 `out_any[0]`，仅这两位豁免观察。即使失配数为零，覆盖错误标记也会阻止验收。异或反馈题改为从任一已知初态检查公开递推关系，不把隐藏的初值零约定作为要求。
+
+无需密钥的[校准器](calibrate-netlists.mjs) 冻结输入，执行参考 RTL、网表正例及输出故障注入负例。允许只读复用归档网表，但旧 PASS 不构成证据；重放失败后还会尝试新综合的参考 RTL。异或反馈规则另行校准初值一硬件。[发布器](publish-netlist-profiles.mjs) 审计对照后才生成启用规则，并保留证据链接。校准不调用模型，也不重新评分历史批次。派生参考和激励保留[上游 MIT 许可证](VERILOGEVAL-LICENSE)。参见[校准决策](../../../.agents/notes/implemented/testing/2026-09-27-p10-netlist-suite.zh.md)。
+
+`netlistMs` 默认 120000 ms，独立于四阶段验证时间，不增加模型请求或修复轮数。既有编译、展开、仿真命令时限、日志上限、产物配额和调用方/活动取消仍有效。每份验收记录 profile、源码、网表、原结果/产物清单及环境哈希、命令、原始日志、检查数、失配数和延迟。失配、超时、取消、证据缺失及工具/资源失败使用独立终态。本协议不会把网表失败送入另一轮修复。
+
+Baseline PASS、Agent VERIFIED、恢复数和 `final.sv` 要求同一验收标准。[报表审计器](acceptance-audit.mjs) 重新核对成功证据哈希；新冻结批次缺少收据时不能静默退回四阶段评分。不支持的题在 RTL 到达验收步骤后以 `NETLIST_NOT_CALIBRATED` 留在报告中。历史记录保留明确的 `legacy-four-stage-unvalidated` 含义，不升级旧成绩。有限功能仿真不等于形式等价。参见[决策记录](../../../.agents/notes/implemented/bug-fix/2026-09-27-p10-netlist-acceptance.zh.md)。
+
+## 稳定采样 RTL 评测器
+
+独立的 [RTL 评测器](../../src/phase1/p10-settled-rtl.ts) 使用 `p10-settled-rtl-1`。冻结的 `derived/settled-rtl-manifest.json` 为生成与修复选择同一评测器；元数据损坏、规则变化或测试平台字节变化均拒绝执行。没有此清单的批次保留原评测器，不能继承新校准结果。
+
+RTL 仿真使用已校准网表 oracle 的激励、时序和比较，仅移除 FPGA 专用 GSR 断言。它要求精确匹配校准检查数，必检输出未被观察时不输出完成标记而终止。原始 VCD 记录测试平台及 DUT 顶层信号；首次失配日志报告仿真时间，不推测根因。既有有界波形反馈可能记录格式不支持的缺口；原始波形仍可检查。
+
+[calibrate-settled-rtl.mjs](calibrate-settled-rtl.mjs) 冻结新的任务目录、派生测试平台和运行时输入，不调用模型，实际运行参考正例与错误 DUT 负例。可选的历史重放检查正确 Prob078 双沿设计通过、历史误接受的错误设计失败。这些对照验证已测评测器行为，不证明每份参考均符合公开规格。已知题面与参考冲突仍单独披露。参见 [RT-02 决策](../../../.agents/notes/implemented/bug-fix/2026-09-27-p10-settled-rtl.zh.md)。

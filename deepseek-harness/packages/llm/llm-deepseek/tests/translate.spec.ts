@@ -34,7 +34,7 @@ describe('translate: text', () => {
       { type: 'text-delta', index: 0, text: 'lo' },
       { type: 'block-end', index: 0, block: { type: 'text', text: 'Hello' } },
       { type: 'usage', usage: { inputTokens: 5, outputTokens: 2, totalTokens: 7 } },
-      { type: 'finish', reason: { kind: 'stop' } },
+      { type: 'finish', providerProtocolComplete: true, reason: { kind: 'stop' } },
     ])
   })
 
@@ -82,7 +82,7 @@ describe('translate: reasoning', () => {
       { type: 'text-delta', index: 1, text: 'answer' },
       { type: 'block-end', index: 0, block: { type: 'reasoning', text: 'thinking' } },
       { type: 'block-end', index: 1, block: { type: 'text', text: 'answer' } },
-      { type: 'finish', reason: { kind: 'stop' } },
+      { type: 'finish', providerProtocolComplete: true, reason: { kind: 'stop' } },
     ])
   })
 
@@ -119,7 +119,7 @@ describe('translate: tool calls', () => {
         block: { type: 'tool-call', id: 'call_00_x', name: 'get_weather', arguments: '{"city": "Paris"}' },
       },
       { type: 'usage', usage: { inputTokens: 28, outputTokens: 6, totalTokens: 34 } },
-      { type: 'finish', reason: { kind: 'tool-calls' } },
+      { type: 'finish', providerProtocolComplete: true, reason: { kind: 'tool-calls' } },
     ])
   })
 
@@ -173,7 +173,7 @@ describe('translate: finish and usage handling', () => {
       DONE,
     )))
     expect(chunks.at(-2)).toEqual({ type: 'usage', usage: { inputTokens: 9, outputTokens: 1, totalTokens: 10 } })
-    expect(chunks.at(-1)).toEqual({ type: 'finish', reason: { kind: 'stop' } })
+    expect(chunks.at(-1)).toEqual({ type: 'finish', providerProtocolComplete: true, reason: { kind: 'stop' } })
   })
 
   it('last usage wins when both attached and trailing arrive', async () => {
@@ -193,7 +193,7 @@ describe('translate: finish and usage handling', () => {
       { choices: [{ delta: { content: 'x' } }] },
       DONE,
     )))
-    expect(chunks.at(-1)).toEqual({ type: 'finish', reason: { kind: 'stop' } })
+    expect(chunks.at(-1)).toEqual({ type: 'finish', providerProtocolComplete: true, reason: { kind: 'stop' } })
   })
 
   it('omits the usage chunk when none arrived', async () => {
@@ -205,6 +205,7 @@ describe('translate: finish and usage handling', () => {
     const chunks = await collect(translate(feed({}, DONE)))
     expect(chunks).toEqual([{
       type: 'finish',
+      providerProtocolComplete: true,
       reason: {
         kind: 'error',
         failure: { message: 'model returned a completed response with no content', code: EMPTY_RESPONSE_CODE },
@@ -222,6 +223,7 @@ describe('translate: finish and usage handling', () => {
       { type: 'usage', usage: { inputTokens: 7, outputTokens: 0, totalTokens: 7 } },
       {
         type: 'finish',
+        providerProtocolComplete: true,
         reason: {
           kind: 'error',
           failure: { message: 'model returned a completed response with no content', code: EMPTY_RESPONSE_CODE },
@@ -237,7 +239,7 @@ describe('translate: finish and usage handling', () => {
       { choices: [{ delta: {}, finish_reason: 'stop' }] },
       DONE,
     )))
-    expect(chunks.at(-1)).toEqual({ type: 'finish', reason: { kind: 'stop' } })
+    expect(chunks.at(-1)).toEqual({ type: 'finish', providerProtocolComplete: true, reason: { kind: 'stop' } })
   })
 
   it('leaves non-stop finishes unclassified even with no opened blocks', async () => {
@@ -246,7 +248,7 @@ describe('translate: finish and usage handling', () => {
       { choices: [{ delta: {}, finish_reason: 'length' }] },
       DONE,
     )))
-    expect(chunks.at(-1)).toEqual({ type: 'finish', reason: { kind: 'max-tokens' } })
+    expect(chunks.at(-1)).toEqual({ type: 'finish', providerProtocolComplete: true, reason: { kind: 'max-tokens' } })
   })
 })
 
@@ -340,7 +342,7 @@ describe('translate: defensive tool-call branches', () => {
       { type: 'block-start', index: 0, blockType: 'tool-call' },
       { type: 'tool-call-delta', index: 0, id: '', argumentsDelta: '{}' },
       { type: 'block-end', index: 0, block: { type: 'tool-call', id: '', name: '', arguments: '{}' } },
-      { type: 'finish', reason: { kind: 'tool-calls' } },
+      { type: 'finish', providerProtocolComplete: true, reason: { kind: 'tool-calls' } },
     ])
   })
 

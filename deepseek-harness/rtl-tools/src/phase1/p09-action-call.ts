@@ -19,22 +19,29 @@ import type { PhaseId } from './contracts.ts'
 import { ModelTelemetry, type ModelObservation } from './model-observation.ts'
 import { evidenceHash } from './p10-trace.ts'
 import { ModelTranscript } from './model-transcript.ts'
+import { StreamAudit, normalizeChunk } from './stream-audit.ts'
+import type { KnowledgeContextOptions, KnowledgeUsage } from '../knowledge/knowledge-context.ts'
+import type { Skill01Audit, Skill01Options } from './skill01.ts'
 
 /** Opt-in settings are frozen as part of the experiment configuration. */
 export interface AutoSettings {
   registry: 'minimal' | 'full'; campaignRoot: string; bucket: 'preflight' | 'ablation'; sampleId: string
   runtimeRoot: string; runtimeManifestSha256: string; maxToolSteps: number
   maxDispatches?: number
+  campaignDispatchLimit?: number
   validationSkillId?: string
 }
 /** One actual response, never treated as verification evidence. */
 export interface ActionResponse {
+  knowledge?: KnowledgeUsage
+  experimental_skill_01?: Skill01Audit
   schema_version: '1.7'; dispatched: boolean; message: Message | null; finish_kind: string; error_code: string | null
   retryable: boolean; response_bytes: number; prompt_sha256: string | null; request_wall_ms: number
   prompt_tokens: number | null; completion_tokens: number | null; local_tokens: number | null
   observation: ModelObservation; feedback_in_request_sha256: string | null; feedback_projection_sha256: string | null
   consumed_feedback_sha256: string | null
   context_compacted?: boolean
+  truncation_reason?: 'response_bytes' | 'provider_max_tokens'
 }
 /** Official runtime identity with every selected executable/data dependency hashed. */
 export interface CounterManifest { revision: string; executable: string; tokenizer: string; files: Record<string, string>; compiler: string }
@@ -66,11 +73,14 @@ export async function callAction(args: {
   loadSkills: () => Promise<SkillEntry[]>; claim: (directory: string) => Promise<void>
   expectedRequestHash: string | null
   compactThreshold?: number
+  knowledge?: KnowledgeContextOptions
+  experimentalSkill01?: Skill01Options
 }): Promise<ActionResponse> {
   const recorder = await EventRecorder.create(join(args.root, 'models'), { experiment_id: args.experiment as PhaseId, task_id: args.input.task.id as PhaseId, sample_id: args.sequence, mode: 'agent' }, args.maxEventBytes, '1.3')
   await args.claim(recorder.directory)
   const transcript = await ModelTranscript.create(recorder.directory)
   const telemetry = new ModelTelemetry()
+  const streamAudit = new StreamAudit(args.maxEventBytes / 2)
   const result: ActionResponse = { schema_version: '1.7', dispatched: false, message: null, finish_kind: 'error', error_code: null, retryable: false,
     response_bytes: 0, prompt_sha256: null, request_wall_ms: 0, prompt_tokens: null, completion_tokens: null, local_tokens: null,
     observation: telemetry.value, feedback_in_request_sha256: null, feedback_projection_sha256: null, consumed_feedback_sha256: null }
@@ -79,6 +89,7 @@ export async function callAction(args: {
   const signal = AbortSignal.any([args.signal, control.signal])
   const assembler = new BlockAssembler()
   let prepared: PreparedLlmCall | undefined, finished = false, failureStatus: number | null = null
+  let drainingMetadata = false
   const chunks: unknown[] = []
   const link = { revision_id: args.input.current!.revision_id as PhaseId, call_id: randomUUID() as PhaseId }
   try {
@@ -108,7 +119,7 @@ export async function callAction(args: {
         cache.set(key, count); return count
       } }
     const limits = { ...args.p09.limits, window: Math.min(args.p09.limits.window, prepared.context.contextWindow) }
-    const build = () => buildContext(input, limits, counter, signal, args.loadSkills)
+    const build = () => buildContext(input, limits, counter, signal, args.loadSkills, args.knowledge, args.experimentalSkill01)
     const compact = () => {
       history = []
       input = { ...args.input, core_only: true, ...(args.input.repair_control ? { repair_control: { ...args.input.repair_control, compacted: true } } : {}) }
@@ -131,6 +142,8 @@ export async function callAction(args: {
       result.feedback_projection_sha256 = evidenceHash({ observed: rendered.observed, additional_diagnostics: rendered.additional_diagnostics })
     }
     result.prompt_sha256 = sha256(JSON.stringify(body)); result.local_tokens = built.audit.tokens
+    if (built.audit.knowledge) result.knowledge = built.audit.knowledge
+    if (built.audit.experimental_skill_01) result.experimental_skill_01 = built.audit.experimental_skill_01
     if (args.expectedRequestHash && args.expectedRequestHash !== result.prompt_sha256) throw new Error('RETRY_REQUEST_CHANGED')
     const audit = { ...built.audit, schema_version: '1.7', template_version: 'p09-tools-1', revision_id: args.input.current!.revision_id,
       source_sha256: args.input.current!.source_sha256, verification_key: args.input.binding?.verification_key ?? null,
@@ -146,32 +159,39 @@ export async function callAction(args: {
     await publish(recorder.directory, 'context-audit.json', JSON.stringify(audit, null, 2))
     await publish(recorder.directory, 'prompt-final.txt', JSON.stringify(body, null, 2))
     await recorder.append({ type: 'agent_request', link, value: { wire: body, audit } })
-    const ticket = await reserveDispatch(args.auto.campaignRoot, args.auto.bucket, { experiment: args.experiment, sequence: args.sequence, request_sha256: result.prompt_sha256 }, signal, args.auto.maxDispatches)
+    const ticket = await reserveDispatch(args.auto.campaignRoot, args.auto.bucket, { experiment: args.experiment, sequence: args.sequence, request_sha256: result.prompt_sha256 }, signal, args.auto.maxDispatches, args.auto.campaignDispatchLimit)
     await publish(recorder.directory, 'dispatch.json', JSON.stringify({ ticket, request_sha256: result.prompt_sha256 }))
     result.dispatched = true
     telemetry.value.request_prepared = true
     for await (const chunk of telemetry.stream(() => prepared!.stream({ ...request, signal }))) {
       await transcript.append(chunk)
+      const normalized = normalizeChunk(chunk)
+      chunks.push(normalized); streamAudit.append(chunk)
       signal.throwIfAborted()
-      if (finished) throw new Error('MODEL_PROTOCOL_ERROR')
-      if (chunk.type === 'text-delta' || chunk.type === 'reasoning-delta') result.response_bytes += Buffer.byteLength(chunk.text)
-      if (chunk.type === 'tool-call-delta') result.response_bytes += Buffer.byteLength(chunk.argumentsDelta) + Buffer.byteLength(chunk.name ?? '')
-      if (chunk.type === 'block-end') result.response_bytes += Buffer.byteLength(JSON.stringify(chunk.block))
-      if (result.response_bytes > args.model.maxResponseBytes) throw new Error('OUTPUT_TRUNCATED')
+      // A content finish does not exhaust the protocol: trailing usage is still observable.
+      if (finished && chunk.type !== 'usage') throw new Error('MODEL_PROTOCOL_ERROR')
+      if (!drainingMetadata) {
+        if (chunk.type === 'text-delta' || chunk.type === 'reasoning-delta') result.response_bytes += Buffer.byteLength(chunk.text)
+        if (chunk.type === 'tool-call-delta') result.response_bytes += Buffer.byteLength(chunk.argumentsDelta) + Buffer.byteLength(chunk.name ?? '')
+        if (chunk.type === 'block-end') result.response_bytes += Buffer.byteLength(JSON.stringify(chunk.block))
+      }
+      if (!drainingMetadata && result.response_bytes > args.model.maxResponseBytes) {
+        drainingMetadata = true; result.truncation_reason = 'response_bytes'; result.error_code = 'OUTPUT_TRUNCATED'
+      }
       if (chunk.type === 'finish') {
         finished = true; result.finish_kind = chunk.reason.kind
         if (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted') {
-          result.error_code = chunk.reason.failure.code
+          if (!drainingMetadata) result.error_code = chunk.reason.failure.code
           const failure = chunk.reason.failure as { status?: number }; failureStatus = failure.status ?? null
-          chunks.push({ type: 'finish', reason: { kind: chunk.reason.kind, code: result.error_code, status: failureStatus } })
+          if (chunk.reason.kind === 'aborted' || ['AUTH', 'AUTHENTICATION', 'PERMISSION', 'CONTENT_FILTER', 'SAFETY'].includes(chunk.reason.failure.code)) break
           continue
         }
       }
-      chunks.push(chunk); assembler.push(chunk)
-      if (Buffer.byteLength(JSON.stringify(chunks)) > args.maxEventBytes / 2) throw new Error('OUTPUT_TRUNCATED')
+      if (!drainingMetadata) assembler.push(chunk)
     }
+    signal.throwIfAborted()
     if (!finished) throw new Error('MODEL_PROTOCOL_ERROR')
-    if (result.finish_kind === 'max-tokens') result.error_code = 'OUTPUT_TRUNCATED'
+    if (!drainingMetadata && result.finish_kind === 'max-tokens') { result.error_code = 'OUTPUT_TRUNCATED'; result.truncation_reason = 'provider_max_tokens' }
     if (!result.error_code) result.message = assembler.message({ kind: 'model', provider: prepared.config.provider, model: prepared.config.model,
       ...(assembler.replayState === undefined ? {} : { replayState: assembler.replayState }) })
     if (forced && result.message) {
@@ -183,9 +203,14 @@ export async function callAction(args: {
   } catch (error) {
     telemetry.failure(error)
     const code = error instanceof Error ? error.message : ''
-    result.error_code = args.signal.aborted ? 'CANCELLED' : control.signal.aborted ? 'TIMEOUT' : /^[A-Z_]+$/.test(code) ? code : 'HOST_OR_MODEL_FAILURE'
+    const readError = args.signal.aborted ? 'CANCELLED' : control.signal.aborted ? 'TIMEOUT' : /^[A-Z_]+$/.test(code) ? code : 'HOST_OR_MODEL_FAILURE'
+    telemetry.value.terminal_read_error_code = readError
+    if (!drainingMetadata) result.error_code = readError
   } finally { clearTimeout(timer) }
-  if (assembler.usage) { const u = assembler.usage; result.prompt_tokens = u.inputTokens + (u.cacheReadTokens ?? 0) + (u.cacheWriteTokens ?? 0); result.completion_tokens = u.outputTokens }
+  telemetry.value.caller_cancelled = args.signal.aborted
+  telemetry.value.deadline_expired = control.signal.aborted
+  const usage = telemetry.value.provider_usage
+  if (usage?.state === 'USAGE_RETURNED') { result.prompt_tokens = usage.prompt_tokens; result.completion_tokens = usage.completion_tokens }
   result.retryable = result.dispatched && result.response_bytes === 0 && !args.signal.aborted &&
     (['TRANSPORT', 'TIMEOUT', 'CONNECTION', 'CONNECT'].includes(result.error_code ?? '') || result.error_code === 'SERVER' && [502, 503, 504].includes(failureStatus ?? 0))
   result.request_wall_ms = Math.round(performance.now() - start)
@@ -193,6 +218,7 @@ export async function callAction(args: {
   if (telemetry.value.model_output_observed) result.consumed_feedback_sha256 = result.feedback_in_request_sha256
   try {
     await transcript.finish({ complete: !result.error_code && finished && ['stop', 'tool-calls'].includes(result.finish_kind), error: result.error_code })
+    await publish(recorder.directory, 'stream-audit.json', JSON.stringify({ chunks: streamAudit.chunks, metadata: streamAudit.finish() }))
     await publish(recorder.directory, 'transport.json', JSON.stringify(telemetry.value, null, 2))
     await publish(recorder.directory, 'model.json', JSON.stringify(result, null, 2))
     await publish(recorder.directory, 'response.txt', JSON.stringify(result.message, null, 2))
@@ -202,7 +228,7 @@ export async function callAction(args: {
       final_status: args.signal.aborted ? 'ABORTED' : 'INCONCLUSIVE', final_revision_id: args.input.current!.revision_id as PhaseId,
       final_source_sha256: args.input.current!.source_sha256, verification_key: args.input.binding?.verification_key ?? null,
       final_verified: false, stages: { compile: null, elaborate: null, simulation: null, synthesis: null }, semantic_repairs: 0,
-      model_requests_total: result.dispatched ? 1 : 0, transport_retries: 0, stop_reason: result.error_code ?? 'Model action is not a design verdict.', artifact_manifest: ['events.jsonl', 'model.json', 'response.txt', 'stream.json'] })
+      model_requests_total: result.dispatched ? 1 : 0, transport_retries: 0, stop_reason: result.error_code ?? 'Model action is not a design verdict.', artifact_manifest: ['events.jsonl', 'model.json', 'response.txt', 'stream.json', 'stream-audit.json'] })
   } finally { await recorder.close(); await finalArtifactManifest(recorder.directory) }
   return result
 }

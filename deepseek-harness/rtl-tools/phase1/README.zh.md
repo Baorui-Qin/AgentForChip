@@ -7,6 +7,8 @@ kind: "package-reference"
 
 [English](README.md) | 中文
 
+Phase 2 运行基线由 [dev.yaml](configs/dev.yaml) 固定为 Vivado 2026.1；Phase 1 历史实验及 fixture 保留 2025.2 来源。新 snapshot、兼容套件与 evaluator identity 使用配置版本，后续 Static Knowledge 使用 `{"tool":"vivado","tool_version":"2026.1"}`。真实验证范围和未通过项见[迁移报告](../../../../docs/vivado-2026.1/report.md)。
+
 ## 概述
 
 通过独立的 dsh 应用，使用 Windows Vivado 验证固定手写 RTL，并调用 DeepSeek 官方 API。doctor 保留环境事实；项目记录保留独立样本、有界诊断和模型响应。执行控制不代表操作系统隔离、自主修复闭环或比赛验收通过。
@@ -28,7 +30,7 @@ kind: "package-reference"
 <a id="preflight"></a>
 ## 环境预检
 
-编辑 [configs/dev.yaml](configs/dev.yaml) 和 [cordis.patch.yml](cordis.patch.yml) 中的绝对路径。在启动 workspace-write profile 前创建配置的输出目录。示例使用明确可写工作区 `D:/AMD` 下的 `D:/AMD/phase1-validation`，固定 Vivado 2025.2、`xczu3eg-sbva484-1-e` 和 5 ns；每条命令 120 秒、四线程等限制属于开发配置，不是官方预算。YAML 读取器拒绝可执行标签与未知字段。doctor 配置要求 `model: null`；独立的 API profile 负责模型设置。两个 YAML 文件都不能放置凭据。
+编辑 [configs/dev.yaml](configs/dev.yaml) 和 [cordis.patch.yml](cordis.patch.yml) 中的绝对路径。在启动 workspace-write profile 前创建配置的输出目录。示例使用明确可写工作区 `F:/FPGA/AgentforChip/AgentForChip/AMD` 下的 `F:/FPGA/AgentforChip/AgentForChip/AMD/phase2-vivado2026.1`，固定 Vivado 2026.1、`xczu3eg-sbva484-1-e` 和 5 ns；每条命令 300 秒、四线程等限制属于开发配置，不是官方预算。YAML 读取器拒绝可执行标签与未知字段。doctor 配置要求 `model: null`；独立的 API profile 负责模型设置。两个 YAML 文件都不能放置凭据。
 
 从仓库根目录执行：
 
@@ -94,7 +96,11 @@ pnpm dsh --profile headless --patch rtl-tools/phase1/end-to-end.patch.yml genera
 
 快照检查器拒绝路径穿越、备用数据流、符号链接、junction 与硬链接别名，并在每个阶段前后复核固定清单和资产哈希。这些检查可以检测变化，但不能阻止写入，也不能消除恶意并发替换。受管进程组在调用结束前完成退出等待，取消和插件卸载也遵守此规则。阶段 stdout/stderr 达到上限后溢出会中止执行。活动产物审计按配置间隔轮询，并在阶段结束后再次检查；检测到超限会中止，不能返回 PASS。轮询观察之间可能发生超额写入，它不是操作系统磁盘配额。输出超限后仍保留最终诊断元数据。
 
-开发 profile 将编译、展开、仿真、综合含报告预算设为 60/60/30/120 秒，整次验证设为 300 秒，清理宽限一秒，线程数四。每条保留流和报告上限为 4 MiB，产物审计预算为 256 MiB，审计间隔 100 ms，单事件上限 1 MiB。这些都是可信配置，不是官方比赛限制。阶段证据区分环境、资源、策略与设计失败；本应用不会把完整隔离标记设为 true。
+开发 profile 将编译、展开、仿真、综合含报告预算设为 60/60/30/300 秒，整次验证设为 600 秒，清理宽限一秒，线程数四。每条保留流和报告上限为 4 MiB，产物审计预算为 256 MiB，审计间隔 100 ms，单事件上限 1 MiB。这些都是可信配置，不是官方比赛限制。阶段证据区分环境、资源、策略与设计失败；本应用不会把完整隔离标记设为 true。
+
+验证器通过每个 run 自有的 FIFO 队列协调原子 JSON 发布与元数据扫描。等待仍计入原 deadline；取消的等待者不能迟到发布。终态所有者等待活动扫描结算后，再发布结果和索引产物。其他进程不参与此协调，文件系统错误仍会拒绝操作。`filesystem-error.json` 将可用的原始错误字段与取消状态绑定到该 run。见[共享证据协调实现](../src/phase1/evidence-access.ts)。
+
+需要人工授权的 [counter 修复应用](repair/README.zh.md)对 DUT `VRFC 10-3818` 的提案资格和修订比较使用同一个[严格判定函数](../src/phase1/repair-policy.ts)。它要求完整且正常的展开执行、精确的冲突文本、明确 DUT 归属，以及与已验证 manifest 文件哈希、记录的最终源码哈希和实际编译 DUT 输入一致的独立当前 DUT 来源绑定。它使用绑定工作目录解析每条 primary 诊断的当前路径，再与绑定 DUT 路径比较；陈旧归属标签不能代替此检查。伴随错误只能是同次调用中精确且无定位信息的 `XSIM 43-3322` 汇总。原始 `repairable_by_model` 保持 false。未通过判定的 driver 情况不能借助通用 DUT 错误分支获得资格。
 
 <a id="data-and-events"></a>
 ## 数据与事件
@@ -106,6 +112,14 @@ pnpm dsh --profile headless --patch rtl-tools/phase1/end-to-end.patch.yml genera
 [recorder.ts](../src/phase1/recorder.ts) 为每个独立样本创建一个由宿主持有的私有运行目录。事件信封关联 `experiment_id`、`task_id`、`sample_id`、`revision_id` 与 `call_id`；模型开始事件保留实际 Prompt，不含传输请求头。写入按顺序执行并刷盘，时间戳使用 UTC，耗时使用单调时钟。单事件字节数超限时关闭失败，不静默截断证据。宿主必须阻止候选代码访问该目录；本库不为对抗性 HDL 安装操作系统权限策略。
 
 记录器在返回前持久化 `run.json` 和 `run_started`。终态发布先写入 `run_finished`，再将 JSON 写入同目录临时文件，刷盘后原子重命名为 `result.json`。终态发布开始后不再接受追加。终态文件缺失时，`inspectRun` 返回 `INCOMPLETE`；损坏或串题结果会被拒绝。它不会把可能仍存活的所有者标记为 ABORTED，持有运行的工作流必须先确认其终止。项目事件不替换或迁移已发布的 Harness Session 记录。
+
+模型动作在 `stream.json` 和 `stream.jsonl` 中保留每个已接收的规范化 chunk。独立的[增量审计](../src/phase1/stream-audit.ts)通过同一受管原子写入器发布 `stream-audit.json`。其紧凑 JSON 数组的精确 UTF-8 预算为 `maxEventBytes / 2`，计入方括号、逗号与转义，并为用量和 finish 元数据预留 4096 字节。普通 chunk 整块省略；不保留已省略的正文等待终态裁剪。关键元数据无法容纳时，将 `audit_error` 设为 `AUDIT_METADATA_LIMIT`、`terminal_metadata_preserved` 设为 false，并记录省略计数。该审计错误不改变语义接纳结果，也不截断完整归档。
+
+[提供方用量](../src/phase1/provider-usage.ts)区分 `USAGE_RETURNED`、`USAGE_MISSING_PROVIDER`、`USAGE_LOST_HOST` 和 `USAGE_UNPARSEABLE`；不可用的计数保持 null。返回计数必须为非负安全整数，并具有提供方给出的精确总量。Prompt 用量只将互不重叠的输入与缓存桶相加一次；reasoning 已包含在输出中。不累加相同的规范化样本；冲突或非法样本会明确报告。内容 finish 不等于迭代器正常耗尽；已收到的有效用量在后续中断后仍保留。这些观察事实独立于语义接纳结果，记录在 `model.json.observation.provider_usage` 中。
+
+DeepSeek 适配器仅在观察到 `[DONE]` 并发出此前的用量记录后，才在规范化 finish 中设置可选的 `providerProtocolComplete=true`。遥测将此事实公开为 `model.json.observation.provider_protocol_complete`，来源为 `normalized-provider-stream-marker`。已完成的提供方错误若没有用量，分类为 `USAGE_MISSING_PROVIDER`；没有标记的本地错误，包括响应没有 body 的 `EMPTY_RESPONSE`，分类为 `USAGE_LOST_HOST`。标记缺失本身不提供协议完整结束的证据。语义失败与后续取消各自留证，已收到的有效用量仍可用。这项元数据不改变提供方选择、重试或请求预算。
+
+[动作响应](../src/phase1/p09-action-call.ts)超过语义字节上限后，错误保持 `OUTPUT_TRUNCATED`、message 保持 null，并停止语义组装。同一迭代器在原请求、signal 和计时器下继续观察元数据，直到正常耗尽、原 deadline 或取消；认证、安全拒绝和用户取消路径仍立即终止。原 signal 中止时，提供方必须取消并结算待完成的读取。后续传输、提供方终态、用量、审计和持久化结果各自保留；此 drain 不增加宽限、派发或重试。
 
 <a id="verification"></a>
 ## 验证
@@ -133,3 +147,5 @@ G0、G1、G2、完整操作系统隔离与官方镜像就绪状态均保持未�
 ## Dev Note
 
 [有界 RTL 验证事实](../../.agents/notes/implemented/feature/2026-09-13-rtl-simulation-tool.zh.md)。
+
+[修复资格、有界流审计与提供方用量](../../.agents/notes/implemented/bug-fix/2026-10-09-p3-production-continuity.zh.md)。

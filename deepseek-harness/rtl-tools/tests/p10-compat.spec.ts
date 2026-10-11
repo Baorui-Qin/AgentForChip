@@ -5,7 +5,8 @@ import { checkAutoSource } from '../src/phase1/p09-auto-policy.ts'
 
 it('moves exactly two whole lines and reverses every byte including CRLF', async () => {
   for (const id of Object.keys(reviewedTBs)) {
-    const bytes = await readFile(new URL(`./fixtures/p10/${id}_test.sv`, import.meta.url))
+    // The historical allowlist pins CRLF checkout bytes; Git may store this fixture with LF.
+    const bytes = Buffer.from((await readFile(new URL(`./fixtures/p10/${id}_test.sv`, import.meta.url), 'utf8')).replace(/\r?\n/g, '\r\n'))
     const result = adaptTB(id, bytes)
     const original = bytes.toString().match(/[^\n]*\n|[^\n]+$/g)!
     const effective = result.effective.toString().match(/[^\n]*\n|[^\n]+$/g)!

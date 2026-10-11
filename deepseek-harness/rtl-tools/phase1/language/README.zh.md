@@ -7,6 +7,8 @@ kind: "package-reference"
 
 [English](README.md) | 中文
 
+Phase 2 运行基线由 [dev.yaml](../configs/dev.yaml) 固定为 Vivado 2026.1；Phase 1 历史实验及 fixture 保留 2025.2 来源。新 snapshot、兼容套件与 evaluator identity 使用配置版本，后续 Static Knowledge 使用 `{"tool":"vivado","tool_version":"2026.1"}`。真实验证范围和未通过项见[迁移报告](../../../../../docs/vivado-2026.1/report.md)。
+
 ## 概述
 
 Vivado 仿真与综合共享显式语言解析。宿主保留源文件角色和命令证据，不增加模型参数，也不修改评分资产。本层识别诊断归属，不推断根因或自动修复。
@@ -25,7 +27,7 @@ Vivado 仿真与综合共享显式语言解析。宿主保留源文件角色和�
 
 新验证器事件、快照、阶段及终态记录使用项目 schema 1.3。读取器保留 1.0/1.1 支持；模型记录仍为 1.1，对照信封仍为 1.2。Harness Session 版本保持不变。每次调用记录解析后的可执行路径、工具参数、Windows 包装参数、策略包装后的启动命令、源文件元数据、语言模式、进程结果及 stdout/stderr 相对路径。
 
-版本探测保留真实退出码。已确认的 2025.2 版本横幅允许退出码 1；该信息性例外只适用于 `-version`，不适用于编译或其他设计执行。取消、超时、信号终止或截断的探测不能确认就绪。读取器核验版本探测证据和调用与进程事实的一致性。
+版本探测保留真实退出码。已实测的 Vivado 2025.2 和 2026.1 版本横幅允许退出码 1；该信息性例外只适用于 `-version`，不适用于编译或其他设计执行。取消、超时、信号终止或截断的探测不能确认就绪。读取器核验版本探测证据和调用与进程事实的一致性。
 
 诊断记录保留消息编号、严重级别、位置及有界消息文本；原始日志用于还原精确原文格式。`origin` 表示清单中的文件归属；`attribution` 区分 DUT 编译或综合错误、测试台或参考实现兼容性、语言配置、Harness 配置、工具环境和未知问题。源文件按完整规范化路径匹配，不凭 `/trusted/` 子串或文件名猜测。
 
@@ -39,7 +41,7 @@ Vivado 仿真与综合共享显式语言解析。宿主保留源文件角色和�
 
 ## 来源
 
-- [AMD Vivado 2025.2 UG900](https://docs.amd.com/r/2025.2-English/ug900-vivado-logic-simulation/xelab-xvhdl-and-xvlog-xsim-Command-Options) 定义命令语义，包括 xvlog 的 SystemVerilog 标记。
+- [AMD Vivado 2026.1 UG900](https://docs.amd.com/r/2026.1-English/ug900-vivado-logic-simulation/xelab-xvhdl-and-xvlog-xsim-Command-Options) 定义命令语义，包括 xvlog 的 SystemVerilog 标记。
 - [Edalize Vivado 源码](https://github.com/olofk/edalize/blob/9a6f648c596bfe74224ae82f529075e565d4182b/edalize/tools/vivado.py)，提交 `9a6f648c596bfe74224ae82f529075e565d4182b`，声明 BSD-2-Clause，并将源文件类型显式映射到 `read_verilog` 或 `read_verilog -sv`。本实现借鉴设计，不复制源码，也不引入框架依赖。
 - [Edalize 旧 XSim 源码](https://github.com/olofk/edalize/blob/main/edalize/xsim.py) 提供 `sv`、`verilog` 工程条目和编译单元的背景示例。其 API 已弃用，不作为本项目运行时或固定版本实现依赖。
 - AMD 社区建议只有在正文、版本和本地复现均可获得后才算已验证。不宣称存在已确认的 Prob038 社区解决办法。建议修改只在独立手写复现中测试，不修改原始基准资产。

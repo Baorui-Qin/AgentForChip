@@ -3,7 +3,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, expect, it, vi } from 'vitest'
 import type { GenerateOptions, LlmCallConfig, PreparedLlmCall, StreamChunk } from '@deepseek-ai/dsh-llm'
-import { callText, type ModelRuntime } from '../src/phase1/model.ts'
+import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import { callText, type ModelRuntime, type ModelObservation } from '../src/phase1/model.ts'
 import { EventRecorder } from '../src/phase1/recorder.ts'
 import type { PhaseId } from '../src/phase1/contracts.ts'
 import { parseRecord } from '../src/phase1/records.ts'
@@ -14,7 +15,7 @@ const text: StreamChunk[] = [{ type: 'block-start', index: 0, blockType: 'text' 
 const stop: StreamChunk = { type: 'finish', reason: { kind: 'stop' } }
 const settings = { model: 'mock-explicit-model', maxTokens: 32, temperature: 0, timeoutMs: 1000, maxResponseBytes: 4096 }
 
-async function invoke(chunks: StreamChunk[], options: { hang?: boolean; timeoutMs?: number; signal?: AbortSignal; prepareError?: string; maxResponseBytes?: number } = {}) {
+async function invoke(chunks: StreamChunk[], options: { hang?: boolean; timeoutMs?: number; signal?: AbortSignal; prepareError?: string; maxResponseBytes?: number; reasoningEffort?: LlmCallConfig['reasoningEffort'] } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'phase1-api-mock-')); roots.push(root)
   const recorder = await EventRecorder.create(root, { experiment_id: 'mock' as PhaseId, task_id: 'text' as PhaseId, sample_id: 0, mode: 'agent' }, 65536, '1.1')
   const released = vi.fn()
@@ -31,11 +32,12 @@ async function invoke(chunks: StreamChunk[], options: { hang?: boolean; timeoutM
     return { config, stream } as unknown as PreparedLlmCall
   })
   const runtime: ModelRuntime = { prepareCall }
+  let observation: ModelObservation | undefined
   try {
-    const result = await callText(runtime, { ...settings, timeoutMs: options.timeoutMs ?? settings.timeoutMs, maxResponseBytes: options.maxResponseBytes ?? settings.maxResponseBytes }, 'Public development prompt.', recorder,
-      { revision_id: 'rev' as PhaseId, call_id: 'call' as PhaseId }, options.signal ?? new AbortController().signal)
+    const result = await callText(runtime, { ...settings, reasoningEffort: options.reasoningEffort, timeoutMs: options.timeoutMs ?? settings.timeoutMs, maxResponseBytes: options.maxResponseBytes ?? settings.maxResponseBytes }, 'Public development prompt.', recorder,
+      { revision_id: 'rev' as PhaseId, call_id: 'call' as PhaseId }, options.signal ?? new AbortController().signal, value => { observation = value })
     const events = await readFile(join(recorder.directory, 'events.jsonl'), 'utf8')
-    return { result, events, stream, prepareCall, released, request, directory: recorder.directory }
+    return { result, events, stream, prepareCall, released, request, observation, directory: recorder.directory }
   } finally { await recorder.close() }
 }
 
@@ -48,6 +50,14 @@ it('assembles one stream without duplicate block-end text, records requests and 
   expect(s.events).toContain('"type":"model_request"')
   expect(parseRecord('ModelResult', s.result)).toEqual(s.result)
   expect({ ...s.result, timing: { ...s.result.timing, request_wall_ms: 0 } }).toMatchSnapshot()
+})
+
+it('passes an explicit generation recovery reasoning override to prepared calls', async () => {
+  const normal = await invoke([...text, stop])
+  expect(normal.prepareCall.mock.calls[0]![0]).not.toHaveProperty('reasoningEffort')
+  const recovery = await invoke([...text, stop], { reasoningEffort: ReasoningEffortId('off') })
+  expect(recovery.prepareCall.mock.calls[0]![0]).toMatchObject({ reasoningEffort: 'off' })
+  expect(recovery.request).toMatchObject({ reasoningEffort: 'off' })
 })
 
 it('archives returned reasoning and partial output before response-limit enforcement without changing ModelRecord', async () => {
@@ -106,5 +116,7 @@ it('terminates on response quota, timeout and caller cancellation and releases t
     expect(s.result.error?.category).toBe(options.maxResponseBytes ? 'truncated' : options.timeoutMs ? 'timeout' : 'cancelled')
     expect(s.released).toHaveBeenCalledTimes(1)
     expect(s.result.server_cancellation).toBe('unconfirmed')
+    expect(s.observation).toMatchObject({ caller_cancelled: options.signal !== undefined, deadline_expired: options.timeoutMs !== undefined,
+      provider_usage: { state: 'USAGE_LOST_HOST', total_tokens: null } })
   }
 })

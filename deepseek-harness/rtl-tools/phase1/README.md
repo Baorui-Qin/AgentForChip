@@ -7,6 +7,8 @@ kind: "package-reference"
 
 English | [中文](README.zh.md)
 
+The Phase 2 runtime baseline is Vivado 2026.1, selected by [dev.yaml](configs/dev.yaml). Historical Phase 1 experiments and fixtures retain their 2025.2 provenance. New snapshots, compatibility suites and evaluator identities use the configured version; future Static Knowledge uses `{"tool":"vivado","tool_version":"2026.1"}`. See the [migration report](../../../../docs/vivado-2026.1/report.md) for live validation scope and remaining failures.
+
 ## Summary
 
 Verify fixed handwritten RTL with Windows Vivado and call the DeepSeek official API through separate dsh applications. The doctor preserves environment facts; project records retain independent samples, bounded diagnostics and model responses. Execution controls do not establish OS isolation, an autonomous repair loop or competition acceptance.
@@ -28,7 +30,7 @@ The separate [three-route development comparison](comparison/README.md) owns fro
 <a id="preflight"></a>
 ## Preflight
 
-Edit the absolute paths in [configs/dev.yaml](configs/dev.yaml) and [cordis.patch.yml](cordis.patch.yml). Create the configured output directory before launching a workspace-write profile. The example uses `D:/AMD/phase1-validation` under the explicit `D:/AMD` writable workspace. It pins Vivado 2025.2, `xczu3eg-sbva484-1-e` and 5 ns; limits such as 120 seconds per command and four threads are development settings, not official budgets. The YAML reader rejects executable tags and unknown fields. The doctor configuration requires `model: null`; the separate API profile owns model settings. Never put credentials in either YAML file.
+Edit the absolute paths in [configs/dev.yaml](configs/dev.yaml) and [cordis.patch.yml](cordis.patch.yml). Create the configured output directory before launching a workspace-write profile. The example uses `F:/FPGA/AgentforChip/AgentForChip/AMD/phase2-vivado2026.1` under the explicit `F:/FPGA/AgentforChip/AgentForChip/AMD` writable workspace. It pins Vivado 2026.1, `xczu3eg-sbva484-1-e` and 5 ns; limits such as 300 seconds per command and four threads are development settings, not official budgets. The YAML reader rejects executable tags and unknown fields. The doctor configuration requires `model: null`; the separate API profile owns model settings. Never put credentials in either YAML file.
 
 From the repository root:
 
@@ -94,7 +96,11 @@ The generation directory retains `verification.json` and `end-to-end.json`, link
 
 The snapshot checker rejects traversal, alternate streams, symlinks, junctions and hardlink aliases, and rechecks the pinned manifest and asset hashes before and after each stage. These checks detect changes but do not prevent writes or eliminate hostile concurrent replacement. Managed process groups join before a call completes, including cancellation and plugin unloading. Stage stdout/stderr caps abort execution on overflow. A live artifact audit polls every configured interval and checks again after stages; detected overflow aborts and cannot yield PASS. Polling can overshoot between observations and is not an OS disk quota. Final diagnostic metadata remains available after an output-limit failure.
 
-The development profile sets compile/elaborate/simulation/combined-synthesis budgets to 60/60/30/120 seconds, total verification to 300 seconds, cleanup grace to one second and threads to four. It sets each retained stream/report cap to 4 MiB, artifact audit budget to 256 MiB, audit interval to 100 ms and event cap to 1 MiB. All are trusted configuration values, not official contest limits. Stage evidence keeps environment, resource, policy and design failures distinct; no full-isolation flag can become true in this application.
+The development profile sets compile/elaborate/simulation/combined-synthesis budgets to 60/60/30/300 seconds, total verification to 600 seconds, cleanup grace to one second and threads to four. It sets each retained stream/report cap to 4 MiB, artifact audit budget to 256 MiB, audit interval to 100 ms and event cap to 1 MiB. All are trusted configuration values, not official contest limits. Stage evidence keeps environment, resource, policy and design failures distinct; no full-isolation flag can become true in this application.
+
+The verifier coordinates atomic JSON publication and metadata scans in a FIFO queue owned by each run. Waiting consumes the original deadlines; cancelled waiters cannot publish later. The terminal owner joins the active scan before publishing results and indexing artifacts. Other processes remain outside this coordination, and filesystem errors still reject. Available original failure fields and cancellation state are bound to the run in `filesystem-error.json`. See the [shared evidence coordinator](../src/phase1/evidence-access.ts).
+
+The human-authorized [counter repair application](repair/README.md) uses one [strict predicate](../src/phase1/repair-policy.ts) for DUT `VRFC 10-3818` proposal eligibility and revision comparison. It requires complete, normal elaboration, exact conflict wording, explicit DUT attribution and an independent current DUT source binding consistent with verified manifest file hashes, the recorded final source hash and actual compile DUT inputs. It resolves each primary diagnostic's current path against the bound working directory and compares it again with the bound DUT path; stale attribution labels cannot substitute for this check. Accompanying errors must be exact unlocated `XSIM 43-3322` summaries from the same invocation. Raw `repairable_by_model` remains false. A rejected driver case cannot gain eligibility through the generic DUT-error branch.
 
 <a id="data-and-events"></a>
 ## Data and events
@@ -106,6 +112,14 @@ Artifact references are portable relative paths. Absolute paths, traversal, back
 [recorder.ts](../src/phase1/recorder.ts) creates one private host-owned run directory per independent sample. Its event envelope joins `experiment_id`, `task_id`, `sample_id`, `revision_id` and `call_id`; model-start events retain the actual prompt without transport headers. Writes are serialized and flushed, timestamps use UTC, and elapsed durations use a monotonic clock. Event byte overflow fails closed rather than silently truncating evidence. The host must keep the directory inaccessible to candidate code; this library does not install OS permissions for adversarial HDL.
 
 The recorder persists `run.json` and `run_started` before returning. Terminal publication writes `run_finished`, then a same-directory temporary JSON file, flushes it and atomically renames it to `result.json`. No append is accepted after terminal publication begins. `inspectRun` reports `INCOMPLETE` when the terminal file is missing and rejects corrupt or cross-task results. It does not label a possibly live owner ABORTED; an owning workflow must first establish termination. Project events do not replace or migrate released Harness Session records.
+
+Model actions retain every received normalized chunk in `stream.json` and `stream.jsonl`. The separate [incremental audit](../src/phase1/stream-audit.ts) publishes `stream-audit.json` through the same managed atomic writer. Its compact JSON array has an exact UTF-8 budget of `maxEventBytes / 2`, including brackets, commas and escapes, with 4096 bytes reserved for usage and finish metadata. Ordinary chunks are omitted whole; omitted payloads are not held for final trimming. Critical metadata that cannot fit sets `audit_error` to `AUDIT_METADATA_LIMIT` and `terminal_metadata_preserved` to false, with omission counts. This audit error does not change semantic acceptance or truncate the complete archives.
+
+[Provider usage](../src/phase1/provider-usage.ts) distinguishes `USAGE_RETURNED`, `USAGE_MISSING_PROVIDER`, `USAGE_LOST_HOST` and `USAGE_UNPARSEABLE`; unavailable counts remain null. Returned counts require nonnegative safe integers and an exact provided total. Prompt accounting adds disjoint input and cache buckets once; reasoning remains within output. Equal normalized samples are not summed, and conflicting or invalid samples are reported explicitly. Content finish does not establish normal iterator exhaustion, and valid received usage survives later interruption. These observations are independent of semantic acceptance and appear in `model.json.observation.provider_usage`.
+
+The DeepSeek adapter sets optional `providerProtocolComplete=true` on a normalized finish only after it observes `[DONE]` and emits preceding accounting. Telemetry publishes this fact as `model.json.observation.provider_protocol_complete`, with source `normalized-provider-stream-marker`. A completed provider error without usage is `USAGE_MISSING_PROVIDER`; an unmarked local error, including a no-body `EMPTY_RESPONSE`, is `USAGE_LOST_HOST`. An absent marker supplies no proof of provider protocol completion. Semantic failure and later cancellation remain separate facts, and valid received usage remains available. This metadata does not change provider selection, retries or request budgets.
+
+When an [action response](../src/phase1/p09-action-call.ts) exceeds its semantic byte limit, its error stays `OUTPUT_TRUNCATED`, its message stays null and semantic assembly stops. The same iterator continues metadata observation under the original request, signal and timer until normal exhaustion, the original deadline or cancellation; authentication, safety and user-cancel paths still terminate immediately. The provider must cancel and settle a pending read when that signal aborts. Later transport, terminal-provider, usage, audit and persistence outcomes remain separate facts; no extra grace, dispatch or retry is added by this drain.
 
 <a id="verification"></a>
 ## Verification
@@ -133,3 +147,5 @@ G0, G1, G2, complete OS isolation and official-image readiness remain unaccepted
 ## Dev Note
 
 [Bounded RTL verification facts](../../.agents/notes/implemented/feature/2026-09-13-rtl-simulation-tool.md).
+
+[Repair eligibility, bounded stream audit and provider accounting](../../.agents/notes/implemented/bug-fix/2026-10-09-p3-production-continuity.md).

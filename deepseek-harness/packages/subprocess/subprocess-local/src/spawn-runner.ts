@@ -34,7 +34,7 @@ import {
   resolveWindowsExecutable,
   SUBPROCESS_RUNNER_ENV,
   WINDOWS_RUNNER_SELECTION,
-} from './runner-launch.ts'
+} from './runner-target.ts'
 
 type RunnerHost = Pick<NodeJS.Process, 'env' | 'exitCode' | 'connected' | 'cwd' | 'chdir' | 'on' | 'off' | 'once' | 'disconnect'> & {
   send?: NodeJS.Process['send']

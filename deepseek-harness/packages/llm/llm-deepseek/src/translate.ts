@@ -132,6 +132,7 @@ export async function* translate(payloads: AsyncIterable<string>): AsyncGenerato
       const reason = pendingFinish ?? { kind: 'stop' as const }
       yield {
         type: 'finish',
+        providerProtocolComplete: true,
         reason: reason.kind === 'stop' && order.length === 0
           ? {
             kind: 'error',

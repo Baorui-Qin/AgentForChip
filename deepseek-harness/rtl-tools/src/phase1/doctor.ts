@@ -14,7 +14,7 @@ import { atomicJson } from './recorder.ts'
 export const DoctorConfig = z.object({
   schema_version: z.const('1.0').required(),
   repositoryRoot: z.string().required(), outputRoot: z.string().required(),
-  expectedVivadoVersion: z.const('2025.2').required(), part: z.const('xczu3eg-sbva484-1-e').required(), clockPeriodNs: z.const(5).required(),
+  expectedVivadoVersion: z.string().required(), part: z.const('xczu3eg-sbva484-1-e').required(), clockPeriodNs: z.const(5).required(),
   tools: z.object({ vivado: z.string().required(), xvlog: z.string().required(), xelab: z.string().required(), xsim: z.string().required() }).required(),
   limits: z.object({ timeoutMs: z.natural().min(1).max(2_147_483_647).required(), graceMs: z.natural().min(1).required(),
     maxLogBytes: z.natural().min(1).required(), maxLineChars: z.natural().min(1).required(),
@@ -37,7 +37,7 @@ export interface DoctorResult {
   eda_ready: boolean
   model: { status: 'MODEL_NOT_READY'; reason: string }
   directory: string
-  versions: Record<string, { actual: string | null; matches: boolean; probe: Probe }>
+  versions: Record<string, { actual: string | null; expected: string; matches: boolean; probe: Probe }>
   part_query: { status: 'PASS' | 'FAIL' | 'SKIPPED'; part: string; probe: Probe | null }
   synthesis: SynthesisResult | null
   started_at: string
@@ -54,6 +54,7 @@ export async function readDoctorConfig(path: string): Promise<{ config: DoctorSe
   const input = load(text, { schema: JSON_SCHEMA }) as Parameters<typeof DoctorConfig>[0]
   if (!input || typeof input !== 'object' || !Object.hasOwn(input, 'model') || input.model !== null) throw new Error('Doctor requires explicit model: null until the local adapter is configured')
   const config = DoctorConfig(input)
+  if (!/^\d{4}\.\d+$/.test(config.expectedVivadoVersion)) throw new Error('Expected Vivado version must be YYYY.minor')
   const allowed = [
     [config, ['schema_version', 'repositoryRoot', 'outputRoot', 'expectedVivadoVersion', 'part', 'clockPeriodNs', 'tools', 'limits', 'model']],
     [config.tools, ['vivado', 'xvlog', 'xelab', 'xsim']],
@@ -79,9 +80,9 @@ function clean(probe: Probe): boolean {
  * @param expected - pinned major/minor release.
  * @returns observed version and comparison; Vivado's informational exit 1 is allowed here only.
  */
-export function versionFact(probe: Probe, output: string, expected: string): { actual: string | null; matches: boolean; probe: Probe } {
+export function versionFact(probe: Probe, output: string, expected: string): { actual: string | null; expected: string; matches: boolean; probe: Probe } {
   const actual = output.match(/\bVivado(?:\s+Simulator)?\s+v?(\d{4}\.\d+)\b/i)?.[1] ?? null
-  return { actual, matches: clean(probe) && [0, 1].includes(probe.process!.exitCode ?? -1) && actual === expected, probe }
+  return { actual, expected, matches: clean(probe) && [0, 1].includes(probe.process!.exitCode ?? -1) && actual === expected, probe }
 }
 
 async function sourceHashes(root: string): Promise<Record<string, string>> {

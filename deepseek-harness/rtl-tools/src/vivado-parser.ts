@@ -74,7 +74,7 @@ export class VivadoDiagnostics {
 
 /**
  * Read the exact utilization rows rather than totals, percentages or INFO messages.
- * @param report - Vivado 2025.2 non-hierarchical report text.
+ * @param report - Vivado non-hierarchical report text; historical formats remain regression fixtures.
  * @returns independently nullable metrics; missing or ambiguous rows stay unknown.
  */
 export function parseUtilization(report: string): Resources {

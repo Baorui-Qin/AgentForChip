@@ -83,6 +83,7 @@ Each spawn selects one owner for both signalling and quiescence. Supported Linux
 | [`src/linux-execve.ts`](src/linux-execve.ts) | Linux libc image replacement and inherited-standard-descriptor preservation |
 | [`src/windows-job.ts`](src/windows-job.ts) | Windows Job capability checks and helper launch |
 | [`src/runner-launch.ts`](src/runner-launch.ts) | Source, built, and packaged private-runner selection |
+| [`src/runner-target.ts`](src/runner-target.ts) | Runner selector, argv parsing, and Windows executable lookup; `runner-launch.ts` reexports the same helpers |
 | [`src/spawn-runner.ts`](src/spawn-runner.ts) | Linux one-shot exec bootstrap and Windows Job runner |
 | [`src/runner-protocol.ts`](src/runner-protocol.ts) | Strict Linux launch/startup files and Windows IPC messages |
 | [`src/terminal.ts`](src/terminal.ts) | `node-pty` handle: Linux scope attachment, foreground inspection, and fallback cleanup |
@@ -95,6 +96,8 @@ Each spawn selects one owner for both signalling and quiescence. Supported Linux
 A spawn synchronously validates the final argv, cwd, and environment, selects containment before the user command can run, and returns a handle while target identity remains private. Linux ordinary and terminal launches use a private one-shot request whose scoped bootstrap restores the target cwd and environment, resolves the executable, clears close-on-exec on fd 0 through fd 2, and enters libc `execve()` with the original argv. Windows ordinary launches isolate runner fd 0 through fd 2, reserve fd 3 for IPC, and carry target stdio on fd 4 through fd 6; the runner resolves those CRT descriptors to OS handles, creates the target suspended, assigns it to the Job, resumes it, and closes only the carrier descriptors. `done` settles the direct command after its stdio barrier, while `waitForExit()` separately waits for the selected scope, Job, process group, or observed session to become empty.
 
 ### Safety invariants
+
+A terminate-channel `EPIPE` is retained as a control diagnostic while the existing grace boundary still waits for native Job range proof. It cannot establish successful cleanup; abnormal runner closure rejects that proof and retains the control error as its cause. The private Windows runner exits after its protocol and native ownership settle, so unrelated referenced ports cannot extend its lifetime.
 
 Spill files are opened `0600` with `O_EXCL` and random names under a `0700` per-process directory, defeating symlink planting in shared temp dirs; a failed final close withholds the spill path. Fallback process identities carry start times, so cleanup never follows PID reuse. A selected native failure is reported instead of replaying argv through fallback, and a range is removed from the live set only after cleanup completes or the failure remains observable. Host-exit finalization creates no promises or timers, preserves the host exit code and diagnostic, contains each target's failure, and does not claim quiescence.
 

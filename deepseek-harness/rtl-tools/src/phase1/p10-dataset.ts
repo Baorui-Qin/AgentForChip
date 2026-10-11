@@ -3,7 +3,8 @@ import { readFile, readdir, realpath } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import { checkedFile, sha256, type Evaluation } from './snapshots.ts'
 import { datasetRevision } from './protocol.ts'
-import { checkInterface, type DUTInterface } from './candidates.ts'
+import { checkInterface, declaredInterface, type DUTInterface } from './candidates.ts'
+import { applyPublicInterfaceErratum, type PublicInterfaceErratum } from './p10-interface-errata.ts'
 
 /** Public prompt and immutable asset identities; reference contents never belong to a model prompt. */
 export interface P10Task {
@@ -11,6 +12,7 @@ export interface P10Task {
   interface: DUTInterface | null; interface_error: string | null
   clock: { kind: 'physical' | 'virtual'; port: string | null; period_ns: 5 } | null
   git_crlf_checkout_files?: string[]
+  public_interface_erratum?: PublicInterfaceErratum
 }
 /** Selection predicates are frozen before observing evaluator or model outcomes. */
 export const selectionRules = [
@@ -23,12 +25,18 @@ export const selectionRules = [
 /** Stable across execution dates; hash ordering is not a random-number-library dependency. */
 export const selectionSeed = 'p10-verilogeval-v1:20260917:'
 
-/** Parse only the public port-list notation used by these tasks; ambiguity blocks rather than guesses. @param spec - unchanged public task. @returns constant-width public interface. */
+/** Parse public port lists or a unique inline module; ambiguity blocks rather than guesses. @param spec - unchanged public task. @returns constant-width public interface. */
 export function publicInterface(spec: string): DUTInterface {
   const declarations = spec.split(/\r?\n/).filter(line => /^\s*-\s+(input|output|inout)\b/.test(line))
-  if (!declarations.length) throw new Error('PUBLIC_INTERFACE_UNSUPPORTED')
+  if (!declarations.length) {
+    const modules = [...spec.matchAll(/\bmodule\s+TopModule\s*\([\s\S]*?\bendmodule\b/g)]
+    if (modules.length !== 1) throw new Error('PUBLIC_INTERFACE_UNSUPPORTED')
+    const parsed = declaredInterface(modules[0]![0], 'TopModule')
+    if (/8-bit 2-to-1 mux/.test(spec) && parsed.ports.some(port => port.direction === 'output' && port.width !== 8)) throw new Error('PUBLIC_INTERFACE_CONFLICT')
+    return parsed
+  }
   const ports = declarations.map(line => {
-    const match = /^\s*-\s+(input|output)\s+([A-Za-z_][A-Za-z_0-9]*)\s*(?:\(\s*(\d+)\s+bits?\s*\))?\s*$/.exec(line)
+    const match = /^\s*-\s+(input|output)\s+([A-Za-z_][A-Za-z_0-9]*)\s*(?:\(\s*(\d+)\s+bits?\s*\))?\s*,?\s*$/.exec(line)
     if (!match) throw new Error('PUBLIC_INTERFACE_UNSUPPORTED')
     const width = Number(match[3] ?? 1)
     if (!Number.isSafeInteger(width) || width < 1 || width > 65536) throw new Error('PUBLIC_INTERFACE_UNSUPPORTED')
@@ -73,7 +81,7 @@ export async function loadP10Dataset(directory: string, revision: string, tree: 
       if (clocks.length > 1 || clocks.some(p => p.width !== 1)) throw new Error('PUBLIC_CLOCK_UNSUPPORTED')
       clock = { kind: clocks.length ? 'physical' : 'virtual', port: clocks[0]?.name ?? null, period_ns: 5 }
     } catch (error) { interface_error = error instanceof Error ? error.message : 'PUBLIC_INTERFACE_UNSUPPORTED' }
-    tasks.push({ task_id, spec, assets, interface: ports, interface_error, clock, git_crlf_checkout_files: converted })
+    tasks.push(applyPublicInterfaceErratum({ task_id, spec, assets, interface: ports, interface_error, clock, git_crlf_checkout_files: converted }))
   }
   return tasks
 }

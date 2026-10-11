@@ -4,7 +4,7 @@ import { basename, dirname, join } from 'node:path'
 const scenario = process.argv[2]
 const args = process.argv.slice(3)
 if (args.includes('-version')) {
-  process.stdout.write(`Vivado v${scenario === 'version-mismatch' ? '2024.2' : '2025.2'} (fixture)\n`)
+  process.stdout.write(`Vivado v${scenario === 'version-mismatch' ? '2025.2' : '2026.1'} (fixture)\n`)
   process.exitCode = 1
 } else if (args.includes('rev-parse')) {
   process.stdout.write('a'.repeat(40) + '\n')

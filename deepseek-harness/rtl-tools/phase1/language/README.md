@@ -7,6 +7,8 @@ kind: "package-reference"
 
 English | [中文](README.zh.md)
 
+The Phase 2 runtime baseline is Vivado 2026.1, selected by [dev.yaml](../configs/dev.yaml). Historical Phase 1 experiments and fixtures retain their 2025.2 provenance. New snapshots, compatibility suites and evaluator identities use the configured version; future Static Knowledge uses `{"tool":"vivado","tool_version":"2026.1"}`. See the [migration report](../../../../../docs/vivado-2026.1/report.md) for live validation scope and remaining failures.
+
 ## Summary
 
 Vivado simulation and synthesis share explicit language resolution. The host retains source roles and command evidence without granting the model new parameters or changing evaluator assets. This layer identifies diagnostic ownership, not inferred root causes or automatic repairs.
@@ -25,7 +27,7 @@ Synthesis reads DUT files with `read_verilog` or `read_verilog -sv` using the sa
 
 New verifier events, snapshots, stage and terminal records use project schema 1.3. Readers retain 1.0/1.1; model records remain 1.1 and comparison envelopes remain 1.2. Harness Session generations are unchanged. Each invocation records resolved executable, tool arguments, Windows wrapper arguments, policy-wrapped launch, source metadata, language mode, process outcome and relative stdout/stderr paths.
 
-Version probes preserve their actual exit codes. A verified 2025.2 banner can have exit code 1; this informational allowance applies only to `-version`, never compilation or other design execution. Aborted, timed-out, signalled or truncated probes cannot establish readiness. The reader checks probe evidence and invocation/process consistency.
+Version probes preserve their actual exit codes. Observed Vivado 2025.2 and 2026.1 version banners can have exit code 1; this informational allowance applies only to `-version`, never compilation or other design execution. Aborted, timed-out, signalled or truncated probes cannot establish readiness. The reader checks probe evidence and invocation/process consistency.
 
 Diagnostic records preserve message id, severity, location and bounded message text. Raw logs remain the source for exact original formatting. `origin` names manifest ownership; `attribution` distinguishes DUT compile/synthesis errors, testbench/reference compatibility, language configuration, Harness configuration, tool environment and unknown failures. Source matching uses exact normalized paths, never a `/trusted/` substring or basename guess.
 
@@ -39,7 +41,7 @@ The [counter repair application](../repair/README.md) keeps a separate host prop
 
 ## Sources
 
-- [AMD Vivado 2025.2 UG900](https://docs.amd.com/r/2025.2-English/ug900-vivado-logic-simulation/xelab-xvhdl-and-xvlog-xsim-Command-Options) owns command semantics, including the xvlog SystemVerilog flag.
+- [AMD Vivado 2026.1 UG900](https://docs.amd.com/r/2026.1-English/ug900-vivado-logic-simulation/xelab-xvhdl-and-xvlog-xsim-Command-Options) owns command semantics, including the xvlog SystemVerilog flag.
 - [Edalize Vivado source](https://github.com/olofk/edalize/blob/9a6f648c596bfe74224ae82f529075e565d4182b/edalize/tools/vivado.py), commit `9a6f648c596bfe74224ae82f529075e565d4182b`, declares BSD-2-Clause and explicitly maps source types to `read_verilog`/`read_verilog -sv`. This implementation borrows the design, not source code or framework dependencies.
 - [Edalize legacy XSim source](https://github.com/olofk/edalize/blob/main/edalize/xsim.py) provides contextual examples of `sv`/`verilog` project entries and compilation units. Its API is deprecated; it is not an adopted runtime or pinned implementation dependency.
 - AMD community suggestions remain unverified unless their full text, version and a local reproducer are available. No community workaround for Prob038 is claimed. Suggested changes are tested only in separate handwritten reproducers, never by editing original benchmark assets.

@@ -172,7 +172,11 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
       const binding = prepareManagedProcessBinding(this.internals)
       const launch = containmentMode === 'linux-scope'
         ? launchLinuxScope(spec, env)
-        : launchWindowsJob(spec, env)
+        : launchWindowsJob(spec, env, {
+          onTerminateDeliveryError: (error) => {
+            this.ctx.logger.warn('subprocess-local: terminate IPC returned EPIPE; awaiting Windows Job range proof under the existing grace boundary', error)
+          },
+        })
       handle = bindManagedProcess(spec, launch, binding)
     }
     this.live.add(handle)

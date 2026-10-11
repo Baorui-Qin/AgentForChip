@@ -20,6 +20,15 @@ export interface LineObserver {
   accept(raw: string, truncated?: boolean): void
 }
 
+/** Host-owned deadline provenance; ordinary caller cancellation remains independent. */
+export class DeadlineExceeded extends Error {
+  /** @param source - the host budget whose existing timer expired. */
+  constructor(readonly source: 'command' | 'stage' | 'total') {
+    super(`${source} wall-clock budget exceeded`)
+    this.name = 'DeadlineExceeded'
+  }
+}
+
 /** Independent termination facts and bounded artifact references. */
 export interface CommandResult {
   exitCode: number | null
@@ -69,7 +78,7 @@ async function capture(stream: Readable, path: string, observer: LineObserver, c
  * @param argv - confined executable and arguments.
  * @param cwd - unique artifact directory.
  * @param label - trusted filename prefix for logs.
- * @param signal - caller and plugin-lifecycle cancellation.
+ * @param signal - caller/lifecycle cancellation or a typed enclosing deadline.
  * @param observer - bounded diagnostic collector.
  * @returns termination facts and capped log references; provider and I/O failures throw.
  */
@@ -81,7 +90,7 @@ export async function runCommand(
   const started = performance.now()
   const deadline = new AbortController()
   let timedOut = false
-  const timer = setTimeout(() => { timedOut = true; deadline.abort() }, config.timeoutMs)
+  const timer = setTimeout(() => { timedOut = true; deadline.abort(new DeadlineExceeded('command')) }, config.timeoutMs)
   const stdoutLog = join(cwd, `${label}.stdout.log`)
   const stderrLog = join(cwd, `${label}.stderr.log`)
   try {
@@ -94,23 +103,37 @@ export async function runCommand(
     // Pipe dispositions guarantee both streams.
     const stdout = capture(handle.stdout!, stdoutLog, observer, config, () => deadline.abort())
     const stderr = capture(handle.stderr!, stderrLog, observer, config, () => deadline.abort())
+    const unprovenRange = new Error('Managed process range did not prove settlement')
     const outcome = handle.done.then(async value => {
       handle.terminate()
-      await handle.waitForExit()
+      if (await handle.waitForExit() !== true) throw unprovenRange
       return value
     })
     const pending = [outcome, stdout, stderr] as const
+    let failed = false
+    let failure: unknown
     try {
       const [exit, out, err] = await Promise.all(pending)
       return {
-        ...exit, timedOut, aborted: signal.aborted,
+        ...exit, timedOut: timedOut || (signal.aborted && signal.reason instanceof DeadlineExceeded), aborted: signal.aborted,
         durationMs: Math.round(performance.now() - started), stdoutLog, stderrLog,
         logTruncated: out.truncated || err.truncated,
         outputTail: (out.tail + '\n' + err.tail).trim().slice(-config.maxLineChars),
       }
+    } catch (error) {
+      failed = true; failure = error
+      throw error
     } finally {
-      handle.terminate()
-      try { await handle.waitForExit() } finally { await Promise.allSettled(pending) }
+      const cleanupErrors: unknown[] = []
+      try { handle.terminate() } catch (error) { cleanupErrors.push(error) }
+      try { if (await handle.waitForExit() !== true) throw unprovenRange } catch (error) { cleanupErrors.push(error) }
+      await Promise.allSettled(pending)
+      if (cleanupErrors.length) {
+        const errors = [...new Set(failed ? [failure, ...cleanupErrors] : cleanupErrors)]
+        if (errors.length === 1) throw errors[0]
+        const primary = failed ? failure : cleanupErrors[0]
+        throw new AggregateError(errors, primary instanceof Error ? primary.message : 'Managed command cleanup failed', { cause: primary })
+      }
     }
   } finally {
     clearTimeout(timer)

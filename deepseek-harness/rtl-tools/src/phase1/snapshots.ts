@@ -1,4 +1,5 @@
 /** Host-owned fixture snapshots; path checks detect escapes but are not an OS sandbox. @module rtl-tools/phase1/snapshots */
+import type { DoctorSettings } from './doctor.ts'
 import { createHash, randomUUID } from 'node:crypto'
 import { lstat, mkdir, mkdtemp, readFile, realpath, writeFile } from 'node:fs/promises'
 import { dirname, join, relative } from 'node:path'
@@ -6,6 +7,9 @@ import { artifactPath, type PhaseId } from './contracts.ts'
 import { fixtureFiles, type FixtureId } from './fixtures.ts'
 import { atomicJson } from './recorder.ts'
 import { resolveHDLSources, groupHDLSources, type HDLLanguage, type HDLSource, type ResolvedHDLSource } from '../hdl.ts'
+
+/** Configured EDA target recorded before execution; observed versions live in probe logs. */
+export type SnapshotEnvironment = Pick<DoctorSettings, 'expectedVivadoVersion' | 'part' | 'clockPeriodNs'>
 
 /** Immutable in-memory authority, paired with an auditable on-disk manifest. */
 export interface Snapshot { id: PhaseId; directory: string; fixture: FixtureId; trust: 'trusted_fixture' | 'reviewed_candidate'; files: Record<string, string>; manifest: string; sourceHash: string; sources: ResolvedHDLSource[]; evaluation?: Evaluation }
@@ -35,8 +39,8 @@ export async function checkedFile(root: string, name: string): Promise<string> {
 }
 
 /** Allocate a fixed fixture snapshot under a private run directory. @param parent - host-owned parent. @param fixture - fixed fixture id. @returns pinned snapshot authority. */
-export async function createSnapshot(parent: string, fixture: FixtureId): Promise<Snapshot> {
-  return materializeSnapshot(parent, fixture, fixtureFiles(fixture), 'trusted_fixture')
+export async function createSnapshot(parent: string, fixture: FixtureId, environment: SnapshotEnvironment): Promise<Snapshot> {
+  return materializeSnapshot(parent, fixture, fixtureFiles(fixture), 'trusted_fixture', environment)
 }
 
 /**
@@ -46,17 +50,17 @@ export async function createSnapshot(parent: string, fixture: FixtureId): Promis
  * @param reviewedSha256 - explicit host approval digest, never supplied by model arguments.
  * @returns separately labelled snapshot; no general execution authorization is granted.
  */
-export async function createReviewedCounterSnapshot(parent: string, source: string, reviewedSha256: string): Promise<Snapshot> {
+export async function createReviewedCounterSnapshot(parent: string, source: string, reviewedSha256: string, environment: SnapshotEnvironment): Promise<Snapshot> {
   if (!/^[a-f0-9]{64}$/.test(reviewedSha256) || sha256(source) !== reviewedSha256) throw new Error('Reviewed source hash mismatch')
-  return materializeSnapshot(parent, 'counter', { ...fixtureFiles('counter'), 'rtl/solution.sv': source }, 'reviewed_candidate')
+  return materializeSnapshot(parent, 'counter', { ...fixtureFiles('counter'), 'rtl/solution.sv': source }, 'reviewed_candidate', environment)
 }
 
 /** Bind a reviewed DUT to a host-owned dataset evaluator. @param parent - private run directory. @param assets - pinned trusted bytes. @param evaluation - fixed host configuration. @returns fresh authority. */
-export async function createDatasetSnapshot(parent: string, assets: Record<string, string>, evaluation: Evaluation): Promise<Snapshot> {
-  return materializeSnapshot(parent, 'counter', assets, 'reviewed_candidate', evaluation)
+export async function createDatasetSnapshot(parent: string, assets: Record<string, string>, evaluation: Evaluation, environment: SnapshotEnvironment): Promise<Snapshot> {
+  return materializeSnapshot(parent, 'counter', assets, 'reviewed_candidate', environment, evaluation)
 }
 
-async function materializeSnapshot(parent: string, fixture: FixtureId, assets: Record<string, string>, trust: Snapshot['trust'], evaluation?: Evaluation): Promise<Snapshot> {
+async function materializeSnapshot(parent: string, fixture: FixtureId, assets: Record<string, string>, trust: Snapshot['trust'], environment: SnapshotEnvironment, evaluation?: Evaluation): Promise<Snapshot> {
   const names = evaluation?.sources ?? (fixture === 'verilog' ? ['rtl/solution.v', 'trusted/tb.v'] : ['rtl/solution.sv', 'trusted/tb.sv'])
   const sources = resolveHDLSources(names.map(source => typeof source === 'string' ? { path: source,
     role: source === 'trusted/ref.sv' ? 'reference' as const : /^trusted\/tb\.(sv|v)$/.test(source) ? 'testbench' as const : 'dut' as const } : source), evaluation?.language)
@@ -73,7 +77,7 @@ async function materializeSnapshot(parent: string, fixture: FixtureId, assets: R
     files[name] = sha256(bytes)
   }
   const manifest = { schema_version: '1.3', snapshot_id: id, trust, fixture, sources, compilation_groups: groupHDLSources(sources), top: evaluation?.top ?? 'counter', tb_top: evaluation?.tbTop ?? 'phase1_tb',
-    part: 'xczu3eg-sbva484-1-e', tool_version: '2025.2', clock_period_ns: 5, files, ...(evaluation ? { evaluation } : {}) }
+    part: environment.part, tool_version: environment.expectedVivadoVersion, clock_period_ns: environment.clockPeriodNs, files, ...(evaluation ? { evaluation } : {}) }
   await atomicJson(directory, 'manifest.json', manifest)
   return { id, directory, fixture, trust, files, sources, manifest: JSON.stringify(manifest), sourceHash: files[dut[0]!.path]!, ...(evaluation ? { evaluation: structuredClone(evaluation) } : {}) }
 }

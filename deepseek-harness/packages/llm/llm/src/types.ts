@@ -397,6 +397,8 @@ export type StreamChunk =
   | {
     type: 'finish'
     reason: FinishReason
+    /** The adapter observed the provider's protocol terminator and emitted preceding accounting; absent on locally synthesized failures. */
+    providerProtocolComplete?: boolean
     /** Replay metadata for a successful response; see {@link ReplayEnvelope}. */
     replayState?: ReplayEnvelope
   }

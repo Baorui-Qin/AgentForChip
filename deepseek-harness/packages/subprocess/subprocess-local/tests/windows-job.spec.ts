@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events'
 import { fstatSync } from 'node:fs'
 import { PassThrough } from 'node:stream'
+import { Context } from '@deepseek-ai/cordis'
 import { describe, expect, it, vi } from 'vitest'
 import {
   launchWindowsJob,
@@ -138,6 +139,164 @@ describe('Windows Job capability', () => {
 })
 
 describe('Windows parent runner contract', () => {
+  it.each([true, false])('keeps direct exit0 separate from clean range proof before grace: %s', async (clean) => {
+    vi.useFakeTimers()
+    const child = new FakeChild(); child.deferSendCallbacks = true
+    const { result } = launch(child); child.deliverNextSend(null)
+    const handle = bindManagedProcess(spec, result)
+    const joined = handle.waitForExit().then(() => 'proven', (error: unknown) => error)
+    const kill = vi.spyOn(child, 'kill').mockImplementation((signal) => {
+      child.connected = false; child.emit('close', null, signal); return true
+    })
+    try {
+      handle.stdout?.resume()
+      child.targetStdout.end(); child.targetStderr.end()
+      child.emit('message', { type: 'target-exit', exitCode: 0 })
+      await expect(handle.done).resolves.toEqual({ exitCode: 0, signal: null })
+      handle.terminate(); handle.terminate()
+      child.deliverNextSend(Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }))
+      if (clean) { child.connected = false; child.emit('close', 0, null) }
+      await vi.advanceTimersByTimeAsync(spec.graceMs)
+      expect(child.sent.filter(message => (message as { type: string }).type === 'terminate')).toHaveLength(1)
+      if (clean) { expect(await joined).toBe('proven'); expect(kill).not.toHaveBeenCalled() }
+      else { expect(await joined).toBeInstanceOf(Error); expect(kill).toHaveBeenCalledExactlyOnceWith('SIGKILL') }
+    } finally { vi.useRealTimers() }
+  })
+
+  it.each(['callback-before-grace', 'callback-after-grace', 'synchronous-send'] as const)(
+    'fails closed without proof after terminate EPIPE: %s', async (order) => {
+      vi.useFakeTimers()
+      const child = new FakeChild()
+      child.deferSendCallbacks = true
+      const { result } = launch(child)
+      child.deliverNextSend(null)
+      const epipe = Object.assign(new Error('write EPIPE'), { code: 'EPIPE' })
+      if (order === 'synchronous-send') { child.throwOnSendCall = 2; child.sendThrown = epipe }
+      const handle = bindManagedProcess(spec, result)
+      const done = handle.done.then(() => 'unexpected-success', (error: unknown) => error)
+      const joined = handle.waitForExit().then(() => 'unexpected-proof', (error: unknown) => error)
+      const kill = vi.spyOn(child, 'kill').mockImplementation((signal) => {
+        child.connected = false; child.emit('close', null, signal); return true
+      })
+      try {
+        handle.terminate()
+        if (order === 'callback-before-grace') child.deliverNextSend(epipe)
+        expect(kill).not.toHaveBeenCalled()
+        await vi.advanceTimersByTimeAsync(spec.graceMs)
+        if (order === 'callback-after-grace') child.deliverNextSend(epipe)
+        expect(kill).toHaveBeenCalledWith('SIGKILL')
+        const failure = await joined
+        expect(failure).toBeInstanceOf(Error)
+        if (!(failure instanceof Error)) throw new Error('Expected missing-proof failure')
+        expect(failure.message).toContain('before proving')
+        expect(failure.cause).toBe(epipe)
+        expect(await done).toBe(failure)
+      } finally { vi.useRealTimers() }
+    },
+  )
+
+  it.each(['malformed', 'duplicate', 'missing-result', 'unsafe-exit'] as const)(
+    'retains %s failure after terminate EPIPE and close', async (failure) => {
+      const child = new FakeChild(); child.deferSendCallbacks = true
+      const { result } = launch(child); child.deliverNextSend(null)
+      const direct = result.direct.then(() => 'outcome', (error: unknown) => error)
+      const range = result.owner.waitForExit().then(() => 'clean', (error: unknown) => error)
+      result.owner.signal('SIGTERM')
+      child.deliverNextSend(Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }))
+      if (failure === 'malformed') child.emit('message', { type: 'target-exit', exitCode: '0' })
+      if (failure === 'duplicate' || failure === 'unsafe-exit') child.emit('message', { type: 'target-exit', exitCode: 0 })
+      if (failure === 'duplicate') child.emit('message', { type: 'target-exit', exitCode: 1 })
+      child.emit('close', failure === 'unsafe-exit' ? 127 : 0, null)
+      expect(await range).toBeInstanceOf(Error)
+      await direct
+    },
+  )
+
+  it('keeps cancellation reason and output drain separate from successful range proof', async () => {
+    const child = new FakeChild(); child.deferSendCallbacks = true
+    const reason = new Error('deadline exceeded'), controller = new AbortController()
+    const request = { ...spec, signal: controller.signal, stdio: { stdin: 'ignore', stdout: { maxBytes: 1024 }, stderr: { maxBytes: 1024 } } } as const
+    const { result } = launch(child, request); child.deliverNextSend(null)
+    const handle = bindManagedProcess(request, result)
+    let done = false
+    const outcome = handle.done.then((value) => { done = true; return value })
+    controller.abort(reason); handle.terminate(); controller.abort(new Error('second reason'))
+    child.deliverNextSend(Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }))
+    child.emit('message', { type: 'target-exit', exitCode: 0 })
+    child.emit('close', 0, null)
+    await expect(handle.waitForExit()).resolves.toBe(true)
+    expect(done).toBe(false)
+    expect(controller.signal.reason).toBe(reason)
+    child.targetStdout.end('last stdout'); child.targetStderr.end('last stderr')
+    expect(await outcome).toEqual({ exitCode: 0, signal: null })
+    expect(handle.collected.stdout?.readFrom(0).text).toBe('last stdout')
+    expect(child.sent.filter(message => (message as { type: string }).type === 'terminate')).toHaveLength(1)
+    await expect(handle.waitForExit()).resolves.toBe(true)
+  })
+
+  it('releases actual runtime ownership only after proof and permits repeated disposal', async () => {
+    const child = new FakeChild(); child.deferSendCallbacks = true
+    vi.doMock('../src/windows-job.ts', () => ({
+      probeWindowsJob: () => true,
+      launchWindowsJob: (request: Parameters<typeof launchWindowsJob>[0], env: Record<string, string>, options: object) => {
+        const result = launchWindowsJob(request, env, { ...options, spawn: vi.fn(() => child) as never, runnerInvocation: ['C:\\node.exe', 'C:\\runner.js'] })
+        child.emit('spawn'); return result
+      },
+    }))
+    const ctx = new Context()
+    try {
+      const { default: Runtime } = await import('../src/index.ts')
+      await ctx.plugin(Runtime)
+      const handle = ctx.subprocess.spawn(spec)
+      child.deliverNextSend(null)
+      child.emit('message', { type: 'target-exit', exitCode: 0 })
+      child.targetStdout.resume(); child.targetStderr.resume()
+      child.targetStdout.end(); child.targetStderr.end()
+      await handle.done
+      const live = Reflect.get(ctx.subprocess, 'live') as Set<unknown>
+      expect(live.size).toBe(1) // Direct exit cannot release a surviving Job/helper.
+      handle.terminate()
+      child.deliverNextSend(Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }))
+      const disposal = ctx.fiber.dispose()
+      child.connected = false; child.emit('close', 0, null)
+      await disposal
+      await ctx.fiber.dispose()
+      expect(live.size).toBe(0)
+      expect(child.killed).toEqual([])
+    } finally {
+      child.emit('close', 0, null)
+      await ctx.fiber.dispose()
+      vi.doUnmock('../src/windows-job.ts'); vi.resetModules()
+    }
+  })
+
+  it.each(['before-result', 'after-result', 'after-proof'] as const)(
+    'retains range proof when terminate EPIPE arrives %s', async (order) => {
+      const child = new FakeChild()
+      child.deferSendCallbacks = true
+      const { result } = launch(child)
+      child.deliverNextSend(null)
+      const reason = new Error('caller deadline')
+      result.owner.signal('SIGTERM', reason)
+      // Observe both promises before injecting the historical failure ordering.
+      const direct = result.direct.then(value => ({ value }), (error: unknown) => ({ error }))
+      const range = result.owner.waitForExit().then(() => 'clean', (error: unknown) => error)
+      const epipe = Object.assign(new Error('write EPIPE'), { code: 'EPIPE' })
+      if (order === 'before-result') child.deliverNextSend(epipe)
+      child.emit('message', { type: 'target-exit', exitCode: 0 })
+      if (order === 'after-result') child.deliverNextSend(epipe)
+      child.connected = false
+      child.emit('close', 0, null)
+      if (order === 'after-proof') {
+        await range
+        child.deliverNextSend(epipe)
+      }
+      expect(await direct).toEqual({ value: { exitCode: 0, signal: null } })
+      expect(await range).toBe('clean')
+      expect(child.killed).toEqual([])
+    },
+  )
+
   it('isolates runner stdio, carries target stdio on fd 4 through fd 6, and sends cwd/env', () => {
     const { child, result, spawn } = launch()
     expect(spawn).toHaveBeenCalledWith('C:\\node.exe', [

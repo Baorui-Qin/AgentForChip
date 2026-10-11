@@ -49,6 +49,23 @@ import {
   runSpawnRunner,
 } from '../src/spawn-runner.ts'
 import type { SpawnRunnerInternals } from '../src/spawn-runner.ts'
+import * as runnerTarget from '../src/runner-target.ts'
+
+it('preserves selector consumption and argv rejection through both runner helper entries', () => {
+  for (const entry of [{ consumeRunnerSelection, parseRunnerTargetArgv }, runnerTarget]) {
+    const env = { [SUBPROCESS_RUNNER_ENV]: 'windows', SAFE: 'retained' }
+    expect(entry.consumeRunnerSelection(env)).toBe(WINDOWS_RUNNER_SELECTION)
+    expect(env).toEqual({ SAFE: 'retained' })
+    expect(entry.consumeRunnerSelection(env)).toBeUndefined()
+    const argv = ['--', 'program', '', '--flag']
+    expect(entry.parseRunnerTargetArgv(argv)).toEqual(['program', '', '--flag'])
+    expect(argv).toEqual(['--', 'program', '', '--flag'])
+    expect(() => entry.parseRunnerTargetArgv(['program'])).toThrow('subprocess runner requires target argv after a private -- delimiter')
+  }
+  expect(runnerTarget.resolveWindowsExecutable).toBe(resolveWindowsExecutable)
+  expect(runnerTarget.SUBPROCESS_RUNNER_ENV).toBe(SUBPROCESS_RUNNER_ENV)
+  expect(runnerTarget.WINDOWS_RUNNER_SELECTION).toBe(WINDOWS_RUNNER_SELECTION)
+})
 
 const scratch: string[] = []
 

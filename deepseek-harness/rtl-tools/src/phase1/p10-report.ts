@@ -47,7 +47,7 @@ export function preflightMetrics(rows: P10Preflight[]) {
 }
 
 /** Publish complete blocked-run deliverables without inventing Baseline/Agent trajectories. @param directory - pilot output. @param revision - frozen dataset. @param rows - exactly the selected tasks. @param sentinel - separately identified compatibility probe. @param wallMs - campaign observation time. @returns NO-GO or explicit need for model-phase implementation. */
-export async function reportP10Preflight(directory: string, revision: string, rows: P10Preflight[], sentinel: P10Preflight, wallMs: number) {
+export async function reportP10Preflight(directory: string, revision: string, rows: P10Preflight[], sentinel: P10Preflight, wallMs: number, vivadoVersion: string) {
   if (rows.length !== 10 || new Set(rows.map(r => r.task_id)).size !== 10 || rows.some((r, i) => r.manifest_index !== i + 1 || r.model_requests !== 0)) throw new Error('P10_TASK_ACCOUNTING_INVALID')
   const metrics = preflightMetrics(rows)
   const write = (name: string, value: unknown) => publish(directory, name, JSON.stringify(value, null, 2) + '\n')
@@ -69,7 +69,7 @@ export async function reportP10Preflight(directory: string, revision: string, ro
   await publish(directory, 'p10-results-10.csv', csv(resultRows, Object.keys(resultRows[0]!)))
   const compatibility = [...rows, sentinel].flatMap(row => row.diagnostics.map(d => ({ task_id: row.task_id, selected: row.manifest_index !== null,
     blocked_stage: row.blocked_stage, origin: d.origin, message_id: d.message_id, message: d.message, asset: d.file,
-    vivado_version: '2025.2', status: row.status, artifacts: row.verification_run })))
+    vivado_version: vivadoVersion, status: row.status, artifacts: row.verification_run })))
   await publish(directory, 'p10-benchmark-compatibility-10.csv', csv(compatibility, ['task_id', 'selected', 'blocked_stage', 'origin', 'message_id', 'message', 'asset', 'vivado_version', 'status', 'artifacts']))
   const distribution = [...new Set(rows.map(r => r.status))].map(category => ({ category, count: rows.filter(r => r.status === category).length, origin: 'evaluator_preflight', model_failure: false }))
   await publish(directory, 'p10-failure-distribution-10.csv', csv(distribution, ['category', 'count', 'origin', 'model_failure']))

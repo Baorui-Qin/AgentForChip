@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto'
 import { parseContract, stages, type ModelResult, type PhaseId, type RunIdentity, type RunResult, type StageResult } from './contracts.ts'
 import { parseRecord, type ModelRecord, type StageRecord, type RunRecord } from './records.ts'
 import type { ContextAudit } from './p09-context.ts'
+import type { EvidenceAccess } from './evidence-access.ts'
 
 /** Correlation keys are host-assigned, not inferred from log text. */
 export interface EventLink { revision_id: PhaseId | null; call_id: PhaseId }
@@ -23,12 +24,28 @@ export type EventInput =
  * @param directory - host-owned directory, never candidate-controlled.
  * @param name - fixed caller-owned filename.
  * @param value - already-validated JSON-serializable data.
+ * @param access - optional same-run coordination shared with live metadata scans.
+ * @param signal - original deadline/cancellation; terminal owner publication may omit it.
  */
-export async function atomicJson(directory: string, name: string, value: unknown): Promise<void> {
-  const temp = join(directory, `.${randomUUID()}.tmp`)
-  const handle = await open(temp, 'wx', 0o600)
-  try { await handle.writeFile(JSON.stringify(value, null, 2) + '\n'); await handle.sync() } finally { await handle.close() }
-  await rename(temp, join(directory, name))
+export async function atomicJson(directory: string, name: string, value: unknown, access?: EvidenceAccess, signal?: AbortSignal): Promise<void> {
+  access?.assertPath(join(directory, name))
+  const publish = async (current?: AbortSignal) => {
+    current?.throwIfAborted()
+    const temp = join(directory, `.${randomUUID()}.tmp`)
+    const handle = await open(temp, 'wx', 0o600)
+    try {
+      current?.throwIfAborted()
+      await handle.writeFile(JSON.stringify(value, null, 2) + '\n')
+      current?.throwIfAborted()
+      await handle.sync()
+    } finally { await handle.close() }
+    current?.throwIfAborted()
+    await rename(temp, join(directory, name))
+    // An in-flight rename must settle even if cancellation arrives after its commit point.
+    current?.throwIfAborted()
+  }
+  if (access) await access.run('atomic_json:' + name, publish, signal)
+  else await publish(signal)
 }
 
 /** Serial durable writer. The host owns the directory for its entire lifetime. */

@@ -12,6 +12,20 @@ import { calibrationPairReady } from '../src/phase1/p10-suite-preflight.ts'
 const fixture = () => readFile(new URL('./fixtures/p10/Prob005_notgate_test.sv', import.meta.url))
 const convert = (bytes: Buffer) => convertTB('Prob005_notgate', bytes, sha256(bytes))
 
+it('keeps original TB bytes when the selected runtime does not require declaration movement', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'p10-no-rule-')), dataset = join(root, 'original'), output = join(root, 'derived')
+  await mkdir(join(dataset, 'dataset_spec-to-rtl'), { recursive: true }); await mkdir(output)
+  const path = 'dataset_spec-to-rtl/Prob005_notgate_test.sv', bytes = await fixture()
+  await writeFile(join(dataset, path), bytes)
+  const task: P10Task = { task_id: 'Prob005_notgate', assets: { [path]: sha256(bytes) }, spec: '', interface: null, interface_error: null, clock: null }
+  const manifest = await buildSuite(dataset, [task], output, '2026-09-23T00:00:00.000Z', { vivadoVersion: '2026.1', applyDeclarationOrderRule: false })
+  expect(manifest.converted_task_count).toBe(0)
+  expect(manifest.rules).toEqual([])
+  expect(manifest.tasks[0]!.evaluator_id).toBe('verilogeval-Prob005_notgate-vivado2026.1-compat-v1')
+  expect(await readFile(join(output, task.task_id, 'tb.sv'))).toEqual(bytes)
+  expect(await readFile(join(output, task.task_id, 'change.diff'), 'utf8')).toBe('')
+})
+
 it('accepts matching informational version exit 1, never failing EDA or incomplete negative evidence', () => {
   const invocation = { args: ['-sv'], version_matches: null, process: { exit_code: 0, timed_out: false, cancelled: false, signal: null, log_truncated: false } }
   const negative = { stages: [
@@ -65,7 +79,7 @@ it('T6 never repeats a transformation', async () => {
   expect(() => convert(bytes)).toThrow('COMPAT_RULE_NOT_APPLICABLE')
 })
 it('T7 refuses wrong scope, expressions, preprocessing and partial known templates', async () => {
-  const text = (await fixture()).toString()
+  const text = (await fixture()).toString().replace(/\r?\n/g, '\r\n')
   for (const input of [text.replace('module tb()', 'module other()'), text.replace('~tb_match;', '!tb_match;'),
     text.replace('\tinitial begin \r\n\t\t$dumpfile', '\tgenerate if (1) begin\r\n\tinitial begin \r\n\t\t$dumpfile'),
     text.replace('wire tb_match;', 'wire other_match;'), text.replace('module tb();', 'module tb();\r\n`ifdef ALTER'),
@@ -87,7 +101,7 @@ it('retains unmatched, ambiguous and undecodable files byte-for-byte in the full
     await writeFile(join(dataset, path), bytes)
     catalog.push({ task_id, assets: { [path]: sha256(bytes) }, spec: '', interface: null, interface_error: null, clock: null })
   }
-  const manifest = await buildSuite(dataset, catalog, output, '2026-09-18T00:00:00.000Z')
+  const manifest = await buildSuite(dataset, catalog, output, '2026-09-18T00:00:00.000Z', { vivadoVersion: '2026.1', applyDeclarationOrderRule: true })
   expect(manifest).toMatchObject({ task_count: 3, converted_task_count: 0, unchanged_task_count: 3, unknown_task_count: 2 })
   expect(manifest.tasks.map(t => t.status)).toEqual(['NO_KNOWN_COMPAT_ISSUE', 'MULTIPLE_MATCH', 'STATIC_ANALYSIS_ERROR'])
   for (const [index, task] of catalog.entries()) expect(await readFile(join(output, task.task_id, 'tb.sv'))).toEqual(inputs[index])
@@ -104,7 +118,7 @@ it('T9/T10 builds byte-identical manifests without touching upstream and seals t
   }
   for (const folder of ['first', 'second']) {
     await mkdir(join(root, folder))
-    await buildSuite(dataset, [task], join(root, folder), '2026-09-18T00:00:00.000Z')
+    await buildSuite(dataset, [task], join(root, folder), '2026-09-18T00:00:00.000Z', { vivadoVersion: '2026.1', applyDeclarationOrderRule: true })
   }
   const first = join(root, 'first'), second = join(root, 'second')
   for (const name of await readdir(first, { recursive: true })) {
@@ -113,11 +127,11 @@ it('T9/T10 builds byte-identical manifests without touching upstream and seals t
   }
   for (const [path, hash] of Object.entries(task.assets)) expect(sha256(await readFile(join(dataset, path)))).toBe(hash)
   await expect(loadCompatAssets(dataset, task, first, '1ps/1ps')).rejects.toThrow()
-  const seal = { manifest_sha256: sha256(await readFile(join(first, suiteManifestName))), defaultTimescale: '1ps/1ps', representative_calibration_passed: true }
+  const seal = { manifest_sha256: sha256(await readFile(join(first, suiteManifestName('2026.1')))), defaultTimescale: '1ps/1ps', representative_calibration_passed: true }
   await writeFile(join(first, 'suite-freeze.json'), JSON.stringify(seal))
   const baseline = await loadCompatAssets(dataset, task, first, '1ps/1ps'), agent = await loadCompatAssets(dataset, task, first, '1ps/1ps')
   expect(() => assertSharedEvaluator(baseline, agent)).not.toThrow()
-  expect(baseline.evaluation.compatibility).toMatchObject({ compatibility_version: 'vivado2025.2-compat-v1', vivado_version: '2025.2' })
+  expect(baseline.evaluation.compatibility).toMatchObject({ compatibility_version: 'vivado2026.1-compat-v1', vivado_version: '2026.1' })
   await expect(loadSuiteAssets(dataset, task, first)).rejects.toThrow('COMPAT_SUITE_NOT_FROZEN')
   const wrong = structuredClone(agent); wrong.assets['trusted/tb.sv'] += '\n'
   expect(() => assertSharedEvaluator(baseline, wrong)).toThrow('BASELINE_AGENT_EVALUATOR_MISMATCH')

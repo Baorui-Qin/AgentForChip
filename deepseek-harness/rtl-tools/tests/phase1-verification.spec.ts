@@ -1,11 +1,19 @@
+const snapshotEnvironment = { expectedVivadoVersion: '2026.1', part: 'xczu3eg-sbva484-1-e' as const, clockPeriodNs: 5 as const }
 import { mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
 import LocalSubprocess from '@deepseek-ai/dsh-subprocess-local'
 import { afterEach, expect, it, vi } from 'vitest'
-import { VerificationRunner, SimulationEvidence } from '../src/phase1/verification.ts'
+import { installTestOperationScope } from './test-operation-scope.ts'
+import { DeterministicEdaOutput } from './helpers/deterministic-eda-output.ts'
+import { ManagedVersionProbeFixture } from './helpers/managed-version-probe-fixture.ts'
+import { TargetWitness } from './helpers/g1-target-witness.ts'
+import { waitForBoundTarget } from './helpers/bound-target-wait.ts'
+import { waitForChildReadiness } from './helpers/child-readiness-wait.ts'
+import type { SubprocessHandle, SubprocessSpawnSpec } from '@deepseek-ai/dsh-subprocess'
+import { VerificationRunner, SimulationEvidence, type VerificationResult } from '../src/phase1/verification.ts'
 import { checkedFile, checkSnapshot, createSnapshot, createDatasetSnapshot } from '../src/phase1/snapshots.ts'
 import { parseRecord } from '../src/phase1/records.ts'
 import { fixtureIds, expectedStage, type FixtureId } from '../src/phase1/fixtures.ts'
@@ -16,23 +24,55 @@ import { renderVerification } from '../src/phase1/development.ts'
 import { classifyPreflight } from '../src/phase1/p10-report.ts'
 
 const roots: string[] = [], contexts: Context[] = [], runners: VerificationRunner[] = []
+const fixtures: DeterministicEdaOutput[] = []
+const versionFixtures: ManagedVersionProbeFixture[] = []
+let witness: TargetWitness | undefined
+const operationScope = installTestOperationScope()
 afterEach(async () => {
-  for (const runner of runners.splice(0)) await runner.close()
-  for (const ctx of contexts.splice(0)) await ctx.fiber.dispose()
-  for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true })
-  vi.restoreAllMocks()
+  const scope = operationScope()
+  try {
+    await scope.cleanup(async () => {
+      for (const owner of runners) await owner.close()
+      for (const fixture of fixtures) await fixture.close()
+      for (const fixture of versionFixtures) await fixture.close()
+      for (const ctx of contexts) await ctx.fiber.dispose()
+    }, async () => {
+      if (await witness?.capture(scope, roots)) return
+      if (scope.bodyErrors().length) {
+        console.error('Retained failed test roots', JSON.stringify({ roots, bodyErrors: scope.bodyErrors() }))
+        return
+      }
+      for (const root of roots) await rm(root, { recursive: true, force: true })
+    })
+    runners.length = 0; contexts.length = 0; roots.length = 0; fixtures.length = 0; versionFixtures.length = 0; witness = undefined
+  } catch (error) {
+    console.error('Test cleanup failed; roots retained', JSON.stringify({ roots, scope_id: scope.id, pending: scope.pendingOperations, bodyErrors: scope.bodyErrors(), error: String(error) }))
+    throw error
+  } finally { vi.restoreAllMocks() }
 })
 
-async function setup(options = {}, limits = {}) {
+async function setup(options = {}, limits = {}, rawVerdict?: string, isolateVersionProbes = false, observeNative?: (spec: SubprocessSpawnSpec, handle: SubprocessHandle) => void) {
   const root = await mkdtemp(join(tmpdir(), 'phase1-verification-')); roots.push(root)
   const ctx = new Context(); contexts.push(ctx); await ctx.plugin(LocalSubprocess)
   const { config } = await readDoctorConfig(fileURLToPath(new URL('../phase1/configs/dev.yaml', import.meta.url)))
   config.outputRoot = root
   config.tools = { vivado: process.execPath, xvlog: process.execPath, xelab: process.execPath, xsim: process.execPath }
   config.limits = { ...config.limits, timeoutMs: 5000, graceMs: 100, maxLogBytes: 8192 }
-  const runner = new VerificationRunner(ctx.subprocess, config, { compileMs: 5000, elaborateMs: 5000, simulationMs: 5000, totalMs: 30000, maxArtifactBytes: 1000000, artifactPollMs: 20, maxEventBytes: 65536, ...limits }); runners.push(runner)
+  const runner = operationScope().own(new VerificationRunner(ctx.subprocess, config, { compileMs: 5000, elaborateMs: 5000, simulationMs: 5000, totalMs: 30000, maxArtifactBytes: 1000000, artifactPollMs: 20, maxEventBytes: 65536, ...limits }), ['registerFixture', 'registerReviewedCounter', 'registerDataset', 'verify', 'preflightDataset']); runners.push(runner)
   const spawn = ctx.subprocess.spawn.bind(ctx.subprocess)
-  const spy = vi.spyOn(ctx.subprocess, 'spawn').mockImplementation(spec => spawn({ ...spec, argv: [process.execPath, fileURLToPath(new URL('./fake-verification.mjs', import.meta.url)), JSON.stringify(options), ...spec.argv.slice(1)] }))
+  const prefix = [process.execPath, fileURLToPath(new URL('./fake-verification.mjs', import.meta.url)), JSON.stringify(options)]
+  const fixture = rawVerdict === undefined ? undefined : new DeterministicEdaOutput(prefix, rawVerdict)
+  if (fixture) fixtures.push(fixture)
+  const versionFixture = isolateVersionProbes ? new ManagedVersionProbeFixture(spawn, [...prefix, '-version'], { stdout: 'Vivado Simulator v2026.1\n', stderr: '', exitCode: 0 }) : undefined
+  if (versionFixture) versionFixtures.push(versionFixture)
+  const spy = vi.spyOn(ctx.subprocess, 'spawn').mockImplementation(spec => {
+    const mapped = { ...spec, argv: [...prefix, ...spec.argv.slice(1)] }
+    witness?.record('subprocess_call_start', { argv: mapped.argv, cwd: mapped.cwd })
+    const handle = versionFixture ? versionFixture.spawn(mapped) : fixture ? fixture.spawn(mapped) : spawn(mapped)
+    const observed = operationScope().observeManaged(witness ? witness.observe(mapped, handle, versionFixture?.calls.at(-1)?.kind === 'VERSION_FIXTURE' ? 'LOGICAL_VERSION' : fixture ? 'LOGICAL_OUTPUT' : 'NATIVE') : handle)
+    observeNative?.(mapped, observed)
+    return observed
+  })
   const register = (fixture: FixtureId = 'counter') => runner.registerFixture(fixture, { experiment_id: 'mock' as PhaseId, task_id: fixture as PhaseId, sample_id: 0, mode: 'agent' })
   return { root, ctx, runner, spy, register }
 }
@@ -41,8 +81,18 @@ const mixedEvaluation = { top: 'counter', tbTop: 'tb', sources: [{ path: 'rtl/so
 const mixedAssets = { 'rtl/solution.v': 'module counter; endmodule', 'trusted/ref.sv': 'module reference; endmodule', 'trusted/tb.v': 'module tb; endmodule', 'trusted/clock.xdc': '' }
 const identity = { experiment_id: 'mock' as PhaseId, task_id: 'mixed' as PhaseId, sample_id: 0, mode: 'agent' as const }
 
+it('rejects a 2025.2 tool or evaluator when configured for 2026.1', async () => {
+  const s = await setup({ actualVersion: '2025.2' })
+  await expect(s.runner.registerDataset(mixedAssets, { ...mixedEvaluation, compatibility: { vivado_version: '2025.2' } }, identity)).rejects.toThrow('Evaluator Vivado version')
+  const result = await s.runner.verify(await s.register(), new AbortController().signal, unconfined)
+  expect(result.stages[0]!.status).not.toBe('PASS')
+  expect(result.stages.slice(1).every(stage => stage.status === 'SKIPPED')).toBe(true)
+  expect(s.spy.mock.calls.every(([spec]) => spec.argv.includes('-version'))).toBe(true)
+})
+
 it('records an evaluator-specific default without overriding source timescales', async () => {
-  const s = await setup({ verdict: 'Mismatches: 0 in 20 samples' })
+  witness = new TargetWitness('F03-A1')
+  const s = await setup({ verdict: 'Mismatches: 0 in 20 samples' }, {}, undefined, true)
   const evaluation = { ...mixedEvaluation, defaultTimescale: '1ps/1ps' as const, compatibility: { original_tb_sha256: 'original', effective_tb_sha256: 'derived' } }
   const result = await s.runner.preflightDataset(await s.runner.registerDataset(mixedAssets, evaluation, identity), new AbortController().signal, unconfined)
   const elaborate = result.stages[1]!.invocations![0]!
@@ -57,7 +107,8 @@ it('records an evaluator-specific default without overriding source timescales',
 })
 
 it('preflights a dataset through simulation without synthesis or a candidate PASS', async () => {
-  const s = await setup({ verdict: 'Mismatches: 0 in 20 samples' })
+  witness = new TargetWitness('F03-A2')
+  const s = await setup({ verdict: 'Mismatches: 0 in 20 samples' }, {}, undefined, true)
   const id = await s.runner.registerDataset(mixedAssets, mixedEvaluation, identity)
   const result = await s.runner.preflightDataset(id, new AbortController().signal, unconfined)
   expect(result.stages.map(stage => stage.status)).toEqual(['PASS', 'PASS', 'PASS', 'SKIPPED'])
@@ -80,9 +131,11 @@ it('rejects non-dataset preflight and attributes original testbench compile erro
 })
 
 it.each(['Mismatches: 0 in 0 samples', 'Mismatches: 2 in 20 samples'])('does not mark an unhealthy evaluator ready: %s', async verdict => {
-  const s = await setup({ verdict })
+  witness = new TargetWitness('B2-' + (verdict.includes('0 in 0') ? 'zero' : 'mismatch'))
+  const s = await setup({ verdict }, {}, verdict)
   const result = await s.runner.preflightDataset(await s.runner.registerDataset(mixedAssets, mixedEvaluation, identity), new AbortController().signal, unconfined)
   expect(classifyPreflight(result).status).toBe('INCONCLUSIVE')
+  witness.record('readiness_parser_settled', { verdict, classification: classifyPreflight(result), status: result.status, artifacts: result.artifacts, stages: result.stages })
   expect(result.stages[3]!.status).toBe('SKIPPED')
 })
 
@@ -101,7 +154,8 @@ it('records ordered mixed invocations, skips downstream stages after a group fai
 })
 
 it('completes all mixed groups in order without adding sv flags to elaboration or simulation', async () => {
-  const s = await setup({ verdict: 'Mismatches: 0 in 20 samples' })
+  witness = new TargetWitness('F03-A3')
+  const s = await setup({ verdict: 'Mismatches: 0 in 20 samples' }, {}, undefined, true)
   const result = await s.runner.verify(await s.runner.registerDataset(mixedAssets, mixedEvaluation, identity), new AbortController().signal, unconfined)
   expect(result.status).toBe('PASS')
   const groups = result.stages[0]!.invocations!.filter(value => value.label.startsWith('compile-'))
@@ -135,9 +189,9 @@ it('keeps completed synthesis invocation evidence when report policy rejects the
 
 it('binds source order and mode to manifests and rejects mutated execution metadata', async () => {
   const s = await setup()
-  const original = await createDatasetSnapshot(s.root, mixedAssets, mixedEvaluation)
-  const changed = await createDatasetSnapshot(s.root, mixedAssets, { ...mixedEvaluation, language: 'systemverilog' })
-  const reordered = await createDatasetSnapshot(s.root, mixedAssets, { ...mixedEvaluation, sources: [...mixedEvaluation.sources].reverse() })
+  const original = await createDatasetSnapshot(s.root, mixedAssets, mixedEvaluation, snapshotEnvironment)
+  const changed = await createDatasetSnapshot(s.root, mixedAssets, { ...mixedEvaluation, language: 'systemverilog' }, snapshotEnvironment)
+  const reordered = await createDatasetSnapshot(s.root, mixedAssets, { ...mixedEvaluation, sources: [...mixedEvaluation.sources].reverse() }, snapshotEnvironment)
   expect(original.sources.map(source => source.language)).not.toEqual(changed.sources.map(source => source.language))
   expect(original.sources.map(source => source.path)).not.toEqual(reordered.sources.map(source => source.path))
   original.sources.reverse()
@@ -153,11 +207,30 @@ it('shares the compile deadline across version probes and multiple groups', asyn
 })
 
 it('cancels a mixed compile group, joins its tree, then accepts the next snapshot', async () => {
-  const s = await setup({ hangGroup: 2 })
+  witness = new TargetWitness('F03-A4')
+  const s = await setup({ hangGroup: 2 }, {}, undefined, true)
   const control = new AbortController()
   const pending = s.runner.verify(await s.runner.registerDataset(mixedAssets, mixedEvaluation, identity), control.signal, unconfined)
   let run = ''
-  await vi.waitFor(async () => { run = join(s.root, (await readdir(s.root))[0]!); expect(await readFile(join(run, 'child.pid'), 'utf8')).toMatch(/^\d+$/) }, { timeout: 10000 })
+  await waitForBoundTarget(async () => {
+    const name = (await readdir(s.root))[0]
+    if (name === undefined) return false
+    run = join(s.root, name)
+    const file = join(run, 'child.pid')
+    let text: string
+    try { text = await readFile(file, 'utf8') }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT' && (error as NodeJS.ErrnoException).path === file) return false; throw error }
+    expect(text).toMatch(/^\d+$/)
+    witness!.record('mixed_child_ready', { run, pid: Number(text) })
+    return true
+  }, listener => {
+    let listening = true
+    void pending.then(result => {
+      witness?.record('mixed_verification_terminal', { status: result.status, artifacts: result.artifacts, stages: result.stages })
+      if (listening) listener(result.status === 'PASS' ? 0 : 1)
+    }, (error: unknown) => { witness?.record('mixed_verification_error', { error: String(error) }); if (listening) listener(1) })
+    return () => { listening = false }
+  }, () => {}, 10000, 50)
   control.abort()
   expect((await pending).status).toBe('ABORTED')
   const pid = Number(await readFile(join(run, 'child.pid'), 'utf8'))
@@ -210,7 +283,8 @@ it.each([
 })
 
 it('reports dataset mismatch counts without inventing source locations', async () => {
-  const s = await setup({ verdict: 'Mismatches: 18 in 20 samples' })
+  witness = new TargetWitness('F03-A5')
+  const s = await setup({ verdict: 'Mismatches: 18 in 20 samples' }, {}, undefined, true)
   const result = await s.runner.verify(await s.runner.registerDataset(mixedAssets, mixedEvaluation, identity), new AbortController().signal, unconfined)
   expect(result.stages[2]).toMatchObject({ status: 'FAIL', failure_domain: 'design',
     errors: [{ category: 'functional_mismatch', file: null, line: null, message_id: null, attribution: 'UNKNOWN', repairable_by_model: false }] })
@@ -244,26 +318,86 @@ it.each([{ error: 'compile', zeroError: true }, { error: 'report' }, { missingNe
 })
 
 it.each(['timeout', 'cancel'] as const)('joins the child process tree on %s before allowing another task', async mode => {
-  const s = await setup({ hang: 'simulation' }, { simulationMs: mode === 'timeout' ? 600 : 5000 })
-  const control = new AbortController()
-  const pending = s.runner.verify(await s.register(), control.signal, unconfined)
-  let run: string | undefined
-  await vi.waitFor(async () => {
-    run = join(s.root, (await readdir(s.root))[0]!)
-    expect(await readFile(join(run, 'child.pid'), 'utf8')).toMatch(/^\d+$/)
-  }, { timeout: 10000, interval: 30 })
-  if (mode === 'cancel') control.abort()
-  const result = await pending
-  expect(result.status).toBe(mode === 'timeout' ? 'TIMEOUT' : 'ABORTED')
-  const pid = Number(await readFile(join(run!, 'child.pid'), 'utf8'))
-  expect(() => process.kill(pid, 0)).toThrow()
-  const next = await s.runner.verify(await s.register('syntax'), new AbortController().signal, unconfined)
-  expect(next.stages[0]?.status).toBe('FAIL')
+  witness = new TargetWitness('S3-CHILD-' + mode)
+  const scope = operationScope(), simulationMs = mode === 'timeout' ? 600 : 5000
+  const control = new AbortController(), terminal = Promise.withResolvers<number>()
+  let simulation: { spec: SubprocessSpawnSpec; handle: SubprocessHandle; command: number; run: string; abortAt: number | undefined; aborted: () => void } | undefined
+  const s = await setup({ hang: 'simulation', fastSimulationHang: true, readinessId: scope.id }, { simulationMs }, undefined, false, (spec, handle) => {
+    if (!spec.argv.includes('-tclbatch')) return
+    expect(simulation).toBeUndefined(); expect(basename(spec.cwd!)).toBe('build')
+    const run = dirname(spec.cwd!); expect(dirname(run)).toBe(s.root)
+    const command = witness!.liveSimulation(spec.cwd!)!.command
+    const binding = { spec, handle, command, run, abortAt: undefined as number | undefined, aborted: () => {
+      binding.abortAt = Date.now()
+      witness!.record('child_simulation_abort', { command, scope_id: scope.id, run, at_ms: binding.abortAt, reason: String(spec.signal?.reason) })
+    } }
+    simulation = binding; spec.signal!.addEventListener('abort', binding.aborted, { once: true })
+    witness!.record('child_simulation_dispatched', { command, scope_id: scope.id, run, cwd: spec.cwd, argv: spec.argv, simulation_ms: simulationMs })
+  })
+  const id = await s.register()
+  let pending: Promise<VerificationResult> | undefined, settled: Promise<void> | undefined
+  const notifications: Promise<void>[] = []
+  const ready = async () => {
+    const binding = simulation
+    if (!binding) return false
+    const path = join(binding.run, 'child-ready.json')
+    let text: string
+    try { text = await readFile(path, 'utf8') }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT' && (error as NodeJS.ErrnoException).path === path) return false; throw error }
+    const value = JSON.parse(text) as { schema_version: string; readiness_id: string; run: string; cwd: string; argv: string[]; parent_pid: number; child_pid: number; child_ready_at_ms: number; pid_published_at_ms: number }
+    expect(value).toMatchObject({ schema_version: 'native-child-ready-1', readiness_id: scope.id, run: binding.run, cwd: binding.spec.cwd, argv: binding.spec.argv.slice(3) })
+    expect(Number.isSafeInteger(value.child_pid) && value.child_pid > 0).toBe(true)
+    expect(Number.isSafeInteger(value.parent_pid) && value.parent_pid > 0 && value.parent_pid !== value.child_pid).toBe(true)
+    const pid = await readFile(join(binding.run, 'child.pid'), 'utf8'); expect(pid).toMatch(/^\d+$/); expect(Number(pid)).toBe(value.child_pid)
+    const events = (await readFile(join(binding.run, 'events.jsonl'), 'utf8')).trim().split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line) as { type: string; timestamp: string; value: { stage?: string } | null })
+    const started = events.filter(event => event.type === 'stage_started' && event.value?.stage === 'simulation')
+    expect(started).toHaveLength(1)
+    const stageStartedAt = Date.parse(started[0]!.timestamp)
+    expect(value.child_ready_at_ms - stageStartedAt).toBeGreaterThanOrEqual(0)
+    expect(value.pid_published_at_ms - stageStartedAt).toBeLessThan(simulationMs)
+    expect(value.child_ready_at_ms).toBeLessThanOrEqual(value.pid_published_at_ms)
+    if (binding.abortAt !== undefined) expect(value.pid_published_at_ms).toBeLessThan(binding.abortAt)
+    witness!.record('child_native_ready', { command: binding.command, scope_id: scope.id, receipt: value, stage_started_at_ms: stageStartedAt, simulation_ms: simulationMs,
+      observed_signal_aborted: binding.spec.signal!.aborted, producer_clock: 'same-host Date.now; worker hrtime clocks not subtracted' })
+    return true
+  }
+  try {
+    await scope.track('native child readiness', () => waitForChildReadiness(ready, listener => {
+      let listening = true
+      notifications.push(terminal.promise.then(code => { if (listening) listener(code) }))
+      return () => { listening = false }
+    }, () => {
+      witness!.record('child_verification_started', { scope_id: scope.id, snapshot_id: id, simulation_ms: simulationMs })
+      pending = s.runner.verify(id, control.signal, unconfined)
+      settled = pending.then(result => {
+        witness!.record('child_verification_terminal', { scope_id: scope.id, status: result.status, artifacts: result.artifacts, stages: result.stages })
+        terminal.resolve(result.status === 'PASS' ? 0 : 1)
+      }, (error: unknown) => { witness!.record('child_verification_error', { scope_id: scope.id, error: String(error) }); terminal.resolve(1) })
+    }, 10000, 30))
+    if (mode === 'cancel') { witness!.record('child_caller_cancel', { scope_id: scope.id }); control.abort() }
+    const result = await pending!
+    expect(result.status).toBe(mode === 'timeout' ? 'TIMEOUT' : 'ABORTED')
+    expect(result.artifacts).toBe(simulation!.run)
+    expect(await simulation!.handle.waitForExit()).toBe(true)
+    witness!.record('child_native_range_proven', { scope_id: scope.id, command: simulation!.command, run: result.artifacts, wait_for_exit: true,
+      original_scope_proof: 'FIX07_SCOPE_AUDIT managed_ranges; command and scope IDs are observer identities' })
+    const pid = Number(await readFile(join(result.artifacts, 'child.pid'), 'utf8'))
+    expect(() => process.kill(pid, 0)).toThrow()
+    const next = await s.runner.verify(await s.register('syntax'), new AbortController().signal, unconfined)
+    expect(next.stages[0]?.status).toBe('FAIL')
+  } catch (error) {
+    control.abort(); terminal.resolve(1)
+    await settled
+    throw error
+  } finally {
+    await settled; await Promise.all(notifications)
+    if (simulation) simulation.spec.signal!.removeEventListener('abort', simulation.aborted)
+  }
 })
 
 it('detects changed assets, traversal, ADS, junction escapes and forged manifests', async () => {
   const s = await setup()
-  const snapshot = await createSnapshot(s.root, 'counter')
+  const snapshot = await createSnapshot(s.root, 'counter', snapshotEnvironment)
   await checkSnapshot(snapshot)
   for (const path of ['../other', 'rtl/solution.sv:secret', 'D:/other', 'rtl/../../other']) await expect(checkedFile(snapshot.directory, path)).rejects.toThrow()
   await writeFile(join(snapshot.directory, 'trusted/tb.sv'), 'changed')

@@ -1,5 +1,6 @@
 /** Evidence ordering for revisions evaluated against one frozen P10 test suite. @module rtl-tools/phase1/p10-revision */
 import type { DiagnosticReceipt } from './repair-diagnostics.ts'
+import { multipleDriverFailure } from './repair-policy.ts'
 
 /** Lower ranks are stronger evidence; ratios are comparable only at the same stage and sample count. */
 export interface RevisionScore { rank: number; checks: number | null; mismatches: number | null }
@@ -13,6 +14,9 @@ export function revisionScore(receipt: DiagnosticReceipt, verified: boolean): Re
   if (!failed || !failed.complete || !failed.process_normal || !['FAIL', 'INCONCLUSIVE'].includes(failed.status)) return null
   if (failed.stage === 'simulation') return failed.functional_failure && failed.verdict.completed
     ? { rank: 2, checks: failed.verdict.checks, mismatches: failed.verdict.mismatches } : null
+  if (failed.diagnostics.some(d => d.severity === 'ERROR' && (d.kind === 'multiple_drivers' || d.message_id === 'VRFC 10-3818' || d.message_id === 'XSIM 43-3322'))) {
+    return multipleDriverFailure(failed) ? { rank: 4, checks: null, mismatches: null } : null
+  }
   if (!failed.diagnostics.some(d => d.severity === 'ERROR' && d.origin === 'dut' && d.repairable_by_model) ||
     failed.diagnostics.some(d => d.severity === 'ERROR' && d.kind !== 'consequential' && (d.origin !== 'dut' || !d.repairable_by_model))) return null
   const index = stages.indexOf(failed.stage)

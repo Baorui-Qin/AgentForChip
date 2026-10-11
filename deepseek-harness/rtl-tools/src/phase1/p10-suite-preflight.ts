@@ -7,7 +7,7 @@ import { Config } from './p10-preflight.ts'
 import { runCommand } from '../process.ts'
 import { publish } from './candidates.ts'
 import { sha256 } from './snapshots.ts'
-import { loadP10Dataset, selectP10, type P10Task } from './p10-dataset.ts'
+import { p10PreflightAssets, loadP10Dataset, selectP10, type P10Task } from './p10-dataset.ts'
 import { loadCompatAssets, negativeControl } from './p10-compat.ts'
 import { assertSharedEvaluator, buildSuite, loadSuiteAssets, suiteManifestName, type SuiteManifest } from './p10-compat-suite.ts'
 import { readDoctorConfig } from './doctor.ts'
@@ -75,12 +75,31 @@ async function run(ctx: Context, config: ReturnType<typeof Config>, command: str
   const fixed = JSON.parse(await readFile(frozen.fixed_manifest, 'utf8')) as { task_ids: string[] }
   if (JSON.stringify(selected.slice(0, 10)) !== JSON.stringify(fixed.task_ids)) throw new Error('P10_FIXED_SELECTION_CHANGED')
   const tasks = fixed.task_ids.map(id => catalog.find(t => t.task_id === id)!), sentinel = catalog.find(t => t.task_id === 'Prob038_count15')!
+  const { config: eda } = await readDoctorConfig(config.settingsFile)
+  const edaRoot = join(root, 'eda-' + command); await mkdir(edaRoot)
+  const runner = new VerificationRunner(ctx.subprocess, { ...eda, outputRoot: edaRoot }, config), id = randomUUID() as PhaseId, rows: Row[] = []
+  const manifestName = suiteManifestName(eda.expectedVivadoVersion)
+  let applyDeclarationOrderRule = false
+  if (command === 'calibrate') {
+    try {
+      for (const task of [tasks[0]!, sentinel]) {
+        const { assets, evaluation } = await p10PreflightAssets(dataset, task)
+        const snapshot = await runner.registerDataset(assets, evaluation, { experiment_id: id, task_id: task.task_id as PhaseId, sample_id: 0, mode: 'baseline' })
+        const result = await runner.preflightDataset(snapshot, signal, argv => argv)
+        await publish(root, 'original-' + task.task_id + '.json', json(result))
+        const compile = result.stages[0]!
+        if (classifyPreflight(result).status === 'TESTBENCH_COMPATIBILITY_BLOCKED' && compile.errors.some(e => e.message_id === 'VRFC 10-3380')) applyDeclarationOrderRule = true
+        else if (compile.status !== 'PASS') throw new Error('ORIGINAL_COMPATIBILITY_UNRESOLVED: ' + task.task_id)
+      }
+    } finally { await runner.close() }
+  }
+  const buildPolicy = { vivadoVersion: eda.expectedVivadoVersion, applyDeclarationOrderRule }
   let manifest: SuiteManifest
   if (command === 'calibrate') {
     await mkdir(derived)
-    manifest = await buildSuite(dataset, catalog, derived, frozen.build_epoch)
+    manifest = await buildSuite(dataset, catalog, derived, frozen.build_epoch, buildPolicy)
     const repeat = join(root, 'reproducibility-copy'); await mkdir(repeat)
-    await buildSuite(dataset, catalog, repeat, frozen.build_epoch)
+    await buildSuite(dataset, catalog, repeat, frozen.build_epoch, buildPolicy)
     const files: Record<string, string> = {}
     for (const entry of await readdir(derived, { recursive: true, withFileTypes: true })) {
       if (!entry.isFile()) continue
@@ -91,17 +110,14 @@ async function run(ctx: Context, config: ReturnType<typeof Config>, command: str
     }
     await publish(root, 'build-reproducibility.json', json({ equal: true, build_epoch: frozen.build_epoch, files }))
     await publish(root, 'catalog.json', json(catalog)); await publish(root, 'selection-order.json', json(selected))
-    for (const file of [suiteManifestName, 'compat-scan.json', 'compat-scan.csv']) await publish(root, file, await readFile(join(derived, file), 'utf8'))
+    for (const file of [manifestName, 'compat-scan.json', 'compat-scan.csv']) await publish(root, file, await readFile(join(derived, file), 'utf8'))
   } else {
-    manifest = JSON.parse(await readFile(join(derived, suiteManifestName), 'utf8')) as SuiteManifest
+    manifest = JSON.parse(await readFile(join(derived, manifestName), 'utf8')) as SuiteManifest
     const readonly = JSON.parse(await readFile(join(root, 'readonly-proof.json'), 'utf8'))
     if (readonly.modify_denied !== true || readonly.create_denied !== true || readonly.delete_denied !== true) throw new Error('COMPAT_READONLY_NOT_VERIFIED')
     const seal = JSON.parse(await readFile(join(derived, 'suite-freeze.json'), 'utf8'))
     if (seal.representative_calibration_sha256 !== sha256(await readFile(join(root, 'representative-calibration.json')))) throw new Error('COMPAT_CALIBRATION_CHANGED')
   }
-  const { config: eda } = await readDoctorConfig(config.settingsFile)
-  const edaRoot = join(root, 'eda-' + command); await mkdir(edaRoot)
-  const runner = new VerificationRunner(ctx.subprocess, { ...eda, outputRoot: edaRoot }, config), id = randomUUID() as PhaseId, rows: Row[] = []
   async function verify(task: P10Task, kind: string, timescale?: '1ps/1ps') {
     await assertFreeze()
     const baseline = command === 'calibrate' ? await loadSuiteAssets(dataset, task, derived, timescale, true) : await loadCompatAssets(dataset, task, derived, timescale)
@@ -145,7 +161,7 @@ async function run(ctx: Context, config: ReturnType<typeof Config>, command: str
   if (command !== 'preflight') return
   const preflight = tasks.map(task => {
     const positive = rows.find(r => r.task_id === task.task_id && r.kind === 'positive')!, negative = rows.find(r => r.task_id === task.task_id && r.kind === 'negative')!
-    return { ...manifest.tasks.find(t => t.task_id === task.task_id)!, original_status: 'ORIGINAL_EVALUATOR_BLOCKED', original_evidence: frozen.fixed_manifest,
+    return { ...manifest.tasks.find(t => t.task_id === task.task_id)!, original_status: 'SEE_ORIGINAL_PROBES', original_evidence: root,
       compat_status: calibrationPairReady(positive, negative) ? 'EVALUATOR_READY' : positive.status === 'EVALUATOR_READY' ? 'INCONCLUSIVE' : positive.status,
       evaluable: calibrationPairReady(positive, negative), positive, negative, baseline_status: 'NOT_RUN', agent_status: 'NOT_RUN' }
   })
@@ -156,8 +172,8 @@ async function run(ctx: Context, config: ReturnType<typeof Config>, command: str
     ...columns.map(c => r[c]), r.compatibility_rules.map(v => v.id).join('|'), ...r.positive.stages.slice(0, 3).map(s => s.status), r.positive.stages[2]!.evidence.checks_executed, r.negative.stages[2]!.evidence.mismatch_count,
   ].join(',')).join('\n') + '\n')
   const calibration = JSON.parse(await readFile(join(root, 'representative-calibration.json'), 'utf8')) as { rows: Row[] }
-  const allRows = [...calibration.rows, ...rows], validation = { protocol: 'VerilogEval V2 tasks evaluated with Vivado 2025.2 compatibility evaluator v1',
-    dataset_revision: revision, manifest_sha256: sha256(await readFile(join(derived, suiteManifestName))), counts: { total: manifest.task_count, converted: manifest.converted_task_count,
+  const allRows = [...calibration.rows, ...rows], validation = { protocol: `VerilogEval V2 tasks evaluated with Vivado ${eda.expectedVivadoVersion} compatibility evaluator v1`,
+    dataset_revision: revision, manifest_sha256: sha256(await readFile(join(derived, manifestName))), counts: { total: manifest.task_count, converted: manifest.converted_task_count,
       unchanged: manifest.unchanged_task_count, unknown: manifest.unknown_task_count, fixed_ten_ready: preflight.filter(t => t.evaluable).length },
     dataset_unchanged: true, host_only: true, model_requests: 0, model_comparison: 'NOT_RUN', main_40: 'NOT_RUN',
     representative_calibration: calibration, frozen_before_preflight: true, baseline_agent_identity_asserted: true, full_os_isolation_verified: false,

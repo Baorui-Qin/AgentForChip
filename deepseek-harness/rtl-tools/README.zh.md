@@ -7,7 +7,13 @@ kind: "package-reference"
 
 [English](README.md) | 中文
 
+Phase 2 运行基线由 [dev.yaml](phase1/configs/dev.yaml) 固定为 Vivado 2026.1；Phase 1 历史实验及 fixture 保留 2025.2 来源。新 snapshot、兼容套件与 evaluator identity 使用配置版本，后续 Static Knowledge 使用 `{"tool":"vivado","tool_version":"2026.1"}`。真实验证范围和未通过项见[迁移报告](../../../docs/vivado-2026.1/report.md)。
+
 ## 概述
+
+[Diagnostic Knowledge V1](knowledge/README.zh.md) 为 P10 修复请求提供可选且绑定版本的诊断建议，保留已有 parser、Skill 选择和验证标准。
+
+P10 模型审计负载的大小限制独立于 provider 流的读取。审计内容截断或超大语义结果被拒绝后，仍可保留末尾的 usage 和 finish 元数据；计费记录区分已返回、服务端缺失、读取中断和无法解析的 usage。完整的标准化流另存为磁盘 artifact，不属于有界事件，也不是原始 HTTP 抓包；磁盘配额由部署负责。参见[计费设计决策](../.agents/notes/implemented/bug-fix/2026-10-09-p3-production-continuity.zh.md)。
 
 `run_simulation` 使用 Icarus 编译配置指定的 RTL 和可信测试台。可选的 `run_synthesis` 产出 Vivado 网表和精简的资源及时序结果。两者均返回有界诊断事实，不修改或修复 RTL。这个通过源码加载的本地插件不是正式比赛评分器。
 
@@ -76,7 +82,7 @@ Icarus 进程使用精确 argv，不经过 shell 插值。编译器使用 `-g201
 <a id="vivado-synthesis"></a>
 ## Vivado 综合
 
-使用 [cordis.synthesis.patch.yml](cordis.synthesis.patch.yml) 代替仅含仿真的 patch，可注册两个工具。模型以 `{"top":"counter"}` 调用 `run_synthesis`；设计顶层不同于 `counter_tb`。只有调用仿真时才需要 Icarus 可执行文件。综合示例使用 Vivado 2025.2、`xczu3eg-sbva484-1-e` 和可信的 [5 ns 时钟约束](example/constraints/counter.xdc)。
+使用 [cordis.synthesis.patch.yml](cordis.synthesis.patch.yml) 代替仅含仿真的 patch，可注册两个工具。模型以 `{"top":"counter"}` 调用 `run_synthesis`；设计顶层不同于 `counter_tb`。只有调用仿真时才需要 Icarus 可执行文件。综合示例使用 Vivado 2026.1、`xczu3eg-sbva484-1-e` 和可信的 [5 ns 时钟约束](example/constraints/counter.xdc)。
 
 可选的 `synthesis` 对象必须独立配置 `top`、非空有序 RTL `sources` 及显式的 `xdcFiles` 列表。空 XDC 列表支持无约束组合逻辑；工具不猜测时钟，也不编造时序证据。综合不会带入仿真源文件或参考实现。XDC 文件是可信的可执行配置，不是模型编写的输入。
 
@@ -114,7 +120,7 @@ node node_modules/typescript/bin/tsc -p rtl-tools/tsconfig.json --pretty false
 将 `RTL_VIVADO` 指向 Vivado 启动器，可启用通过已注册工具运行的真实综合测试；将 `RTL_VIVADO_ARTIFACTS_DIR` 设为绝对目录，可保留这些测试产物。否则真实 Vivado 用例会明确跳过。这些测试为可信 fixture 显式使用 full-access 策略，不代表完成了生产沙箱验证。不需要模型 API key。
 
 ```powershell
-$env:RTL_VIVADO = 'D:\AMDDesignTools\2025.2\Vivado\bin\vivado.bat'
+$env:RTL_VIVADO = 'E:\Xilinx\2026.1\Vivado\bin\vivado.bat'
 $env:RTL_VIVADO_ARTIFACTS_DIR = 'D:\AMD\vivado-synthesis-validation'
 node node_modules/vitest/vitest.mjs run --config rtl-tools/vitest.config.ts -t 'real Vivado via registered tool'
 ```
@@ -130,7 +136,7 @@ node node_modules/vitest/vitest.mjs run --config rtl-tools/vitest.config.ts -t '
 <a id="known-limitations-and-deferred-work"></a>
 ## 已知限制与后续工作
 
-Icarus 是开发后端。用户提供的比赛纪要将 Vivado/Vitis 2025.2 及 `xvlog/xelab/xsim` 指定为正式仿真链路；本插件实现 Vivado 综合，但不实现该仿真链路、Baseline、本地模型配置或修复工作流。这些比赛信息来自所提供的纪要，并非独立核实的官方评分细则。报告解析器针对 Vivado 2025.2 UltraScale+ 文本报告；不支持的格式会明确失败，不会替换为零指标。
+Icarus 是开发后端。用户提供的比赛纪要将 Vivado/Vitis 2025.2 及 `xvlog/xelab/xsim` 指定为正式仿真链路；本插件实现 Vivado 综合，但不实现该仿真链路、Baseline、本地模型配置或修复工作流。这些比赛信息来自所提供的纪要，并非独立核实的官方评分细则。报告解析器保留 Vivado 2025.2 UltraScale+ 历史回归；迁移报告记录 2026.1 实跑状态；不支持的格式会明确失败，不会替换为零指标。
 
 PASS 标记是测试台证据，不是不可伪造的评分器判定：候选 RTL 也能打印文本。部署方必须通过只读挂载和外部可信评分器保护测试台、配置、评分器及参考文件。固定源文件列表并不阻止其他工具或仿真代码修改外围沙箱允许写入的文件。文件沙箱不隔离网络，也不限制波形文件磁盘用量；处理不可信设计时应使用断网且限制资源的容器。
 

@@ -1,10 +1,11 @@
 import { mkdtemp, readFile, rm, readdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
 import LocalSubprocess from '@deepseek-ai/dsh-subprocess-local'
 import { afterEach, expect, it, vi } from 'vitest'
+import { installTestOperationScope } from './test-operation-scope.ts'
 import { RepairWorkflow, type RepairSettings } from '../src/phase1/repair-workflow.ts'
 import { readDoctorConfig } from '../src/phase1/doctor.ts'
 import { fixtureFiles } from '../src/phase1/fixtures.ts'
@@ -15,16 +16,38 @@ import type { StageRecord } from '../src/phase1/records.ts'
 import { decideRepair } from '../src/phase1/repair-policy.ts'
 import { extractSource } from '../src/phase1/candidates.ts'
 import { taskSpec } from '../src/phase1/p09-tasks.ts'
+import { revisionScore } from '../src/phase1/p10-revision.ts'
+import { ManagedVersionProbeFixture } from './helpers/managed-version-probe-fixture.ts'
+import { TargetWitness } from './helpers/g1-target-witness.ts'
 
 const roots: string[] = [], contexts: Context[] = [], workflows: RepairWorkflow[] = []
+const versionFixtures: ManagedVersionProbeFixture[] = []
+let witness: TargetWitness | undefined
+const operationScope = installTestOperationScope()
 afterEach(async () => {
-  for (const workflow of workflows.splice(0)) await workflow.close()
-  for (const ctx of contexts.splice(0)) await ctx.fiber.dispose()
-  for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true })
-  vi.restoreAllMocks()
+  const scope = operationScope()
+  try {
+    await scope.cleanup(async () => {
+      for (const owner of workflows) await owner.close()
+      for (const fixture of versionFixtures) await fixture.close()
+      for (const ctx of contexts) await ctx.fiber.dispose()
+      if (versionFixtures.length && process.env.FIX07_SCOPE_AUDIT) await writeFile(join(process.env.FIX07_SCOPE_AUDIT, `${scope.id}-version-probes.json`), JSON.stringify({ scope_id: scope.id, evidence_kind: 'TEST_FIXTURE_LOGICAL_IDENTITIES_NO_OS_PROOF', fixtures: versionFixtures.map(fixture => fixture.calls) }) + '\n', { flag: 'wx' })
+    }, async () => {
+      if (await witness?.capture(scope, roots)) return
+      if (scope.bodyErrors().length) {
+        console.error('Retained failed test roots', JSON.stringify({ roots, bodyErrors: scope.bodyErrors() }))
+        return
+      }
+      for (const root of roots) await rm(root, { recursive: true, force: true })
+    })
+    workflows.length = 0; contexts.length = 0; roots.length = 0; versionFixtures.length = 0; witness = undefined
+  } catch (error) {
+    console.error('Test cleanup failed; roots retained', JSON.stringify({ roots, scope_id: scope.id, pending: scope.pendingOperations, bodyErrors: scope.bodyErrors(), error: String(error) }))
+    throw error
+  } finally { vi.restoreAllMocks() }
 })
 const good = fixtureFiles('counter')['rtl/solution.sv']!
-async function setup(responses: (string | { error: string; status?: number; partial?: string })[] = [good], options = {}) {
+async function setup(responses: (string | { error: string; status?: number; partial?: string })[] = [good], options = {}, isolateVersionProbes = false) {
   const root = await mkdtemp(join(tmpdir(), 'repair-')); roots.push(root)
   const ctx = new Context(); contexts.push(ctx); await ctx.plugin(LocalSubprocess)
   const { config: eda } = await readDoctorConfig(fileURLToPath(new URL('../phase1/configs/dev.yaml', import.meta.url)))
@@ -33,10 +56,20 @@ async function setup(responses: (string | { error: string; status?: number; part
   const settings: RepairSettings = { eda, model: { model: 'mock', temperature: 0, maxTokens: 2048, timeoutMs: 5000, maxResponseBytes: 65536 },
     limits: { compileMs: 5000, elaborateMs: 5000, simulationMs: 5000, totalMs: 30000, maxArtifactBytes: 1000000, artifactPollMs: 20, maxEventBytes: 1048576 }, activeMs: 120000 }
   const spawn = ctx.subprocess.spawn.bind(ctx.subprocess)
-  vi.spyOn(ctx.subprocess, 'spawn').mockImplementation(spec => spawn({ ...spec, argv: [process.execPath, fileURLToPath(new URL('./fake-verification.mjs', import.meta.url)), JSON.stringify(options), ...spec.argv.slice(1)] }))
+  const fakeArgv = [process.execPath, fileURLToPath(new URL('./fake-verification.mjs', import.meta.url)), JSON.stringify(options)]
+  const versionFixture = isolateVersionProbes ? new ManagedVersionProbeFixture(spawn, [...fakeArgv, '-version'], { stdout: 'Vivado Simulator v2026.1\n', stderr: '', exitCode: 0 }) : undefined
+  if (versionFixture) versionFixtures.push(versionFixture)
+  vi.spyOn(ctx.subprocess, 'spawn').mockImplementation(spec => {
+    const mapped = { ...spec, argv: [...fakeArgv, ...spec.argv.slice(1)] }
+    witness?.record('subprocess_call_start', { argv: mapped.argv, cwd: mapped.cwd })
+    const handle = versionFixture ? versionFixture.spawn(mapped) : spawn(mapped)
+    return operationScope().observeManaged(witness ? witness.observe(mapped, handle, versionFixture?.calls.at(-1)?.kind === 'VERSION_FIXTURE' ? 'LOGICAL_VERSION' : 'NATIVE') : handle)
+  })
   const prompts: string[] = []
   const runtime: ModelRuntime = { async prepareCall(config) { return { config, context: { contextWindow: 16384 }, retryPolicy: { mode: 'normal', maxRetries: 0, retryableCodes: [], initialDelayMs: 0, maxDelayMs: 0, jitterRatio: 0 }, adapterDefaults: {}, async *stream(request) {
     prompts.push(JSON.stringify(request.messages))
+    witness?.record('mock_stream_start', { request: prompts.length })
+    try {
     const step = responses[prompts.length - 1] ?? ''
     if (typeof step !== 'string') {
       if (step.partial) {
@@ -51,31 +84,36 @@ async function setup(responses: (string | { error: string; status?: number; part
     yield { type: 'text-delta', index: 0, text } as const
     yield { type: 'block-end', index: 0, block: { type: 'text', text } } as const
     yield { type: 'finish', reason: { kind: 'stop' } } as const
+    } finally { witness?.record('mock_stream_end', { request: prompts.length }) }
   } } } }
-  const workflow = new RepairWorkflow(settings, ctx.subprocess, runtime); workflows.push(workflow)
-  return { root, workflow, prompts, settings, runtime }
+  const workflow = operationScope().own(new RepairWorkflow(settings, ctx.subprocess, runtime), ['start', 'resume', 'review', 'calibrateTask', 'status']); workflows.push(workflow)
+  return { root, workflow, prompts, settings, runtime, versionFixture }
 }
 function withP09(s: Awaited<ReturnType<typeof setup>>, variant: 'A' | 'B' | 'C' = 'A') {
   s.settings.loop = { maxSemanticRepairs: 3, maxTransportRetries: 2, transportBackoffMs: [1, 2], maxRepeatedDiagnostic: 3 }
   s.settings.p09 = { variant, limits: { window: 16384, output: 2048, margin: 1024, feedback: 2048, ledger: 512, skills: 768, sourceWarning: 3072 },
     tokenizer: { python: 'mock', root: s.root, manifestSha256: 'a'.repeat(64), timeoutMs: 5000 }, skillsFile: null, skillsSha256: null, maxRequests: 15 }
-  const workflow = new RepairWorkflow(s.settings, contexts.at(-1)!.subprocess, s.runtime, async () => ({
+  const workflow = operationScope().own(new RepairWorkflow(s.settings, contexts.at(-1)!.subprocess, s.runtime, async () => ({
     quality: 'estimated', identity: { implementation: 'explicit-mock-byte-counter' },
     async count(view) { return Buffer.byteLength(JSON.stringify(view)) + 10 },
-  }))
+  })), ['start', 'resume', 'review', 'calibrateTask', 'status'])
   workflows.push(workflow); return workflow
 }
 it('P09 binds two real Mock verification rounds, audits sent text and exports only the approved version', async () => {
+  witness = new TargetWitness('F03-B3')
   const wrong = fixtureFiles('functional')['rtl/solution.sv']! + '// independent proposal\n'
-  const s = await setup([wrong, good], { repairDiagnostics: true }), workflow = withP09(s, 'B')
+  const s = await setup([wrong, good], { repairDiagnostics: true }, true), workflow = withP09(s, 'B')
   let state = await workflow.resume((await workflow.start('functional')).experiment_id, new AbortController().signal)
+  witness.recordState('repair_initial_review', state)
   for (let i = 0; i < 2; i++) {
     expect(state.phase, JSON.stringify(state)).toBe('AWAITING_REVIEW')
     expect(state.schema_version).toBe('1.6')
     const calls = s.prompts.length
+    witness.recordState('repair_review_revision', state)
     await workflow.resume(state.experiment_id, new AbortController().signal); expect(s.prompts).toHaveLength(calls)
     await workflow.review(state.experiment_id, state.current!.source_sha256, true)
     state = await workflow.resume(state.experiment_id, new AbortController().signal)
+    witness.recordState('repair_round_settled', state)
   }
   expect(state.outcome, JSON.stringify(state)).toBe('VERIFIED')
   expect(state.p09).toMatchObject({ model_requests_total: 2, initial_generation_requests: 0 })
@@ -114,7 +152,7 @@ it('P09 limits format and transport recovery while retaining separate counters',
 })
 it('P09 never stops changed sources solely because they repeat a primary diagnostic', async () => {
   const bad = fixtureFiles('functional')['rtl/solution.sv']!
-  const s = await setup([bad + '// one\n', bad + '// two\n', good], { repairDiagnostics: true }), workflow = withP09(s)
+  const s = await setup([bad + '// one\n', bad + '// two\n', good], { repairDiagnostics: true }, true), workflow = withP09(s)
   let state = await workflow.resume((await workflow.start('functional')).experiment_id, new AbortController().signal)
   for (let i = 0; i < 3; i++) {
     expect(state.phase, JSON.stringify(state)).toBe('AWAITING_REVIEW')
@@ -157,8 +195,10 @@ it('P09 format recovery cannot reset the transport retry budget', async () => {
   expect(s.prompts).toHaveLength(4)
 })
 it.each([{ error: 'AUTH' }, { error: 'TRANSPORT', partial: good }, { error: 'CONTEXT_WINDOW_EXCEEDED' }])('P09 does not recover non-retryable or already-core responses: %j', async response => {
-  const s = await setup([response, good]), workflow = withP09(s)
+  if (response.error === 'AUTH') witness = new TargetWitness('auth-policy')
+  const s = await setup([response, good], {}, response.error === 'AUTH'), workflow = withP09(s)
   const state = await workflow.resume((await workflow.start('functional')).experiment_id, new AbortController().signal)
+  witness?.recordState('nonretryable_model_terminal', state)
   expect(state.phase).toBe('TERMINAL')
   expect(state.p09).toMatchObject({ transport_retries: 0, context_recovery_requests: 0, format_recovery_requests: 0 })
   expect(s.prompts).toHaveLength(1)
@@ -268,6 +308,59 @@ it('human rejection terminates without another model request or candidate execut
   expect((await s.workflow.resume(result.experiment_id, new AbortController().signal)).verification_runs).toHaveLength(1)
   expect(s.prompts).toHaveLength(1)
 })
+
+it.each(['summary', 'missing-log', 'log-truncated', 'parser-limit', 'damaged-asset'])('derives completeness from full retained evidence, not the capped summary: %s', async mode => {
+  const s = await setup()
+  const state = await s.workflow.resume((await s.workflow.start('functional')).experiment_id, new AbortController().signal)
+  const root = state.verification_run!, path = join(root, 'result.json')
+  const record = JSON.parse(await readFile(path, 'utf8'))
+  const stage = record.stages.compile
+  stage.diagnostics_omitted = 1
+  const invocation = stage.invocations.find((item: { version_matches: boolean }) => item.version_matches !== true)
+  if (mode === 'missing-log') await rm(join(root, invocation.stdout_log))
+  if (mode === 'log-truncated') { invocation.process.log_truncated = true; stage.status = 'INCONCLUSIVE'; stage.processes = stage.invocations.map((run: { process: unknown }) => run.process) }
+  if (mode === 'parser-limit') await writeFile(join(root, invocation.stdout_log), Array.from({ length: 101 }, (_, i) => `WARNING: [VRFC 10-1] warning ${i}`).join('\n'))
+  if (mode === 'damaged-asset') await writeFile(invocation.sources.find((source: { role: string }) => source.role === 'dut').path, 'altered')
+  await writeFile(path, JSON.stringify(record))
+  const { receipt } = await readDiagnostics(root, 'diagnostic_replay')
+  expect(receipt.stages[0]!.complete).toBe(mode === 'summary')
+  expect(decideRepair(receipt, { calibrated: true, bound: true, attempts: 0, top: 'counter' }).action).toBe('blocked')
+})
+
+it('attributes elaboration paths using the same run compilation manifest when xelab declares no source inputs', async () => {
+  const s = await setup()
+  const state = await s.workflow.resume((await s.workflow.start('functional')).experiment_id, new AbortController().signal)
+  const root = state.verification_run!, path = join(root, 'result.json')
+  const record = JSON.parse(await readFile(path, 'utf8'))
+  const source = record.stages.compile.invocations.flatMap((run: { sources: unknown[] }) => run.sources).find((source: { role: string }) => source.role === 'dut').path
+  const invocation = record.stages.elaborate.invocations.find((run: { version_matches: boolean }) => run.version_matches !== true)
+  invocation.sources = []; invocation.process.exit_code = 1; record.stages.elaborate.status = 'FAIL'
+  record.stages.elaborate.processes = record.stages.elaborate.invocations.map((run: { process: unknown }) => run.process)
+  await writeFile(join(root, invocation.stdout_log), `ERROR: [VRFC 10-3818] variable 'q1' is driven by invalid combination of procedural drivers [${source}:8]\nERROR: [XSIM 43-3322] Static elaboration of top level Verilog design unit(s) in library work failed.\n`)
+  await writeFile(path, JSON.stringify(record))
+  const { receipt } = await readDiagnostics(root, 'diagnostic_replay')
+  expect(receipt.stages[1]!.diagnostics[0]).toMatchObject({ origin: 'dut', kind: 'multiple_drivers', repairable_by_model: false })
+  expect(receipt.stages[1]!.diagnostics[1]).toMatchObject({ origin: 'unknown', kind: 'consequential', repairable_by_model: false })
+  expect(decideRepair(receipt, { calibrated: true, bound: true, attempts: 0, top: 'counter' }).rule).toBe('UNTRUSTED_EVIDENCE')
+})
+
+it.each(['owned', 'foreign-invocation', 'unknown-extra', 'reference', 'missing-primary', 'wrong-summary', 'incomplete', 'abnormal'])('recognizes only complete same-invocation DUT driver errors: %s', mode => {
+  const dutSource = { path: resolve('/rtl/solution.sv'), cwd: process.cwd() }
+  const primary = { category: 'error', kind: 'multiple_drivers', message_id: 'VRFC 10-3818', file: '/rtl/solution.sv', line: 8,
+    message: "variable 'q1' is driven by invalid combination of procedural drivers", origin: mode === 'reference' ? 'reference' as const : 'dut' as const,
+    attribution: mode === 'reference' ? 'REFERENCE_COMPATIBILITY' as const : 'DUT_COMPILE_ERROR' as const, severity: 'ERROR' as const, invocation: 'elaborate', repairable_by_model: false }
+  const summary = { ...primary, kind: 'unknown', message_id: 'XSIM 43-3322', file: null, line: null, origin: 'unknown' as const, attribution: 'UNKNOWN' as const,
+    invocation: mode === 'foreign-invocation' ? 'foreign' : 'elaborate', message: mode === 'wrong-summary' ? 'unrecognized summary' : 'Static elaboration of top level Verilog design unit(s) in library work failed.' }
+  const diagnostics = mode === 'missing-primary' ? [summary] : [primary, summary]
+  if (mode === 'unknown-extra') diagnostics.push({ ...summary, message_id: 'UNKNOWN 1', message: 'unknown failure' })
+  const stage = normalizeStage({ stage: 'elaborate', status: 'FAIL', processes: [{ exit_code: 1, signal: null, timed_out: mode === 'abnormal', cancelled: false, log_truncated: false, duration_ms: 1 }] } as StageRecord,
+    diagnostics, new SimulationEvidence(), mode !== 'incomplete', dutSource)
+  const facts = { evidence_kind: 'live_verification', stages: [{ ...stage, stage: 'compile', status: 'PASS', complete: true, process_clean: true, diagnostics: [] }, stage,
+    ...['simulation', 'synthesis'].map(name => ({ ...stage, stage: name, status: 'SKIPPED', diagnostics: [] }))] } as Parameters<typeof decideRepair>[0]
+  expect(decideRepair(facts, { calibrated: true, bound: true, attempts: 0, top: 'TopModule' }).action).toBe(mode === 'owned' ? 'propose_repair' : 'blocked')
+  expect(revisionScore(facts, false)).toEqual(mode === 'owned' ? { rank: 4, checks: null, mismatches: null } : null)
+  expect(primary.repairable_by_model).toBe(false)
+})
 it('changed reviewed bytes block execution and do not produce another request', async () => {
   const s = await setup()
   const waiting = await s.workflow.resume((await s.workflow.start('functional')).experiment_id, new AbortController().signal)
@@ -286,24 +379,37 @@ it('retains invalid model output and terminates without executing it', async () 
 })
 
 it.each(['syntax', 'synthesis-only'] as const)('offers a bounded repair for %s and restarts at compile after approval', async fixture => {
-  const s = await setup([good], { repairDiagnostics: true })
+  if (fixture === 'syntax') witness = new TargetWitness('F03-SYNTAX')
+  const s = await setup([good], { repairDiagnostics: true }, fixture === 'syntax')
   const waiting = await s.workflow.resume((await s.workflow.start(fixture)).experiment_id, new AbortController().signal)
+  witness?.recordState('syntax_review_separated', waiting)
   expect(waiting.phase, JSON.stringify(waiting)).toBe('AWAITING_REVIEW')
   await s.workflow.review(waiting.experiment_id, waiting.current!.source_sha256, true)
   const result = await s.workflow.resume(waiting.experiment_id, new AbortController().signal)
+  witness?.recordState('syntax_candidate_verified', result)
   expect(result.outcome).toBe('VERIFIED')
   const verified = await readDiagnostics(result.verification_run!, 'live_verification')
   expect(verified.receipt.stages.map(s => s.status)).toEqual(['PASS', 'PASS', 'PASS', 'PASS'])
+  if (fixture === 'syntax') {
+    expect(s.versionFixture).toBeDefined()
+    expect(s.versionFixture!.calls.filter(call => call.kind === 'VERSION_FIXTURE')).toHaveLength(12)
+    expect(s.versionFixture!.calls.filter(call => call.kind === 'NATIVE_FAKE_VERIFICATION')).toHaveLength(11)
+    expect(s.versionFixture!.calls.every(call => call.settled)).toBe(true)
+  } else expect(s.versionFixture).toBeUndefined()
 })
 
 it.each([true, false])('uses at most two requests; second candidate repaired=%s', async success => {
+  if (success) witness = new TargetWitness('F03-B4')
   const wrong = good.replace('count + 1', 'count + 2')
-  const s = await setup([wrong + '// proposal 1\n', success ? good : wrong + '// proposal 2\n'], { repairDiagnostics: true })
+  const s = await setup([wrong + '// proposal 1\n', success ? good : wrong + '// proposal 2\n'], { repairDiagnostics: true }, success)
   let state = await s.workflow.resume((await s.workflow.start('functional')).experiment_id, new AbortController().signal)
+  witness?.recordState('repair_initial_review', state)
   for (let round = 0; round < 2; round++) {
     expect(state.phase, JSON.stringify(state)).toBe('AWAITING_REVIEW')
+    witness?.recordState('repair_review_revision', state)
     await s.workflow.review(state.experiment_id, state.current!.source_sha256, true)
     state = await s.workflow.resume(state.experiment_id, new AbortController().signal)
+    witness?.recordState('repair_round_settled', state)
   }
   expect(state.outcome).toBe(success ? 'VERIFIED' : 'REPAIR_BUDGET')
   expect(state.attempts).toBe(2); expect(s.prompts).toHaveLength(2); expect(state.verification_runs).toHaveLength(3)
@@ -356,14 +462,18 @@ it('keeps API authentication errors terminal without retries or secret text', as
 })
 
 it('cannot use another experiment approval to launch a candidate', async () => {
-  const s = await setup()
+  witness = new TargetWitness('approval-binding')
+  const s = await setup([good], {}, true)
   const state = await s.workflow.resume((await s.workflow.start('functional')).experiment_id, new AbortController().signal)
+  witness.recordState('approval_initial_review', state)
   const root = join(s.root, 'repair-' + state.experiment_id)
   await s.workflow.review(state.experiment_id, state.current!.source_sha256, true)
   const approval = join(root, 'revisions', state.current!.revision_id, 'approval.json')
   const record = JSON.parse(await readFile(approval, 'utf8')); record.experiment_id = 'different-experiment'
   await writeFile(approval, JSON.stringify(record))
-  expect((await s.workflow.resume(state.experiment_id, new AbortController().signal)).outcome).toBe('HOST_OR_BINDING_BLOCKED')
+  const blocked = await s.workflow.resume(state.experiment_id, new AbortController().signal)
+  witness.recordState('foreign_approval_rejected', blocked)
+  expect(blocked.outcome).toBe('HOST_OR_BINDING_BLOCKED')
   expect(s.prompts).toHaveLength(1)
 })
 
@@ -394,11 +504,16 @@ it('keeps two transport retries in one semantic round with identical prompts and
   expect(result.outcome).toBe('VERIFIED'); expect(s.prompts).toHaveLength(3)
 })
 it.each([{ error: 'TRANSPORT' }, { error: 'TIMEOUT' }, { error: 'SERVER', status: 503 }])('stops after three transport attempts without calling it a semantic design failure: %j', async error => {
-  const s = await setup([error, error, error, good]); finiteLoop(s.settings)
+  const s = await setup([error, error, error, good], {}, error.error === 'TIMEOUT'); finiteLoop(s.settings)
   const state = await s.workflow.resume((await s.workflow.start('functional')).experiment_id, new AbortController().signal)
   expect(state.outcome).toBe('MODEL_TRANSPORT_EXHAUSTED'); expect(state.attempts).toBe(1); expect(s.prompts).toHaveLength(3)
   expect(state.loop!.rounds[0]!.outcome).toBe('MODEL_TRANSPORT_ERROR')
   expect((await s.workflow.resume(state.experiment_id, new AbortController().signal)).outcome).toBe(state.outcome)
+  if (s.versionFixture) {
+    expect(s.versionFixture.calls.filter(call => call.kind === 'VERSION_FIXTURE')).toHaveLength(8)
+    expect(s.versionFixture.calls.filter(call => call.kind === 'NATIVE_FAKE_VERIFICATION')).toHaveLength(8)
+    expect(s.versionFixture.calls.every(call => call.settled)).toBe(true)
+  }
 })
 it.each([{ error: 'AUTH' }, { error: 'SERVER', status: 501 }, { error: 'TRANSPORT', partial: 'module counter(' }, { error: 'TIMEOUT', partial: good }])('does not retry authentication, non-temporary service errors or partial answers: %j', async error => {
   const s = await setup([error, good]); finiteLoop(s.settings)
@@ -406,13 +521,16 @@ it.each([{ error: 'AUTH' }, { error: 'SERVER', status: 501 }, { error: 'TRANSPOR
   expect(state.outcome).toBe('MODEL_RESPONSE_ERROR'); expect(state.attempts).toBe(1); expect(s.prompts).toHaveLength(1)
 })
 it('uses fresh feedback and the previous candidate in a two-round controlled loop', async () => {
+  witness = new TargetWitness('F03-B5')
   const wrong = good.replace('count + 1', 'count + 2')
-  const s = await setup([wrong, good], { repairDiagnostics: true }); finiteLoop(s.settings)
+  const s = await setup([wrong, good], { repairDiagnostics: true }, true); finiteLoop(s.settings)
   let state = await s.workflow.resume((await s.workflow.start('controlled_multi_round')).experiment_id, new AbortController().signal)
+  witness.recordState('repair_initial_review', state)
   const firstCandidate = state.current!
   expect(state.loop!.purpose).toBe('state_machine_acceptance')
   await s.workflow.review(state.experiment_id, firstCandidate.source_sha256, true)
   state = await s.workflow.resume(state.experiment_id, new AbortController().signal)
+  witness.recordState('repair_round_settled', state)
   expect(state.phase).toBe('AWAITING_REVIEW'); expect(state.attempts).toBe(2)
   expect(state.loop!.rounds[1]!.prompt_current_source_sha256).toBe(firstCandidate.source_sha256)
   expect(state.loop!.rounds[0]!.feedback_sha256).not.toBe(state.loop!.rounds[1]!.feedback_sha256)
@@ -421,29 +539,42 @@ it('uses fresh feedback and the previous candidate in a two-round controlled loo
   expect(s.prompts.join('')).not.toContain('PHASE1_COMPLETE checks=%0d')
   await s.workflow.review(state.experiment_id, state.current!.source_sha256, true)
   state = await s.workflow.resume(state.experiment_id, new AbortController().signal)
+  witness.recordState('repair_round_settled', state)
   expect(state.outcome).toBe('VERIFIED'); expect(state.verification_runs).toHaveLength(3)
   expect(state.loop!.rounds.map(r => r.outcome)).toEqual(['MODEL_SEMANTIC_REPAIR_FAILURE', 'VERIFIED'])
   expect(state.loop!.rounds.map(r => r.transport.length)).toEqual([1, 1])
   expect((await readDiagnostics(state.verification_run!, 'live_verification')).record.final_source_sha256).toBe(state.current!.source_sha256)
 })
 it('stops semantic budget exhaustion, not transport retries, after three valid failed candidates', async () => {
+  witness = new TargetWitness('F03-A6')
   const wrong = good.replace('count + 1', 'count + 2')
-  const s = await setup([wrong + '// 1', wrong + '// 2', wrong + '// 3'], { repairDiagnostics: true }); finiteLoop(s.settings)
+  const s = await setup([wrong + '// 1', wrong + '// 2', wrong + '// 3'], { repairDiagnostics: true }, true); finiteLoop(s.settings)
   s.settings.loop!.maxRepeatedDiagnostic = 4
   let state = await s.workflow.resume((await s.workflow.start('functional')).experiment_id, new AbortController().signal)
   for (let i = 0; i < 3; i++) {
+    witness.recordState('repair_review_revision', state)
     expect(state.phase).toBe('AWAITING_REVIEW')
     await s.workflow.review(state.experiment_id, state.current!.source_sha256, true)
     state = await s.workflow.resume(state.experiment_id, new AbortController().signal)
+    witness.recordState('repair_round_settled', state)
   }
   expect(state.outcome).toBe('REPAIR_BUDGET_EXHAUSTED'); expect(state.attempts).toBe(3); expect(s.prompts).toHaveLength(3)
   expect(state.loop!.rounds.flatMap(r => r.transport)).toHaveLength(3)
 })
 it('stops a candidate that repeats any earlier revision rather than only the parent', async () => {
+  witness = new TargetWitness('A2')
   const first = good.replace('count + 1', 'count + 2') + '// first', second = good.replace('count + 1', 'count + 2') + '// second'
-  const s = await setup([first, second, first], { repairDiagnostics: true }); finiteLoop(s.settings); s.settings.loop!.maxRepeatedDiagnostic = 4
+  const s = await setup([first, second, first], { repairDiagnostics: true }, true); finiteLoop(s.settings); s.settings.loop!.maxRepeatedDiagnostic = 4
   let state = await s.workflow.resume((await s.workflow.start('functional')).experiment_id, new AbortController().signal)
-  for (let i = 0; i < 2; i++) { await s.workflow.review(state.experiment_id, state.current!.source_sha256, true); state = await s.workflow.resume(state.experiment_id, new AbortController().signal) }
+  const earlier: string[] = []
+  for (let i = 0; i < 2; i++) {
+    earlier.push(state.current!.source_sha256)
+    witness.record('review_existing_revision', { revision: state.current, phase: state.phase })
+    await s.workflow.review(state.experiment_id, state.current!.source_sha256, true)
+    state = await s.workflow.resume(state.experiment_id, new AbortController().signal)
+  }
+  witness.record('deduplication_settled', { outcome: state.outcome, current: state.current, earlier, model_responses: s.prompts.length, verification_runs: state.verification_runs })
+  expect(new Set(earlier).size).toBe(2); expect(s.prompts).toHaveLength(3)
   expect(state.outcome).toBe('REPEATED_CANDIDATE'); expect(state.attempts).toBe(3); expect(state.verification_runs).toHaveLength(3)
 })
 it('stops repeated primary evidence before dispatching another proposal', async () => {

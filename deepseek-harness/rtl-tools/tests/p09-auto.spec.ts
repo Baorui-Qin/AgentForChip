@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile, mkdir, link } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile, mkdir, link, lstat } from 'node:fs/promises'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { tmpdir } from 'node:os'
@@ -7,7 +7,11 @@ import { fileURLToPath } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
 import LocalSubprocess from '@deepseek-ai/dsh-subprocess-local'
 import { ToolCallId, type StreamChunk } from '@deepseek-ai/dsh-llm'
-import { afterEach, expect, it, vi } from 'vitest'
+import { afterEach, expect, it, vi, type WorkerGlobalState } from 'vitest'
+import { installTestOperationScope } from './test-operation-scope.ts'
+import { ManagedVersionProbeFixture } from './helpers/managed-version-probe-fixture.ts'
+import { TargetWitness } from './helpers/g1-target-witness.ts'
+import { InterstepTiming } from './helpers/interstep-timing.ts'
 import { checkAutoSource, parseAutoAction, autoTools } from '../src/phase1/p09-auto-policy.ts'
 import { claimExperiment, reserveDispatch } from '../src/phase1/p09-claims.ts'
 import { finalArtifactManifest } from '../src/phase1/artifact-manifest.ts'
@@ -22,11 +26,46 @@ import { skillHash, type SkillEntry } from '../src/phase1/p09-context.ts'
 import { evidenceHash } from '../src/phase1/p10-trace.ts'
 
 const roots: string[] = [], contexts: Context[] = [], workflows: RepairWorkflow[] = []
+const versionFixtures: ManagedVersionProbeFixture[] = []
+let witness: TargetWitness | undefined
+let timing: InterstepTiming | undefined
+const operationScope = installTestOperationScope()
 afterEach(async () => {
-  for (const workflow of workflows.splice(0)) await workflow.close()
-  for (const ctx of contexts.splice(0)) await ctx.fiber.dispose()
-  for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true })
-  vi.restoreAllMocks()
+  const scope = operationScope()
+  try {
+    timing?.record('cleanup_started')
+    await scope.cleanup(async () => {
+      for (const owner of workflows) await owner.close()
+      for (const fixture of versionFixtures) await fixture.close()
+      for (const ctx of contexts) await ctx.fiber.dispose()
+    }, async () => {
+      if (timing) {
+        timing.record('scope_resources_quiescent')
+        timing.close()
+        const output = timing.export(), audit = process.env.G1_TARGET_AUDIT
+        if (!audit || (await lstat(audit)).isSymbolicLink()) throw new Error('Timing capture requires its owned audit directory')
+        const worker = (globalThis as typeof globalThis & { __vitest_worker__?: WorkerGlobalState }).__vitest_worker__
+        await writeFile(join(audit, scope.id + '-interstep-timing.json'), output.json, { flag: 'wx' })
+        await writeFile(join(audit, scope.id + '-interstep-context.json'), JSON.stringify({
+          worker_pid: process.pid, thread_id: output.receipt.thread_id, node_version: process.version,
+          pool: worker?.config.pool ?? null, max_workers: worker?.config.maxWorkers ?? null,
+          body_budget_ms: 60000, hook_budget_ms: worker?.config.hookTimeout ?? null,
+          same_original_fixture: true, scope_id: scope.id, pending: scope.pendingOperations,
+          formal_observation_enabled: false, source: 'actual target Vitest worker config and Scope'
+        }) + '\n', { flag: 'wx' })
+      }
+      if (await witness?.capture(scope, roots)) return
+      if (scope.bodyErrors().length) {
+        console.error('Retained failed test roots', JSON.stringify({ roots, bodyErrors: scope.bodyErrors() }))
+        return
+      }
+      for (const root of roots) await rm(root, { recursive: true, force: true })
+    })
+    workflows.length = 0; contexts.length = 0; roots.length = 0; versionFixtures.length = 0; witness = undefined; timing = undefined
+  } catch (error) {
+    console.error('Test cleanup failed; roots retained', JSON.stringify({ roots, scope_id: scope.id, pending: scope.pendingOperations, bodyErrors: scope.bodyErrors(), error: String(error) }))
+    throw error
+  } finally { timing?.close(); vi.restoreAllMocks() }
 })
 async function temp() { const root = await mkdtemp(join(tmpdir(), 'p09-auto-')); roots.push(root); return root }
 it.each(['$fopen("x","w");', '$system("cmd");', '`include "x"', 'import "DPI-C" function x();', 'force tb.dut.q = 1;', 'assign q = tb.q;', '\\evil identifier;', '$finish;'])('rejects unsafe source without running it: %s', body => {
@@ -52,7 +91,11 @@ it('serializes claims and dispatch reservations across independent processes', a
     try { await claimExperiment(root,{task:'same'},String(process.pid)); claimed=true } catch(e) { if(e.message!=='EXPERIMENT_ALREADY_CLAIMED') throw e }
     const ticket=await reserveDispatch(root,'preflight',{pid:process.pid},new AbortController().signal);
     console.log(JSON.stringify({claimed,ticket}));`
-  const results = await Promise.all([1, 2].map(() => promisify(execFile)(process.execPath, ['--import', 'tsx/esm', '--input-type=module', '-e', script, root])))
+  const results = await Promise.all([1, 2].map(() => operationScope().track('independent claim writer', async () => {
+    const execution = promisify(execFile)(process.execPath, ['--import', 'tsx/esm', '--input-type=module', '-e', script, root], { signal: operationScope().signal })
+    const closed = new Promise<void>(resolve => { execution.child.once('close', () => { resolve() }) })
+    try { return await execution } finally { await closed }
+  })))
   const records = results.map(r => JSON.parse(r.stdout))
   expect(records.filter(r => r.claimed)).toHaveLength(1)
   expect(new Set(records.map(r => r.ticket)).size).toBe(2)
@@ -70,6 +113,9 @@ it('accepts a frozen campaign dispatch cap without changing the global maximum',
   await reserveDispatch(root, 'preflight', { i: 2 }, signal, 2)
   await expect(reserveDispatch(root, 'preflight', { i: 3 }, signal, 2)).rejects.toThrow('CAMPAIGN_BUDGET_EXHAUSTED')
   await expect(reserveDispatch(root, 'preflight', {}, signal, 376)).rejects.toThrow('INVALID_DISPATCH_BUDGET')
+  await expect(reserveDispatch(root, 'preflight', {}, signal, 376, 376)).resolves.toBeTruthy()
+  await expect(reserveDispatch(root, 'preflight', {}, signal, 20125, 20125)).rejects.toThrow('INVALID_DISPATCH_BUDGET')
+  await expect(reserveDispatch(root, 'preflight', {}, signal, 376, 375)).rejects.toThrow('INVALID_DISPATCH_BUDGET')
 })
 it('indexes terminal event bytes and hashes, excluding only its own manifest', async () => {
   const root = await temp()
@@ -81,7 +127,7 @@ it('indexes terminal event bytes and hashes, excluding only its own manifest', a
 })
 
 type Step = 'edit-bad' | 'edit-good' | 'verify' | 'read' | 'retrieve' | 'finish' | '503' | 'partial' | 'stale' | 'suite' | 'multiple' | 'auth' | 'truncated'
-async function setup(steps: Step[]) {
+async function setup(steps: Step[], isolateVersionProbes = false) {
   const root = await temp(), runtimeRoot = join(root, 'runtime'); await mkdir(runtimeRoot)
   await writeFile(join(runtimeRoot, 'counter.exe'), 'explicit test double, never executed')
   await writeFile(join(runtimeRoot, 'tokenizer.json'), '{}')
@@ -99,16 +145,28 @@ async function setup(steps: Step[]) {
       tokenizer: { python: 'unused', root, manifestSha256: 'a'.repeat(64), timeoutMs: 1000 }, skillsFile: null, skillsSha256: null, maxRequests: 15 },
     auto: { registry: 'full', campaignRoot: root, bucket: 'preflight', sampleId: 'test', runtimeRoot, runtimeManifestSha256: sha256(manifestBytes), maxToolSteps: 15 } }
   const spawn = ctx.subprocess.spawn.bind(ctx.subprocess)
-  vi.spyOn(ctx.subprocess, 'spawn').mockImplementation(spec => spawn({ ...spec, argv: spec.argv[0]!.endsWith('counter.exe')
-    ? [process.execPath, '-e', 'console.log(JSON.stringify({tokens:100}))']
-    : [process.execPath, fileURLToPath(new URL('./fake-verification.mjs', import.meta.url)), JSON.stringify({ repairDiagnostics: true }), ...spec.argv.slice(1)] }))
+  const prefix = [process.execPath, fileURLToPath(new URL('./fake-verification.mjs', import.meta.url)), JSON.stringify({ repairDiagnostics: true })]
+  const versionFixture = isolateVersionProbes ? new ManagedVersionProbeFixture(spawn, [...prefix, '-version'], { stdout: 'Vivado Simulator v2026.1\n', stderr: '', exitCode: 0 }) : undefined
+  if (versionFixture) versionFixtures.push(versionFixture)
+  vi.spyOn(ctx.subprocess, 'spawn').mockImplementation(spec => {
+    const mapped = { ...spec, argv: spec.argv[0]!.endsWith('counter.exe') ? [process.execPath, '-e', 'console.log(JSON.stringify({tokens:100}))'] : [...prefix, ...spec.argv.slice(1)] }
+    timing?.record('subprocess_call_start')
+    witness?.record('subprocess_call_start', { argv: mapped.argv, cwd: mapped.cwd })
+    const handle = versionFixture ? versionFixture.spawn(mapped) : spawn(mapped)
+    return operationScope().observeManaged(witness ? witness.observe(mapped, handle, versionFixture?.calls.at(-1)?.kind === 'VERSION_FIXTURE' ? 'LOGICAL_VERSION' : 'NATIVE') : handle)
+  })
   const prompts: Record<string, unknown>[] = []
   const runtime: ModelRuntime = { async prepareCall(config) { return { config, context: { contextWindow: 16384 }, adapterDefaults: {},
     retryPolicy: { mode: 'normal', maxRetries: 0, retryableCodes: [], initialDelayMs: 0, maxDelayMs: 0, jitterRatio: 0 },
     async *stream(request): AsyncGenerator<StreamChunk> {
+      timing?.record('mock_stream_start', { round: prompts.length + 1, model_requests: prompts.length })
+      witness?.record('mock_stream_start', { request: prompts.length + 1 })
+      try {
       const first = request.messages[0]!.content[0]!; if (first.type !== 'text') throw new Error('test input')
       const prompt = JSON.parse(first.text) as { current: { revision_id: string }; task: { id: string } }; prompts.push(prompt)
       const step = steps[prompts.length - 1] ?? 'finish'
+      timing?.record('mock_model_response', { round: prompts.length, model_requests: prompts.length })
+      witness?.record('mock_model_response', { request: prompts.length, step })
       if (!['503', 'partial', 'auth'].includes(step)) yield { type: 'reasoning-delta', index: 10, text: 'Returned tool reasoning.' }
       if (step === '503' || step === 'partial' || step === 'auth') {
         if (step === 'partial') yield { type: 'tool-call-delta', index: 0, id: ToolCallId('partial'), name: 'edit_dut', argumentsDelta: '{' }
@@ -125,12 +183,22 @@ async function setup(steps: Step[]) {
       if (step === 'multiple') yield { type: 'tool-call-delta', index: 1, id: ToolCallId('extra'), name: 'finish', argumentsDelta: '{}' }
       yield { type: 'usage', usage: { inputTokens: 100, outputTokens: 50 } }
       yield { type: 'finish', reason: { kind: 'tool-calls' } }
+      } finally { timing?.record('mock_stream_end', { model_requests: prompts.length }); witness?.record('mock_stream_end', { requests: prompts.length }) }
     } } } }
-  const workflow = new RepairWorkflow(settings, ctx.subprocess, runtime); workflows.push(workflow)
-  return { root, workflow, settings, prompts, runtime, async run() { return workflow.resume((await workflow.start('functional')).experiment_id, new AbortController().signal) } }
+  const rawWorkflow = new RepairWorkflow(settings, ctx.subprocess, runtime)
+  timing?.observeMethods(rawWorkflow, ['start', 'resume', 'root', 'json', 'save', 'terminal', 'source', 'revision',
+    'locked', 'operation', 'verify', 'boundFacts', 'resumeAutomatic'])
+  const workflow = operationScope().own(rawWorkflow, ['start', 'resume', 'review', 'calibrateTask', 'status']); workflows.push(workflow)
+  return { root, workflow, settings, prompts, runtime, async run() {
+    timing?.record('workflow_run_start')
+    witness?.record('workflow_run_start')
+    try { return await workflow.resume((await workflow.start('functional')).experiment_id, new AbortController().signal) }
+    finally { timing?.record('workflow_run_end', { model_requests: prompts.length }); witness?.record('workflow_run_end', { mock_requests: prompts.length }) }
+  } }
 }
 it('automatically repairs twice using fresh revisions and observations, without human approvals', async () => {
-  const s = await setup(['503', 'edit-bad', 'verify', 'edit-good', 'verify']), state = await s.run()
+  if (process.env.G1_NATIVE_LIFECYCLE_TRACE === '1') witness = new TargetWitness('positive-calibration')
+  const s = await setup(['503', 'edit-bad', 'verify', 'edit-good', 'verify'], true), state = await s.run()
   expect(state.outcome, JSON.stringify(state)).toBe('VERIFIED')
   expect(state.attempts).toBe(2); expect(state.auto?.verifications).toBe(2)
   expect(state.p09).toMatchObject({ transport_retries: 1, initial_generation_requests: 0, model_requests_total: 5 })
@@ -221,7 +289,9 @@ it('normalizes the pinned runtime root but refuses hardlinked executables', asyn
   expect(() => new RepairWorkflow(s.settings, contexts.at(-1)!.subprocess, s.runtime)).toThrow('Invalid automatic experiment configuration')
 })
 it.each(['auth', 'truncated'] as const)('does not retry or execute %s responses', async step => {
-  const s = await setup([step, 'edit-good']), state = await s.run()
+  if (step === 'auth') witness = new TargetWitness('A1')
+  const s = await setup([step, 'edit-good'], step === 'auth'), state = await s.run()
+  witness?.record('workflow_settled', { outcome: state.outcome, attempts: state.attempts, model_requests_total: state.p09?.model_requests_total, prompts: s.prompts.length })
   expect(state.attempts).toBe(0); expect(state.p09?.model_requests_total).toBe(1)
   expect(state.outcome).not.toBe('VERIFIED')
 }, 60000)
@@ -235,7 +305,14 @@ it('counts rejected edits but never skips verification of a candidate', async ()
   expect(s.prompts[2]).toMatchObject({ host_action_error: 'UNKNOWN_TOOL', verification_state: 'UNVERIFIED' })
 }, 60000)
 it('enforces the tool budget independently of accepted repairs', async () => {
-  const s = await setup(Array(16).fill('read')), state = await s.run()
+  witness = new TargetWitness('F03-B1')
+  if (process.env.G1_INTERSTEP_TRACE === '1') timing = new InterstepTiming({ enabled: true,
+    runId: process.env.G1_INTERSTEP_RUN_ID ?? 'unbound-diagnostic',
+    testIdentity: { file: 'rtl-tools/tests/p09-auto.spec.ts', fullName: 'enforces the tool budget independently of accepted repairs', occurrence: 1 } })
+  timing?.record('test_body_enter')
+  const s = await setup(Array(16).fill('read'), true), state = await s.run()
+  witness.record('tool_budget_terminal', { outcome: state.outcome, attempts: state.attempts, tool_steps: state.auto?.tool_steps, model_requests: s.prompts.length })
+  timing?.record('workflow_terminal', { tool_steps: state.auto?.tool_steps ?? null, model_requests: s.prompts.length, semantic_attempts: state.attempts })
   expect(state.outcome).toBe('TOOL_STEP_BUDGET_EXHAUSTED')
   expect(state.auto?.tool_steps).toBe(15); expect(state.attempts).toBe(0); expect(s.prompts).toHaveLength(15)
 }, 60000)

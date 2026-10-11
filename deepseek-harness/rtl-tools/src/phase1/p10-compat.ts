@@ -6,6 +6,7 @@ import { sha256 } from './snapshots.ts'
 import { publish } from './candidates.ts'
 import { p10PreflightAssets, type P10Task } from './p10-dataset.ts'
 import { loadSuiteAssets, suiteMarkerName } from './p10-compat-suite.ts'
+import { loadSettledRTLAssets, settledRTLManifest } from './p10-settled-rtl.ts'
 
 /** Exact Windows checkout bytes reviewed against the v8 frozen task snapshots. */
 export const reviewedTBs: Readonly<Record<string, string>> = Object.freeze({
@@ -69,6 +70,11 @@ export async function buildCompatAssets(dataset: string, task: P10Task, parent: 
 
 /** Both calibration and candidate scoring load the same fixed derived bytes. @param dataset - unchanged upstream. @param task - checked identity. @param parent - frozen derived directory. @param defaultTimescale - evidence-backed evaluator default, never override. @returns trusted assets and verification-key inputs. */
 export async function loadCompatAssets(dataset: string, task: P10Task, parent: string, defaultTimescale?: '1ps/1ps') {
+  let settled = false
+  try { await readFile(join(parent, settledRTLManifest)); settled = true } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  }
+  if (settled) return loadSettledRTLAssets(dataset, task, parent)
   let fullSuite = false
   try { await readFile(join(parent, suiteMarkerName)); fullSuite = true } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error

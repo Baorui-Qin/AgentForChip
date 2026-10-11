@@ -25,7 +25,7 @@ import {
 } from './runner-launch.ts'
 import type { RunnerInvocation } from './runner-launch.ts'
 
-/** Test seams for runner launch and dynamic capability checks. */
+/** Runner launch/capability seams and parent control diagnostics. */
 export interface WindowsJobInternals {
   spawn?: typeof spawn
   runnerInvocation?: RunnerInvocation
@@ -33,6 +33,8 @@ export interface WindowsJobInternals {
   runnerAvailable?: (invocation: RunnerInvocation) => boolean
   loadWin32ProcessBindings?: typeof loadWin32ProcessBindings
   probeCurrentTokenJobSupport?: typeof probeCurrentTokenJobSupport
+  /** Report a terminate-channel EPIPE separately from outcome/range proof. */
+  onTerminateDeliveryError?: (error: Error) => void
 }
 
 type RunnerProcess = Omit<ReturnType<typeof spawn>, 'send' | 'stdio'> & {
@@ -70,33 +72,61 @@ class WindowsJobOwner implements BoundProcessOwner {
   private cancellationReason: unknown
   private cancellationReasonSet = false
   private terminationSent = false
+  private terminationDeliveryError: Error | undefined
+  private escalationRequested = false
+  private rangeProven = false
+
+  get controlError(): Error | undefined { return this.terminationDeliveryError }
 
   constructor(
     private readonly runner: RunnerProcess,
     private readonly exited: Promise<void>,
     private readonly directResultType: () => WindowsRunnerResult['type'] | undefined,
     private readonly failInfrastructure: (error: unknown) => void,
+    private readonly onTerminateDeliveryError?: (error: Error) => void,
   ) {
-    void this.exited.catch(() => {})
+    void this.exited.then(() => { this.rangeProven = true }, () => {})
   }
 
-  signal(_signal: 'SIGTERM' | 'SIGKILL', cancellationReason?: unknown): void {
+  signal(signal: 'SIGTERM' | 'SIGKILL', cancellationReason?: unknown): void {
     if (!this.cancellationReasonSet) {
       this.cancellationReason = cancellationReason
       this.cancellationReasonSet = true
     }
-    if (this.terminationSent || !this.runner.connected) return
+    if (signal === 'SIGKILL') {
+      this.escalationRequested = true
+      if (this.terminationDeliveryError !== undefined && !this.rangeProven) {
+        this.terminateForHostExit()
+      }
+    }
+    if (this.terminationSent || !this.runner.connected || this.rangeProven) return
     this.terminationSent = true
     try {
       this.runner.send?.({ type: 'terminate' }, (error) => {
+        if (this.recordTerminateEpipe(error)) return
         if (error === null || this.directResultType() !== undefined) return
         this.failInfrastructure(error)
         this.terminateForHostExit()
       })
     } catch (error) {
+      if (this.recordTerminateEpipe(error)) return
       this.failInfrastructure(error)
       this.terminateForHostExit()
     }
+  }
+
+  private recordTerminateEpipe(error: unknown): boolean {
+    if (!(error instanceof Error) || !('code' in error) || error.code !== 'EPIPE') return false
+    if (this.terminationDeliveryError === undefined) {
+      this.terminationDeliveryError = error
+      // Diagnostics cannot interrupt the protocol's result/proof processing.
+      try { this.onTerminateDeliveryError?.(error) } catch { /* Preserve the original control error. */ }
+    }
+    // Reuse bindManagedProcess's existing grace escalation, including a callback
+    // delivered after that boundary. Force-close still requires protocol proof;
+    // an abnormal runner close rejects waitForExit rather than proving cleanup.
+    if (this.escalationRequested && !this.rangeProven) this.terminateForHostExit()
+    return true
   }
 
   mapStartFailure(failure: unknown, serialized: SerializedRunnerError): unknown {
@@ -159,6 +189,7 @@ export function launchWindowsJob(
     rangeExit.promise,
     () => directResultType,
     failInfrastructure,
+    internals.onTerminateDeliveryError,
   )
   child.on('message', (value: unknown) => {
     if (directResultType !== undefined) {
@@ -218,6 +249,7 @@ export function launchWindowsJob(
         : `exit code ${String(exitCode)}`
     const error = new Error(
       `subprocess-local: Windows Job runner exited with ${status} before proving its managed range empty`,
+      { cause: owner.controlError },
     )
     failInfrastructure(error)
   })

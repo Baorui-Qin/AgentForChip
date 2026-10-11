@@ -1,5 +1,30 @@
 /** Host proposal policy, deliberately independent of parsing and execution approval. @module rtl-tools/phase1/repair-policy */
-import type { DiagnosticReceipt } from './repair-diagnostics.ts'
+import { isAbsolute, resolve } from 'node:path'
+import type { DiagnosticReceipt, RepairStage } from './repair-diagnostics.ts'
+
+function currentDutFile(file: string, binding: RepairStage['dut_source']): boolean {
+  if (!binding || typeof binding.path !== 'string' || typeof binding.cwd !== 'string' ||
+    !isAbsolute(binding.path) || !isAbsolute(binding.cwd)) return false
+  const key = (path: string) => {
+    const normalized = resolve(path).replace(/\\/g, '/')
+    return process.platform === 'win32' ? normalized.toLowerCase() : normalized
+  }
+  return key(isAbsolute(file) ? file : resolve(binding.cwd, file)) === key(binding.path)
+}
+
+/** Recognize complete DUT conflicts and only their exact same-invocation unlocated XSim summaries. Raw flags and consequential labels do not grant eligibility. @param stage - current parsed execution facts. @returns whether this elaboration failure supports a Host repair proposal and revision comparison. */
+export function multipleDriverFailure(stage: RepairStage): boolean {
+  if (stage.stage !== 'elaborate' || !stage.complete || !stage.process_normal || !['FAIL', 'INCONCLUSIVE'].includes(stage.status)) return false
+  const errors = stage.diagnostics.filter(d => d.severity === 'ERROR')
+  const primary = errors.filter(d => d.kind === 'multiple_drivers' && d.message_id === 'VRFC 10-3818' &&
+    d.origin === 'dut' && d.attribution === 'DUT_COMPILE_ERROR' && typeof d.file === 'string' && d.file.trim().length > 0 &&
+    currentDutFile(d.file, stage.dut_source) &&
+    typeof d.invocation === 'string' && d.invocation.trim().length > 0 &&
+    /^variable '[A-Za-z_$][\w$]*' is driven by invalid combination of procedural drivers$/.test(d.message))
+  return primary.length > 0 && errors.every(d => primary.includes(d) || (
+    d.message_id === 'XSIM 43-3322' && d.message === 'Static elaboration of top level Verilog design unit(s) in library work failed.' &&
+    d.origin === 'unknown' && d.attribution === 'UNKNOWN' && d.file === null && d.line === null && primary.some(p => p.invocation === d.invocation)))
+}
 
 /** Proposals carry evidence references but never an execution permission. */
 export interface RepairDecision { action: 'propose_repair' | 'stop' | 'blocked'; rule: string; reason: string; stage: string | null }
@@ -14,6 +39,11 @@ export function decideRepair(facts: DiagnosticReceipt, context: { calibrated: bo
   if (!failed.complete || !failed.process_normal || !['FAIL', 'INCONCLUSIVE'].includes(failed.status)) return decision('blocked', 'EXECUTION_OR_EVIDENCE', 'Incomplete evidence or independent execution failure.')
   if (failed.functional_failure) return decision('propose_repair', 'FUNCTIONAL_MISMATCH', 'Complete calibrated mismatch evidence; source location remains unknown.')
   const errors = failed.diagnostics.filter(d => d.severity === 'ERROR')
+  if (errors.some(d => d.kind === 'multiple_drivers' || d.message_id === 'VRFC 10-3818' || d.message_id === 'XSIM 43-3322')) {
+    return multipleDriverFailure(failed)
+      ? decision('propose_repair', 'DUT_MULTIPLE_DRIVERS', 'Observed DUT procedural drivers with only recognized same-invocation elaboration summaries.')
+      : decision('blocked', 'UNCLASSIFIED_FAILURE', 'Driver evidence requires exact DUT conflict facts and same-invocation unlocated summaries.')
+  }
   const primaryCompile = errors.filter(d => d.origin === 'dut' && ['syntax', 'declaration_order', 'name_resolution', 'type_or_port', 'dependency'].includes(d.kind))
   if (['compile', 'elaborate'].includes(failed.stage) && primaryCompile.length && errors.every(d => primaryCompile.includes(d) || (
     d.origin === 'dut' && d.message_id === 'VRFC 10-8530' && d.message === `module '${context.top}' is ignored due to previous errors` &&

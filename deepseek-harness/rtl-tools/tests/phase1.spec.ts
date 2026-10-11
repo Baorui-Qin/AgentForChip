@@ -125,7 +125,16 @@ it('does not interpret version mismatch, timeout, or truncated banners as readin
   expect(versionFact({ ...probe, process: { ...probe.process!, logTruncated: true } }, 'Vivado v2025.2', '2025.2').matches).toBe(false)
 })
 
-it('loads development YAML as data and rejects executable tags and pinned version changes', async () => {
+it('recognizes configured 2026.1 banners and rejects the old release without hiding exit codes', () => {
+  const probe: Probe = { executable: 'vivado', argv: ['-version'], error: null, process: { exitCode: 0, signal: null, timedOut: false, aborted: false, durationMs: 1, stdoutLog: 'stdout', stderrLog: 'stderr', logTruncated: false, outputTail: '' } }
+  for (const banner of ['vivado v2026.1 (64-bit)', 'Vivado Simulator v2026.1']) {
+    expect(versionFact(probe, banner, '2026.1')).toMatchObject({ actual: '2026.1', expected: '2026.1', matches: true })
+  }
+  expect(versionFact(probe, 'Vivado v2025.2', '2026.1').matches).toBe(false)
+  expect(versionFact({ ...probe, process: { ...probe.process!, exitCode: 2 } }, 'Vivado v2026.1', '2026.1').matches).toBe(false)
+})
+
+it('loads development YAML as data and rejects executable tags and malformed version settings', async () => {
   const example = new URL('../phase1/configs/dev.yaml', import.meta.url)
   root = await mkdtemp(join(tmpdir(), 'rtl-config-'))
   await mkdir(join(root, 'config'))
@@ -135,10 +144,11 @@ it('loads development YAML as data and rejects executable tags and pinned versio
     tools: { vivado: process.execPath, xvlog: process.execPath, xelab: process.execPath, xsim: process.execPath } }))
   const parsed = await readDoctorConfig(path)
   expect(parsed.config.model).toBeNull()
+  expect(parsed.config.expectedVivadoVersion).toBe('2026.1')
   expect(parsed.sha256).toMatch(/^[a-f0-9]{64}$/)
   await writeFile(path, '!!js process.exit(0)')
   await expect(readDoctorConfig(path)).rejects.toThrow()
-  await writeFile(path, JSON.stringify({ ...parsed.config, expectedVivadoVersion: '2024.2' }))
+  await writeFile(path, JSON.stringify({ ...parsed.config, expectedVivadoVersion: 'not-a-version' }))
   await expect(readDoctorConfig(path)).rejects.toThrow()
   await writeFile(path, JSON.stringify({ ...parsed.config, apiKey: 'must-not-be-logged' }))
   await expect(readDoctorConfig(path)).rejects.toThrow('Unknown')

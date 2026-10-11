@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { createHash } from 'node:crypto'
 import { BlockAssembler, type StreamChunk } from '@deepseek-ai/dsh-llm'
 import { publish } from './candidates.ts'
+import { normalizeChunk } from './stream-audit.ts'
 
 /** Append every received normalized chunk before parsing or enforcing response limits. */
 export class ModelTranscript {
@@ -24,16 +25,8 @@ export class ModelTranscript {
 
   /** Persist normalized output, omitting unsafe transport error text. @param chunk - next consumer-visible provider chunk. */
   async append(chunk: StreamChunk): Promise<void> {
-    let logged: unknown = chunk
-    if (chunk.type === 'finish') {
-      this.finishKind = chunk.reason.kind
-      if (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted') {
-        const failure = chunk.reason.failure
-        logged = { type: 'finish', reason: { kind: chunk.reason.kind,
-          code: /^[A-Z_]+$/.test(failure.code) ? failure.code : 'UNKNOWN',
-          status: 'status' in failure && typeof failure.status === 'number' ? failure.status : null } }
-      }
-    }
+    const logged = normalizeChunk(chunk)
+    if (chunk.type === 'finish') this.finishKind = chunk.reason.kind
     const line = JSON.stringify({ seq: this.count, elapsed_ms: Math.round(performance.now() - this.started), chunk: logged }) + '\n'
     await this.file.writeFile(line)
     this.digest.update(line); this.bytes += Buffer.byteLength(line); this.count++

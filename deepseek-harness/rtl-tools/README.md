@@ -7,7 +7,13 @@ kind: "package-reference"
 
 English | [中文](README.zh.md)
 
+The Phase 2 runtime baseline is Vivado 2026.1, selected by [dev.yaml](phase1/configs/dev.yaml). Historical Phase 1 experiments and fixtures retain their 2025.2 provenance. New snapshots, compatibility suites and evaluator identities use the configured version; future Static Knowledge uses `{"tool":"vivado","tool_version":"2026.1"}`. See the [migration report](../../../docs/vivado-2026.1/report.md) for live validation scope and remaining failures.
+
 ## Summary
+
+[Diagnostic Knowledge V1](knowledge/README.md) adds optional, version-bound guidance to P10 repair requests while retaining the existing parser, Skill selection and verification criteria.
+
+P10 model audit payloads are bounded independently of provider stream consumption. Terminal usage and finish metadata remain observable after verbose audit truncation or rejected oversized semantics; token accounting distinguishes returned, missing, interrupted and unparseable provider usage. The full normalized transcript is a separate disk artifact, not a bounded event or original HTTP capture; deployment owns its disk quota. See the [accounting decision](../.agents/notes/implemented/bug-fix/2026-10-09-p3-production-continuity.md).
 
 `run_simulation` compiles configured RTL and a trusted testbench with Icarus. Optional `run_synthesis` produces a Vivado netlist and compact resource/timing results. Both return bounded diagnostic facts without modifying or repairing RTL. This source-loaded local plugin is not a formal competition evaluator.
 
@@ -76,7 +82,7 @@ Icarus processes use exact argv with no shell interpolation. The compiler uses `
 <a id="vivado-synthesis"></a>
 ## Vivado synthesis
 
-Load [cordis.synthesis.patch.yml](cordis.synthesis.patch.yml) instead of the simulation-only patch to register both tools. The model calls `run_synthesis` with `{"top":"counter"}`; the design top differs from `counter_tb`. Icarus executables are required only when simulation is invoked. The synthesis example targets Vivado 2025.2, `xczu3eg-sbva484-1-e`, and a trusted [5 ns clock constraint](example/constraints/counter.xdc).
+Load [cordis.synthesis.patch.yml](cordis.synthesis.patch.yml) instead of the simulation-only patch to register both tools. The model calls `run_synthesis` with `{"top":"counter"}`; the design top differs from `counter_tb`. Icarus executables are required only when simulation is invoked. The synthesis example targets Vivado 2026.1, `xczu3eg-sbva484-1-e`, and a trusted [5 ns clock constraint](example/constraints/counter.xdc).
 
 The optional `synthesis` object requires its own `top`, nonempty ordered RTL `sources`, and explicit `xdcFiles` list. An empty XDC list supports unconstrained combinational designs; the tool neither guesses clocks nor invents timing evidence. It does not copy simulation sources or references into synthesis. XDC files are trusted executable configuration, not model-authored input.
 
@@ -114,7 +120,7 @@ The optional actual-Icarus test requires both `RTL_IVERILOG` and `RTL_VVP` envir
 Set `RTL_VIVADO` to the Vivado launcher to enable actual synthesis tests through the registered tool; set `RTL_VIVADO_ARTIFACTS_DIR` to an absolute directory to retain those test artifacts. Otherwise real-Vivado cases are visibly skipped. These tests use explicit full-access policy for trusted fixtures, not a claim of production sandbox validation. No model API key is needed.
 
 ```powershell
-$env:RTL_VIVADO = 'D:\AMDDesignTools\2025.2\Vivado\bin\vivado.bat'
+$env:RTL_VIVADO = 'E:\Xilinx\2026.1\Vivado\bin\vivado.bat'
 $env:RTL_VIVADO_ARTIFACTS_DIR = 'D:\AMD\vivado-synthesis-validation'
 node node_modules/vitest/vitest.mjs run --config rtl-tools/vitest.config.ts -t 'real Vivado via registered tool'
 ```
@@ -130,7 +136,7 @@ Mounting or changing this tool's schema changes the tool portion of the request 
 <a id="known-limitations-and-deferred-work"></a>
 ## Known Limitations and Deferred Work
 
-Icarus is a development backend. The supplied competition memo identifies Vivado/Vitis 2025.2 with `xvlog/xelab/xsim` as the formal simulation path; this plugin implements Vivado synthesis but not that simulation path, Baseline, local model setup, or a repair workflow. Those competition facts are taken from the supplied memo, not independently verified official scoring rules. The report parser targets Vivado 2025.2 UltraScale+ text reports; unsupported formats fail explicitly rather than substituting zero metrics.
+Icarus is a development backend. The supplied competition memo identifies Vivado/Vitis 2025.2 with `xvlog/xelab/xsim` as the formal simulation path; this plugin implements Vivado synthesis but not that simulation path, Baseline, local model setup, or a repair workflow. Those competition facts are taken from the supplied memo, not independently verified official scoring rules. The report parser retains historical Vivado 2025.2 UltraScale+ regression coverage; the migration report records 2026.1 live validation; unsupported formats fail explicitly rather than substituting zero metrics.
 
 PASS markers are testbench evidence, not an unforgeable evaluator verdict: candidate RTL can also print text. The deployment must protect the testbench, configuration, evaluator and reference files with read-only mounts and an external trusted scorer. Fixing the source list does not prevent other tools or simulation code from modifying files allowed by the surrounding sandbox. File sandboxing does not isolate network or constrain waveform disk usage; use an offline, resource-limited container for adversarial designs.
 

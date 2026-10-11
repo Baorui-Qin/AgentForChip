@@ -2,7 +2,7 @@
 import { mkdir, readFile, readdir, lstat, writeFile } from 'node:fs/promises'
 import { join, relative } from 'node:path'
 import type { SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
-import { runCommand, type CommandResult } from '../process.ts'
+import { DeadlineExceeded, runCommand, type CommandResult } from '../process.ts'
 import { VivadoDiagnostics } from '../vivado-parser.ts'
 import { groupHDLSources, assertCompileMode, type ResolvedHDLSource } from '../hdl.ts'
 import { resolveSynthesisConfig, runSynthesis, vivadoArgv } from '../synthesis.ts'
@@ -15,6 +15,7 @@ import { checkSnapshot, createSnapshot, createReviewedCounterSnapshot, createDat
 import type { FixtureId } from './fixtures.ts'
 import { SimulationEvidence } from './simulation-evidence.ts'
 import { finalArtifactManifest } from './artifact-manifest.ts'
+import { EvidenceAccess, scanArtifactBytes } from './evidence-access.ts'
 export { SimulationEvidence } from './simulation-evidence.ts'
 
 /** Explicit deployment budgets for the ordered verification operation. */
@@ -24,7 +25,8 @@ export interface VerificationResult { schema_version: '1.3'; snapshot_id: PhaseI
 
 function fact(value: CommandResult): ProcessFact { return { exit_code: value.exitCode, signal: value.signal, timed_out: value.timedOut, cancelled: value.aborted, log_truncated: value.logTruncated, duration_ms: value.durationMs } }
 
-async function sizeOf(path: string, index?: { path: string; bytes: number }[], root = path): Promise<number> {
+/** Audit bounded EDA artifacts without following links. @param path - owned directory. @param index - optional relative file index. @param root - traversal root. */
+export async function sizeOf(path: string, index?: { path: string; bytes: number }[], root = path): Promise<number> {
   let size = 0
   // Vivado removes transient child directories during the live quota scan.
   const entries = await readdir(path, { withFileTypes: true }).catch(error => {
@@ -55,7 +57,7 @@ export class VerificationRunner {
   async registerFixture(fixture: FixtureId, identity: RunIdentity): Promise<PhaseId> {
     const recorder = await EventRecorder.create(this.config.outputRoot, identity, this.limits.maxEventBytes, '1.3')
     try {
-      const snapshot = await createSnapshot(recorder.directory, fixture)
+      const snapshot = await createSnapshot(recorder.directory, fixture, this.config)
       this.snapshots.set(snapshot.id, { snapshot, recorder, identity, used: false })
       return snapshot.id
     } catch (error) { await recorder.close(); throw error }
@@ -65,7 +67,7 @@ export class VerificationRunner {
   async registerReviewedCounter(source: string, reviewedSha256: string, identity: RunIdentity): Promise<PhaseId> {
     const recorder = await EventRecorder.create(this.config.outputRoot, identity, this.limits.maxEventBytes, '1.3')
     try {
-      const snapshot = await createReviewedCounterSnapshot(recorder.directory, source, reviewedSha256)
+      const snapshot = await createReviewedCounterSnapshot(recorder.directory, source, reviewedSha256, this.config)
       this.snapshots.set(snapshot.id, { snapshot, recorder, identity, used: false })
       return snapshot.id
     } catch (error) { await recorder.close(); throw error }
@@ -73,9 +75,10 @@ export class VerificationRunner {
 
   /** Register pinned evaluator assets after host review. @param assets - trusted bytes including reviewed source. @param evaluation - trusted profile. @param identity - accounting. @returns opaque id. */
   async registerDataset(assets: Record<string, string>, evaluation: Evaluation, identity: RunIdentity): Promise<PhaseId> {
+    if (evaluation.compatibility?.vivado_version !== undefined && evaluation.compatibility.vivado_version !== this.config.expectedVivadoVersion) throw new Error('Evaluator Vivado version does not match runtime configuration')
     const recorder = await EventRecorder.create(this.config.outputRoot, identity, this.limits.maxEventBytes, '1.3')
     try {
-      const snapshot = await createDatasetSnapshot(recorder.directory, assets, evaluation)
+      const snapshot = await createDatasetSnapshot(recorder.directory, assets, evaluation, this.config)
       this.snapshots.set(snapshot.id, { snapshot, recorder, identity, used: false }); return snapshot.id
     } catch (error) { await recorder.close(); throw error }
   }
@@ -108,21 +111,32 @@ export class VerificationRunner {
     entry.used = true
     const { snapshot, recorder, identity } = entry
     const root = recorder.directory
+    const access = new EvidenceAccess(root)
     const build = join(root, 'build')
     const deadline = new AbortController()
     const quota = new AbortController()
     let totalExpired = false
     let quotaError: string | null = null
-    const timer = setTimeout(() => { totalExpired = true; deadline.abort() }, this.limits.totalMs)
+    const timer = setTimeout(() => { totalExpired = true; deadline.abort(new DeadlineExceeded('total')) }, this.limits.totalMs)
     const signal = AbortSignal.any([caller, deadline.signal, quota.signal])
+    let failureRecorded = false
+    const recordFilesystemFailure = async () => {
+      if (!access.failure || failureRecorded) return
+      failureRecorded = true
+      await atomicJson(root, 'filesystem-error.json', { ...identity, snapshot_id: snapshot.id, ...access.failure,
+        cancellation: { caller_aborted: caller.aborted, total_expired: totalExpired, quota_error: quotaError, combined_aborted: signal.aborted } }, access)
+    }
     let poll: Promise<void> = Promise.resolve()
     let polling = false
     const watcher = setInterval(() => {
       if (polling) return
       polling = true
       poll = (async () => {
-        try { if (await sizeOf(root) > this.limits.maxArtifactBytes) { quotaError = 'Artifact byte budget exceeded'; quota.abort() } }
-        catch (error) { quotaError = error instanceof Error ? error.message : 'Artifact audit failed'; quota.abort() }
+        try { if (await scanArtifactBytes(access, undefined, signal) > this.limits.maxArtifactBytes) { quotaError = 'Artifact byte budget exceeded'; quota.abort() } }
+        catch (error) {
+          if (signal.aborted && error === signal.reason) return
+          quotaError = error instanceof Error ? error.message : 'Artifact audit failed'; quota.abort()
+        }
         finally { polling = false }
       })()
     }, this.limits.artifactPollMs)
@@ -133,7 +147,7 @@ export class VerificationRunner {
     const sources = snapshot.sources.map(source => ({ ...source, path: join(snapshot.directory, source.path) }))
     let stopped = false
     try {
-      if (preflight) await atomicJson(root, 'preflight-mode.json', { purpose: 'evaluator_preflight', candidate_verification: false, synthesis_requested: false })
+      if (preflight) await atomicJson(root, 'preflight-mode.json', { purpose: 'evaluator_preflight', candidate_verification: false, synthesis_requested: false }, access, signal)
       await mkdir(build)
       for (const stage of stages) {
         if (preflight && stage === 'synthesis') stopped = true
@@ -148,16 +162,18 @@ export class VerificationRunner {
         if (!stopped) {
           const stageControl = new AbortController()
           const stageBudget = stage === 'compile' ? this.limits.compileMs : stage === 'elaborate' ? this.limits.elaborateMs : stage === 'simulation' ? this.limits.simulationMs : this.config.limits.timeoutMs
-          const stageTimer = setTimeout(() => stageControl.abort(), stageBudget)
+          const stageTimer = setTimeout(() => stageControl.abort(new DeadlineExceeded('stage')), stageBudget)
           const stageSignal = AbortSignal.any([signal, stageControl.signal])
           try {
             stageSignal.throwIfAborted()
             await checkSnapshot(snapshot)
             if (stage === 'compile') {
               for (const [tool, executable] of Object.entries(this.config.tools)) {
-                const version = await this.command(executable, ['-version'], build, `${tool}-version`, stageBudget, stageSignal, confine, new VivadoDiagnostics(this.config.limits.maxDiagnostics, this.config.limits.maxLineChars), commands, invocations, root)
+                const version = await this.command(executable, ['-version'], build, `${tool}-version`, stageBudget, stageSignal, confine, new VivadoDiagnostics(this.config.limits.maxDiagnostics, this.config.limits.maxLineChars), commands, invocations, root, access)
                 const text = await readFile(version.stdoutLog, 'utf8') + await readFile(version.stderrLog, 'utf8')
-                const matches = versionFact({ executable, argv: [], process: version, error: null }, text, '2025.2').matches
+                const observation = versionFact({ executable, argv: invocations.at(-1)!.argv, process: version, error: null }, text, this.config.expectedVivadoVersion)
+                await atomicJson(build, `${tool}-version.json`, observation, access, stageSignal)
+                const matches = observation.matches
                 invocations.at(-1)!.version_matches = matches
                 if (!matches) throw new Error('Environment: tool version probe failed: ' + tool)
               }
@@ -198,7 +214,7 @@ export class VerificationRunner {
                 const commandArgs = group ? [...(group.language === 'systemverilog' ? ['-sv'] : []), ...group.sources.map(source => source.path)] : args
                 if (group) assertCompileMode(group, commandArgs)
                 outcome = await this.command(executable, commandArgs, build, groups.length > 1 ? `${stage}-${index + 1}` : stage,
-                  Math.max(1, limit - (performance.now() - stageStart)), stageSignal, confine, { accept(line, truncated) { diagnostics.accept(line, truncated); evidence.accept(line) } }, commands, invocations, root, group?.sources)
+                  Math.max(1, limit - (performance.now() - stageStart)), stageSignal, confine, { accept(line, truncated) { diagnostics.accept(line, truncated); evidence.accept(line) } }, commands, invocations, root, access, group?.sources)
                 if (outcome.exitCode !== 0 || outcome.signal || outcome.aborted || outcome.timedOut || outcome.logTruncated || diagnostics.errorSeen || diagnostics.lineTruncated) break
               }
               record.exit_code = outcome.exitCode; record.raw_log_path = rel(outcome.stdoutLog)
@@ -225,7 +241,7 @@ export class VerificationRunner {
             }
             if ((record.errors as AttributedDiagnostic[]).some(error => error.origin === 'tool' || (['compile', 'elaborate'].includes(stage) && ['testbench', 'reference'].includes(error.origin)))) { record.status = 'TOOL_ERROR'; record.failure_domain = 'environment' }
             await checkSnapshot(snapshot)
-            if (await sizeOf(root) > this.limits.maxArtifactBytes) { quotaError = 'Artifact byte budget exceeded'; quota.abort() }
+            if (await scanArtifactBytes(access, undefined, stageSignal) > this.limits.maxArtifactBytes) { quotaError = 'Artifact byte budget exceeded'; quota.abort() }
             if (invocations.some(invocation => invocation.process.log_truncated)) { record.status = 'TOOL_ERROR'; record.failure_domain = 'resource' }
           } catch (error) {
             const message = error instanceof Error ? error.message.slice(0, this.config.limits.maxLineChars) : 'Verification failed'
@@ -249,9 +265,10 @@ export class VerificationRunner {
       }
       clearInterval(watcher)
       await poll
-      await atomicJson(root, 'commands.json', commands)
+      await atomicJson(root, 'commands.json', commands, access)
+      await recordFilesystemFailure()
       const artifactIndex: { path: string; bytes: number }[] = []
-      if (await sizeOf(root, artifactIndex) > this.limits.maxArtifactBytes || Buffer.byteLength(JSON.stringify(artifactIndex)) > this.limits.maxEventBytes) {
+      if (await scanArtifactBytes(access, artifactIndex) > this.limits.maxArtifactBytes || Buffer.byteLength(JSON.stringify(artifactIndex)) > this.limits.maxEventBytes) {
         quotaError = 'Artifact byte or index budget exceeded'; quota.abort()
       }
       const firstFailure = (preflight ? results.slice(0, 3) : results).find(result => result.status !== 'PASS')
@@ -265,18 +282,21 @@ export class VerificationRunner {
       await recorder.finish(final)
       return { schema_version: '1.3', snapshot_id: snapshot.id, status: evaluatorReady ? 'EVALUATOR_READY' : final.final_status, stages: results, artifacts: root, full_isolation_verified: false }
     } finally {
-      clearTimeout(timer); clearInterval(watcher); await poll; await recorder.close()
-      await finalArtifactManifest(root)
+      clearTimeout(timer); clearInterval(watcher)
+      try {
+        await poll; await recorder.close(); await recordFilesystemFailure()
+        await finalArtifactManifest(root)
+      } finally { await access.close() }
     }
   }
 
   private async command(executable: string, args: string[], cwd: string, label: string, timeoutMs: number, signal: AbortSignal,
-    confine: (argv: readonly string[]) => readonly string[], observer: { accept(line: string, truncated?: boolean): void }, commands: Record<string, readonly string[]>, invocations: Invocation[], root: string, sources?: ResolvedHDLSource[]): Promise<CommandResult> {
+    confine: (argv: readonly string[]) => readonly string[], observer: { accept(line: string, truncated?: boolean): void }, commands: Record<string, readonly string[]>, invocations: Invocation[], root: string, access: EvidenceAccess, sources?: ResolvedHDLSource[]): Promise<CommandResult> {
     const path = await this.subprocess.resolveExecutable(executable, undefined, signal)
     const cmd = process.platform === 'win32' && /\.(bat|cmd)$/i.test(path) ? await this.subprocess.resolveExecutable('cmd.exe', undefined, signal) : undefined
     const argv = vivadoArgv(path, args, process.platform, cmd)
     commands[label] = argv
-    await atomicJson(cwd, 'commands.json', commands)
+    await atomicJson(cwd, 'commands.json', commands, access, signal)
     const launch = confine(argv)
     const outcome = await runCommand(this.subprocess, { ...this.config.limits, timeoutMs: Math.max(1, Math.floor(timeoutMs)), stopOnLogLimit: true }, launch, cwd, label, signal, observer)
     invocations.push({ label, executable: path, args, argv, launch_argv: launch, version_matches: null, systemverilog_mode: sources ? sources[0]!.language === 'systemverilog' : null,
