@@ -1,10 +1,9 @@
-# AgentForChip 师兄审阅材料
+# AgentForChip 审阅材料
 
 2026-10-18 整理。报告与相关实验日志的交接，不是新增模型实验或正式比赛成绩。
 
 ## 直接阅读
 
-- [微信版简要汇报](WECHAT.zh.md)
 - [完整阶段报告](REPORT.zh.md)
 - [典型失败及成功案例导航](CASES.zh.md)
 - [50 题实测报告](AMD/output/cloud-agent-questions50-20261017/REPORT.zh.md)
